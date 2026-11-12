@@ -1121,7 +1121,7 @@ const s = StyleSheet.create({
     borderRadius: 9,
     backgroundColor: C.burgundyLight,
   },
-  editText: { fontSize: 11, color: C.burgundy, fontWeight: '650' },
+  editText: { fontSize: 11, color: C.burgundy, fontWeight: '600' },
 
   scroll: { paddingHorizontal: 13, paddingTop: 15, paddingBottom: 35 },
   content: { width: '100%' },
@@ -1131,7 +1131,7 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 14,
   },
-  pageTitle: { fontSize: 19, fontWeight: '750', color: C.ink },
+  pageTitle: { fontSize: 19, fontWeight: '700', color: C.ink },
   resultCount: { fontSize: 10, color: C.muted, marginTop: 4 },
   dateBadge: {
     flexDirection: 'row',
@@ -1142,7 +1142,7 @@ const s = StyleSheet.create({
     borderRadius: 9,
     backgroundColor: C.burgundyLight,
   },
-  dateBadgeText: { fontSize: 9, color: C.burgundy, fontWeight: '650' },
+  dateBadgeText: { fontSize: 9, color: C.burgundy, fontWeight: '600' },
 
   controls: {
     flexDirection: 'row',
@@ -1182,7 +1182,7 @@ const s = StyleSheet.create({
     backgroundColor: C.paper,
   },
   filterButtonActive: { backgroundColor: C.burgundy, borderColor: C.burgundy },
-  filterButtonText: { fontSize: 10, color: C.ink, fontWeight: '650' },
+  filterButtonText: { fontSize: 10, color: C.ink, fontWeight: '600' },
   filterButtonTextActive: { color: C.white },
 
   sortContainer: { position: 'relative', zIndex: 30 },
@@ -1197,7 +1197,7 @@ const s = StyleSheet.create({
     borderColor: C.border,
     backgroundColor: C.paper,
   },
-  sortButtonText: { fontSize: 10, color: C.ink, fontWeight: '650' },
+  sortButtonText: { fontSize: 10, color: C.ink, fontWeight: '600' },
   dismissSort: {
     ...StyleSheet.absoluteFillObject,
     position: 'absolute',
@@ -1241,7 +1241,7 @@ const s = StyleSheet.create({
     marginBottom: 11,
   },
   sortLabelText: { fontSize: 10, color: C.muted },
-  clearSort: { fontSize: 10, color: C.burgundy, fontWeight: '650' },
+  clearSort: { fontSize: 10, color: C.burgundy, fontWeight: '600' },
 
   busList: { gap: 9 },
   busCard: {
@@ -1280,7 +1280,7 @@ const s = StyleSheet.create({
   fareCaption: { fontSize: 8, color: C.muted },
   fareValue: {
     fontSize: 17,
-    fontWeight: '750',
+    fontWeight: '700',
     color: C.burgundy,
     marginTop: 2,
   },
@@ -1305,7 +1305,7 @@ const s = StyleSheet.create({
   typeTagText: {
     fontSize: 8,
     color: C.muted,
-    fontWeight: '750',
+    fontWeight: '700',
     letterSpacing: 0.2,
   },
   cardDivider: { height: 1, backgroundColor: C.border, marginVertical: 7 },
@@ -1326,7 +1326,7 @@ const s = StyleSheet.create({
   timelineStop: { flex: 1, justifyContent: 'center', paddingVertical: 1 },
   timeValue: {
     fontSize: 14,
-    fontWeight: '750',
+    fontWeight: '700',
     color: C.ink,
     letterSpacing: -0.3,
   },
@@ -1360,7 +1360,7 @@ const s = StyleSheet.create({
     minWidth: 75,
     paddingLeft: 6,
   },
-  durationText: { fontSize: 12, color: C.ink, fontWeight: '750' },
+  durationText: { fontSize: 12, color: C.ink, fontWeight: '700' },
   durationCaption: {
     fontSize: 8,
     color: C.muted,
@@ -1410,7 +1410,7 @@ const s = StyleSheet.create({
     paddingHorizontal: 17,
     paddingVertical: 11,
   },
-  backHomeText: { color: C.white, fontSize: 11, fontWeight: '650' },
+  backHomeText: { color: C.white, fontSize: 11, fontWeight: '600' },
   bottomNote: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1441,7 +1441,7 @@ const s = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  calendarTitle: { fontSize: 17, fontWeight: '750', color: C.ink },
+  calendarTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
   calendarSubtitle: { fontSize: 10, color: C.muted, marginTop: 4 },
   monthNavigation: {
     flexDirection: 'row',
@@ -1459,7 +1459,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
   },
   disabledArrow: { opacity: 0.3 },
-  monthTitle: { fontSize: 13, fontWeight: '750', color: C.burgundy },
+  monthTitle: { fontSize: 13, fontWeight: '700', color: C.burgundy },
   calendarGrid: { flexDirection: 'row', flexWrap: 'wrap' },
   calendarCell: {
     width: '14.2857%',
@@ -1472,7 +1472,7 @@ const s = StyleSheet.create({
   calendarDaySelected: { backgroundColor: C.burgundy },
   calendarDayDisabled: { opacity: 0.3 },
   calendarDayText: { fontSize: 12, color: C.ink, fontWeight: '600' },
-  calendarDayTextSelected: { color: C.white, fontWeight: '750' },
+  calendarDayTextSelected: { color: C.white, fontWeight: '700' },
   calendarDayTextDisabled: { color: '#B8ADA5' },
   selectedDateRow: {
     flexDirection: 'row',
@@ -1483,7 +1483,7 @@ const s = StyleSheet.create({
     padding: 11,
     marginTop: 15,
   },
-  selectedDateText: { fontSize: 11, color: C.burgundy, fontWeight: '650' },
+  selectedDateText: { fontSize: 11, color: C.burgundy, fontWeight: '600' },
   searchDateButton: {
     height: 46,
     borderRadius: 11,
@@ -1535,7 +1535,7 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  sheetTitle: { fontSize: 19, fontWeight: '750', color: C.ink },
+  sheetTitle: { fontSize: 19, fontWeight: '700', color: C.ink },
   sheetSubtitle: { fontSize: 10, color: C.muted, marginTop: 3 },
   closeButton: {
     width: 34,
@@ -1554,7 +1554,7 @@ const s = StyleSheet.create({
   },
   filterSectionTitle: {
     fontSize: 12,
-    fontWeight: '750',
+    fontWeight: '700',
     color: C.ink,
     marginBottom: 11,
   },
@@ -1616,7 +1616,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: C.paper,
   },
-  clearButtonText: { fontSize: 12, fontWeight: '650', color: C.burgundy },
+  clearButtonText: { fontSize: 12, fontWeight: '600', color: C.burgundy },
   applyButton: {
     flex: 1.5,
     height: 46,

@@ -26,14 +26,21 @@ const C = {
   greenLight: '#EDF4EE',
   unavailable: '#E8E4E0',
   white: '#FFFFFF',
-  ladies: '#D94B91',
-  ladiesBorder: '#B92F73',
-  ladiesInk: '#FFFFFF',
+
+  // Ladies seat colors
+  ladies: '#FCEAF1',
+  ladiesBorder: '#E8B8C9',
+  ladiesInk: '#A65372',
+
+  // Booked ladies seat colors
+ladiesBooked: '#EADDE2',
+ladiesBookedBorder: '#D9C3CC',
+ladiesBookedInk: '#987986',
 };
 
-const GRID_GAP = 5;
-const GRID_PADDING = 7;
-const MIN_SEAT_HEIGHT = 42;
+const GRID_GAP = 3;
+const GRID_PADDING = 4;
+const MIN_SEAT_HEIGHT = 46;
 
 type Seat = {
   seat_Number?: string;
@@ -152,31 +159,36 @@ function SeatTile({
 
   const background = selected
     ? C.burgundy
-    : !bookable
-      ? C.unavailable
-      : ladies
-        ? C.ladies
-        : C.greenLight;
+    : ladies && !bookable
+      ? C.ladiesBooked
+      : !bookable
+        ? C.unavailable
+        : ladies
+          ? C.ladies
+          : C.greenLight;
 
   const borderColor = selected
     ? C.burgundy
-    : !bookable
-      ? '#D7D1CB'
-      : ladies
-        ? C.ladiesBorder
-        : '#BDD2C1';
+    : ladies && !bookable
+      ? C.ladiesBookedBorder
+      : !bookable
+        ? '#D7D1CB'
+        : ladies
+          ? C.ladiesBorder
+          : '#BDD2C1';
 
   const textColor = selected
     ? C.white
-    : !bookable
-      ? '#938B85'
-      : ladies
-        ? C.ladiesInk
-        : C.green;
+    : ladies && !bookable
+      ? C.ladiesBookedInk
+      : !bookable
+        ? '#938B85'
+        : ladies
+          ? C.ladiesInk
+          : C.green;
 
-  const isSleeper = numberValue(seat.length, 1) > 1;
-
-  const compact = width < 48;
+  const compact = width < 55;
+  const showIcon = width >= 48;
 
   return (
     <Pressable
@@ -193,21 +205,27 @@ function SeatTile({
         },
       ]}
     >
-      <Ionicons
-        name={isSleeper ? 'bed-outline' : 'person-outline'}
-        size={compact ? 12 : 16}
-        color={textColor}
-      />
+      {showIcon && (
+        <Ionicons
+          name={
+            numberValue(seat.length, 1) > 1
+              ? 'bed-outline'
+              : 'person-outline'
+          }
+          size={compact ? 12 : 15}
+          color={textColor}
+        />
+      )}
 
       <Text
         numberOfLines={1}
         adjustsFontSizeToFit
-        minimumFontScale={0.55}
+        minimumFontScale={0.75}
         style={[
           styles.seatNumber,
           {
             color: textColor,
-            fontSize: compact ? 8 : 10,
+            fontSize: compact ? 11 : 13,
           },
         ]}
       >
@@ -218,12 +236,12 @@ function SeatTile({
         <Text
           numberOfLines={1}
           adjustsFontSizeToFit
-          minimumFontScale={0.5}
+          minimumFontScale={0.75}
           style={[
             styles.seatFare,
             {
               color: textColor,
-              fontSize: compact ? 7 : 9,
+              fontSize: compact ? 10 : 11,
             },
           ]}
         >
@@ -235,18 +253,11 @@ function SeatTile({
 }
 
 /* =====================================================
-   DECK LAYOUT
-
-   Display horizontal axis = API row
-   Display vertical axis   = API column
-
-   Display horizontal span = API width
-   Display vertical span   = API length
-
-   Horizontal direction is reversed to correct the
-   mirrored seat ordering in the previous version.
-
-   The original provider seat objects are never mutated.
+   DECK
+   Horizontal position = API row (mirrored correction)
+   Vertical position   = API column
+   Horizontal span     = API width
+   Vertical span       = API length
 ===================================================== */
 
 function Deck({
@@ -273,19 +284,13 @@ function Deck({
     width: Math.max(1, numberValue(seat.width, 1)),
   }));
 
-  // Transformed horizontal coordinates.
-  const minX = Math.min(
-    ...positionedSeats.map(s => s.row)
-  );
+  const minX = Math.min(...positionedSeats.map(s => s.row));
 
   const maxX = Math.max(
     ...positionedSeats.map(s => s.row + s.width - 1)
   );
 
-  // Transformed vertical coordinates.
-  const minY = Math.min(
-    ...positionedSeats.map(s => s.column)
-  );
+  const minY = Math.min(...positionedSeats.map(s => s.column));
 
   const maxY = Math.max(
     ...positionedSeats.map(s => s.column + s.length - 1)
@@ -294,20 +299,12 @@ function Deck({
   const horizontalCells = maxX - minX + 1;
   const verticalCells = maxY - minY + 1;
 
-  const innerWidth = Math.max(
-    20,
-    deckWidth - GRID_PADDING * 2
-  );
+  const innerWidth = Math.max(20, deckWidth - GRID_PADDING * 2);
 
-  // Calculate horizontal cell width from the actual
-  // transformed horizontal coordinate range.
   const cellWidth =
-    (
-      innerWidth -
-      (horizontalCells - 1) * GRID_GAP
-    ) / horizontalCells;
+    (innerWidth - (horizontalCells - 1) * GRID_GAP) /
+    horizontalCells;
 
-  // Preserve a readable vertical cell height.
   const cellHeight = MIN_SEAT_HEIGHT;
 
   const gridWidth =
@@ -324,7 +321,7 @@ function Deck({
         <View style={styles.deckIcon}>
           <Ionicons
             name="grid-outline"
-            size={17}
+            size={16}
             color={C.burgundy}
           />
         </View>
@@ -349,31 +346,19 @@ function Deck({
           }}
         >
           {positionedSeats.map(item => {
-            /*
-             * MIRROR CORRECTION:
-             *
-             * Use the rightmost transformed coordinate
-             * as the horizontal origin.
-             *
-             * This reverses the horizontal seat ordering
-             * without changing the seat dimensions.
-             */
+            // Preserve existing provider coordinate correction.
             const left =
-              (
-                maxX -
-                (item.row + item.width - 1)
-              ) * (cellWidth + GRID_GAP);
+              (maxX - (item.row + item.width - 1)) *
+              (cellWidth + GRID_GAP);
 
             const top =
               (item.column - minY) *
               (cellHeight + GRID_GAP);
 
-            // API width = horizontal span.
             const tileWidth =
               item.width * cellWidth +
               (item.width - 1) * GRID_GAP;
 
-            // API length = vertical span.
             const tileHeight =
               item.length * cellHeight +
               (item.length - 1) * GRID_GAP;
@@ -429,7 +414,9 @@ function Legend({
         ]}
       />
 
-      <Text style={styles.legendText}>{label}</Text>
+      <Text style={styles.legendText}>
+        {label}
+      </Text>
     </View>
   );
 }
@@ -445,20 +432,14 @@ export default function Seats({ navigation, route }: any) {
   const params = route?.params || {};
   const bus = params.bus || {};
 
-  const boardingPoints: Point[] = Array.isArray(
-    params.boardingDetails
-  )
+  const boardingPoints: Point[] = Array.isArray(params.boardingDetails)
     ? params.boardingDetails
     : [];
 
-  const droppingPoints: Point[] = Array.isArray(
-    params.droppingDetails
-  )
+  const droppingPoints: Point[] = Array.isArray(params.droppingDetails)
     ? params.droppingDetails
     : [];
 
-  // Use the first points internally.
-  // Point selectors are intentionally not displayed here.
   const defaultBoarding =
     params.defaultBoarding || boardingPoints[0] || null;
 
@@ -472,27 +453,24 @@ export default function Seats({ navigation, route }: any) {
   const [error, setError] = useState('');
 
   const lowerDeck = useMemo(
-    () => seats.filter(
-      seat => numberValue(seat.zIndex) === 0
-    ),
+    () => seats.filter(seat => numberValue(seat.zIndex) === 0),
     [seats]
   );
 
   const upperDeck = useMemo(
-    () => seats.filter(
-      seat => numberValue(seat.zIndex) === 1
-    ),
+    () => seats.filter(seat => numberValue(seat.zIndex) === 1),
     [seats]
   );
 
   const otherDecks = useMemo(
-    () => [
-      ...new Set(
-        seats
-          .map(seat => numberValue(seat.zIndex))
-          .filter(value => value !== 0 && value !== 1)
-      ),
-    ].sort((a, b) => a - b),
+    () =>
+      [
+        ...new Set(
+          seats
+            .map(seat => numberValue(seat.zIndex))
+            .filter(value => value !== 0 && value !== 1)
+        ),
+      ].sort((a, b) => a - b),
     [seats]
   );
 
@@ -510,20 +488,24 @@ export default function Seats({ navigation, route }: any) {
   );
 
   /*
-   * Responsive sizing:
-   * Two decks share the available width.
-   * No horizontal scrolling is used.
+   * Calculate actual deck width from available screen width.
+   * Preserve responsive two-deck layout.
    */
-  const contentWidth = Math.min(screenWidth, 760);
-  const sectionInnerWidth = Math.max(
-    120,
-    contentWidth - 62
+  const maxContentWidth = Math.min(screenWidth, 760);
+  const outerPadding = 10;
+  const sectionPadding = 8;
+  const deckGap = 6;
+
+  const availableDeckSpace = Math.max(
+    100,
+    maxContentWidth -
+      outerPadding * 2 -
+      sectionPadding * 2 -
+      deckGap
   );
 
-  const deckGap = 10;
-
-  const deckWidth =
-    (sectionInnerWidth - deckGap) / 2;
+  const deckWidth = availableDeckSpace / 2;
+  const sectionInnerWidth = availableDeckSpace + deckGap;
 
   useEffect(() => {
     if (defaultBoarding && defaultDropping) {
@@ -545,12 +527,7 @@ export default function Seats({ navigation, route }: any) {
     const boardingId = pointId(boardingPoint);
     const droppingId = pointId(droppingPoint);
 
-    if (
-      !busKey ||
-      !searchKey ||
-      !boardingId ||
-      !droppingId
-    ) {
+    if (!busKey || !searchKey || !boardingId || !droppingId) {
       setError(
         'Required bus or journey point information is missing.'
       );
@@ -575,7 +552,7 @@ export default function Seats({ navigation, route }: any) {
 
       if (!seatList.length) {
         throw new Error(
-          response?.response_Header?.error_Desc ||
+         (response?.response_Header as { error_Desc?: string } | undefined)?.error_Desc ||
           'The provider returned no seat information.'
         );
       }
@@ -620,7 +597,7 @@ export default function Seats({ navigation, route }: any) {
       return;
     }
 
-    navigation.navigate('boarding', {
+    navigation.navigate('points', {
       bus,
       busKey: params.busKey || bus.bus_Key,
       searchKey: params.searchKey || bus.search_Key,
@@ -699,9 +676,7 @@ export default function Seats({ navigation, route }: any) {
             </Text>
 
             <Text style={styles.busType}>
-              {bus.bus_Type ||
-                bus.seat_Layout ||
-                'Bus'}
+              {bus.bus_Type || bus.seat_Layout || 'Bus'}
             </Text>
 
             <Text style={styles.busRoute}>
@@ -751,7 +726,13 @@ export default function Seats({ navigation, route }: any) {
             <Legend
               color={C.ladies}
               border={C.ladiesBorder}
-              label="Ladies"
+              label="Ladies only"
+            />
+
+            <Legend
+              color={C.ladiesBooked}
+              border={C.ladiesBookedBorder}
+              label="Booked ladies"
             />
           </View>
 
@@ -843,12 +824,14 @@ export default function Seats({ navigation, route }: any) {
               </View>
 
               {otherDecks.map(deck => (
-                <View key={deck} style={styles.otherDeck}>
+                <View
+                  key={deck}
+                  style={styles.otherDeck}
+                >
                   <Deck
                     title={`Deck ${deck}`}
                     seats={seats.filter(
-                      seat =>
-                        numberValue(seat.zIndex) === deck
+                      seat => numberValue(seat.zIndex) === deck
                     )}
                     selectedKeys={selectedKeys}
                     onToggle={toggleSeat}
@@ -975,8 +958,8 @@ const styles = StyleSheet.create({
 
   content: {
     width: '100%',
-    padding: 16,
-    gap: 15,
+    padding: 10,
+    gap: 12,
   },
 
   busCard: {
@@ -1023,7 +1006,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     borderRadius: 18,
-    padding: 12,
+    padding: 8,
   },
 
   sectionTitle: {
@@ -1055,20 +1038,20 @@ const styles = StyleSheet.create({
   legend: {
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 9,
-    marginTop: 15,
-    marginBottom: 15,
+    gap: 8,
+    marginTop: 12,
+    marginBottom: 12,
   },
 
   legendItem: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
+    gap: 4,
   },
 
   legendSwatch: {
-    width: 13,
-    height: 13,
+    width: 12,
+    height: 12,
     borderRadius: 4,
     borderWidth: 1,
   },
@@ -1084,12 +1067,12 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     justifyContent: 'space-between',
-    gap: 10,
+    gap: 6,
   },
 
   deckCard: {
     flexShrink: 0,
-    borderRadius: 15,
+    borderRadius: 13,
     borderWidth: 1,
     borderColor: C.border,
     backgroundColor: '#FBF9F5',
@@ -1097,20 +1080,20 @@ const styles = StyleSheet.create({
   },
 
   deckHeader: {
-    minHeight: 54,
-    paddingHorizontal: 8,
-    paddingVertical: 8,
+    minHeight: 48,
+    paddingHorizontal: 6,
+    paddingVertical: 6,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
+    gap: 5,
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
 
   deckIcon: {
-    width: 28,
-    height: 28,
-    borderRadius: 9,
+    width: 25,
+    height: 25,
+    borderRadius: 8,
     backgroundColor: C.burgundyLight,
     alignItems: 'center',
     justifyContent: 'center',
@@ -1123,13 +1106,13 @@ const styles = StyleSheet.create({
 
   deckTitle: {
     color: C.ink,
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '800',
   },
 
   deckCount: {
     color: C.muted,
-    fontSize: 10,
+    fontSize: 9,
     marginTop: 2,
   },
 
@@ -1139,11 +1122,11 @@ const styles = StyleSheet.create({
   },
 
   seatTile: {
-    borderRadius: 9,
+    borderRadius: 8,
     borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 3,
+    paddingVertical: 2,
     gap: 2,
     overflow: 'hidden',
   },
@@ -1238,7 +1221,7 @@ const styles = StyleSheet.create({
     color: C.muted,
     fontSize: 10,
     lineHeight: 16,
-    marginTop: 12,
+    marginTop: 10,
   },
 
   selectionCard: {

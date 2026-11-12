@@ -794,7 +794,7 @@ const s = StyleSheet.create({
     color: C.white,
     fontSize: 30,
     lineHeight: 36,
-    fontWeight: '650',
+    fontWeight: '600',
     letterSpacing: -0.8,
     marginTop: 8,
     maxWidth: 460,
@@ -848,7 +848,7 @@ const s = StyleSheet.create({
   },
   bookingTitle: {
     fontSize: 18,
-    fontWeight: '650',
+    fontWeight: '600',
     letterSpacing: -0.35,
     color: C.ink,
   },
@@ -973,7 +973,7 @@ const s = StyleSheet.create({
   },
   dateNumber: {
     fontSize: 19,
-    fontWeight: '650',
+    fontWeight: '600',
     color: C.ink,
   },
   dateWeek: { fontSize: 9, color: C.muted },
@@ -1005,7 +1005,7 @@ const s = StyleSheet.create({
   },
   sectionTitle: {
     fontSize: 17,
-    fontWeight: '650',
+    fontWeight: '600',
     letterSpacing: -0.3,
     color: C.ink,
   },
@@ -1095,7 +1095,7 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 14,
   },
-  modalTitle: { fontSize: 16, fontWeight: '650', color: C.ink },
+  modalTitle: { fontSize: 16, fontWeight: '600', color: C.ink },
   modalSubtitle: { fontSize: 10, color: C.muted, marginTop: 4 },
   closeButton: {
     width: 32,
@@ -1158,7 +1158,7 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 10,
   },
-  monthTitle: { fontSize: 14, fontWeight: '650', color: C.ink },
+  monthTitle: { fontSize: 14, fontWeight: '600', color: C.ink },
   monthControls: { flexDirection: 'row', gap: 7 },
   monthArrow: {
     width: 31,

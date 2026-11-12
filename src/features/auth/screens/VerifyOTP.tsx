@@ -1,0 +1,484 @@
+import React, { useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Keyboard,
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { Feather } from '@expo/vector-icons';
+import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
+
+import { sendOTP, verifyOTP } from '@/features/auth/api';
+import { saveTokens } from '@/features/auth/tokenStorage';
+
+type AuthStackParamList = {
+  login: undefined;
+  'verify-otp': {
+    mobileNumber: string;
+    expiresIn: number;
+  };
+};
+
+type VerifyOTPRoute = RouteProp<AuthStackParamList, 'verify-otp'>;
+
+export default function VerifyOTP() {
+  const navigation = useNavigation<any>();
+  const route = useRoute<VerifyOTPRoute>();
+
+  const { mobileNumber } = route.params;
+
+  const [otp, setOtp] = useState('');
+  const [countdown, setCountdown] = useState(
+    Math.max(0, route.params.expiresIn || 60)
+  );
+  const [verifying, setVerifying] = useState(false);
+  const [resending, setResending] = useState(false);
+  const [error, setError] = useState('');
+
+  const inputRef = useRef<TextInput>(null);
+
+  useEffect(() => {
+    if (countdown <= 0) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setCountdown((previous) => Math.max(0, previous - 1));
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [countdown]);
+
+  const handleVerify = async () => {
+    if (otp.length !== 6 || verifying) {
+      return;
+    }
+
+    Keyboard.dismiss();
+    setError('');
+    setVerifying(true);
+
+    try {
+      const response = await verifyOTP(mobileNumber, otp);
+
+      await saveTokens({
+        access_token: response.access_token,
+        refresh_token: response.refresh_token,
+      });
+
+      navigation.reset({
+        index: 0,
+        routes: [{ name: 'home' }],
+      });
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to verify OTP. Please try again.'
+      );
+    } finally {
+      setVerifying(false);
+    }
+  };
+
+  const handleResend = async () => {
+    if (countdown > 0 || resending || verifying) {
+      return;
+    }
+
+    setError('');
+    setResending(true);
+
+    try {
+      const response = await sendOTP(mobileNumber);
+
+      setOtp('');
+      setCountdown(Math.max(0, response.expires_in || 60));
+
+      inputRef.current?.focus();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Unable to resend OTP. Please try again.'
+      );
+    } finally {
+      setResending(false);
+    }
+  };
+
+  const formattedMobile = `+91 ${mobileNumber}`;
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          <View style={styles.topBar}>
+            <Pressable
+              onPress={() => navigation.goBack()}
+              style={styles.backButton}
+              accessibilityRole="button"
+              accessibilityLabel="Go back"
+            >
+              <Feather name="arrow-left" size={21} color="#382B28" />
+            </Pressable>
+
+            <Text style={styles.brand}>stablebus</Text>
+
+            <View style={styles.topBarSpacer} />
+          </View>
+
+          <View style={styles.hero}>
+            <View style={styles.iconContainer}>
+              <Feather name="message-circle" size={27} color="#783D4A" />
+            </View>
+
+            <Text style={styles.title}>Verify your number</Text>
+
+            <Text style={styles.subtitle}>
+              We've sent a one-time password to
+            </Text>
+
+            <View style={styles.mobileRow}>
+              <Text style={styles.mobileNumber}>{formattedMobile}</Text>
+
+              <Pressable
+                onPress={() => navigation.goBack()}
+                accessibilityRole="button"
+              >
+                <Text style={styles.changeNumber}>Change</Text>
+              </Pressable>
+            </View>
+          </View>
+
+          <View style={styles.form}>
+            <Text style={styles.label}>Enter 6-digit OTP</Text>
+
+            <Pressable
+              style={styles.otpContainer}
+              onPress={() => inputRef.current?.focus()}
+            >
+              {Array.from({ length: 6 }).map((_, index) => {
+                const digit = otp[index] || '';
+                const isActive = index === otp.length && otp.length < 6;
+
+                return (
+                  <View
+                    key={index}
+                    style={[
+                      styles.otpBox,
+                      isActive && styles.otpBoxActive,
+                      error && styles.otpBoxError,
+                    ]}
+                  >
+                    <Text style={styles.otpDigit}>{digit}</Text>
+                  </View>
+                );
+              })}
+
+              <TextInput
+                ref={inputRef}
+                value={otp}
+                onChangeText={(value) => {
+                  setOtp(value.replace(/\D/g, '').slice(0, 6));
+                  setError('');
+                }}
+                keyboardType="number-pad"
+                maxLength={6}
+                autoComplete="one-time-code"
+                textContentType="oneTimeCode"
+                style={styles.hiddenInput}
+                editable={!verifying}
+                accessibilityLabel="Six-digit OTP"
+              />
+            </Pressable>
+
+            {error ? (
+              <View style={styles.errorContainer}>
+                <Feather name="alert-circle" size={15} color="#B54747" />
+                <Text style={styles.errorText}>{error}</Text>
+              </View>
+            ) : (
+              <Text style={styles.helperText}>
+                Enter the code sent to your mobile number.
+              </Text>
+            )}
+
+            <View style={styles.resendRow}>
+              <Text style={styles.resendLabel}>
+                Didn't receive the code?
+              </Text>
+
+              {countdown > 0 ? (
+                <Text style={styles.countdown}>
+                  Resend in {countdown}s
+                </Text>
+              ) : (
+                <Pressable
+                  onPress={handleResend}
+                  disabled={resending || verifying}
+                  accessibilityRole="button"
+                >
+                  {resending ? (
+                    <ActivityIndicator size="small" color="#783D4A" />
+                  ) : (
+                    <Text style={styles.resendAction}>Resend OTP</Text>
+                  )}
+                </Pressable>
+              )}
+            </View>
+
+            <Pressable
+              style={[
+                styles.verifyButton,
+                (otp.length !== 6 || verifying) &&
+                  styles.buttonDisabled,
+              ]}
+              onPress={handleVerify}
+              disabled={otp.length !== 6 || verifying}
+              accessibilityRole="button"
+            >
+              {verifying ? (
+                <ActivityIndicator color="#FFFEFC" />
+              ) : (
+                <>
+                  <Text style={styles.verifyButtonText}>
+                    Verify & Continue
+                  </Text>
+                  <Feather
+                    name="arrow-right"
+                    size={18}
+                    color="#FFFEFC"
+                  />
+                </>
+              )}
+            </Pressable>
+
+            <View style={styles.privacyNote}>
+              <Feather name="shield" size={15} color="#887A73" />
+              <Text style={styles.privacyText}>
+                Your account is protected with secure verification.
+              </Text>
+            </View>
+          </View>
+
+          <View style={styles.bottomNote}>
+            <Text style={styles.bottomText}>
+              Need help? Contact StableBus support.
+            </Text>
+          </View>
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  flex: {
+    flex: 1,
+  },
+  safeArea: {
+    flex: 1,
+    backgroundColor: '#F8F4ED',
+  },
+  scrollContent: {
+    flexGrow: 1,
+    paddingHorizontal: 24,
+    paddingBottom: 24,
+  },
+  topBar: {
+    height: 58,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  backButton: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: '#FFFEFC',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  brand: {
+    fontSize: 19,
+    fontWeight: '700',
+    color: '#783D4A',
+    letterSpacing: -0.5,
+  },
+  topBarSpacer: {
+    width: 40,
+  },
+  hero: {
+    marginTop: 66,
+    marginBottom: 38,
+  },
+  iconContainer: {
+    width: 58,
+    height: 58,
+    borderRadius: 18,
+    backgroundColor: '#F4EAEB',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 25,
+  },
+  title: {
+    fontSize: 29,
+    fontWeight: '700',
+    color: '#382B28',
+    letterSpacing: -0.8,
+  },
+  subtitle: {
+    marginTop: 12,
+    fontSize: 15,
+    color: '#887A73',
+  },
+  mobileRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 8,
+  },
+  mobileNumber: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#382B28',
+  },
+  changeNumber: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#783D4A',
+  },
+  form: {
+    width: '100%',
+  },
+  label: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#382B28',
+    marginBottom: 15,
+  },
+  otpContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    position: 'relative',
+  },
+  otpBox: {
+    width: '14%',
+    aspectRatio: 0.9,
+    maxWidth: 53,
+    backgroundColor: '#FFFEFC',
+    borderWidth: 1,
+    borderColor: '#EAE0D7',
+    borderRadius: 13,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  otpBoxActive: {
+    borderColor: '#783D4A',
+    borderWidth: 1.5,
+  },
+  otpBoxError: {
+    borderColor: '#B54747',
+  },
+  otpDigit: {
+    fontSize: 22,
+    fontWeight: '600',
+    color: '#382B28',
+  },
+  hiddenInput: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0,
+  },
+  helperText: {
+    marginTop: 12,
+    fontSize: 12,
+    color: '#887A73',
+  },
+  errorContainer: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 7,
+    marginTop: 12,
+  },
+  errorText: {
+    flex: 1,
+    fontSize: 12,
+    lineHeight: 18,
+    color: '#B54747',
+  },
+  resendRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 27,
+  },
+  resendLabel: {
+    fontSize: 13,
+    color: '#887A73',
+  },
+  countdown: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#887A73',
+  },
+  resendAction: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#783D4A',
+  },
+  verifyButton: {
+    height: 56,
+    backgroundColor: '#783D4A',
+    borderRadius: 15,
+    marginTop: 30,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  buttonDisabled: {
+    opacity: 0.45,
+  },
+  verifyButtonText: {
+    color: '#FFFEFC',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  privacyNote: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    marginTop: 20,
+  },
+  privacyText: {
+    fontSize: 12,
+    color: '#887A73',
+  },
+  bottomNote: {
+    marginTop: 'auto',
+    paddingTop: 55,
+  },
+  bottomText: {
+    fontSize: 11,
+    lineHeight: 17,
+    textAlign: 'center',
+    color: '#A0948D',
+  },
+});
