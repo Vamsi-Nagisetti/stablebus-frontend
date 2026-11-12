@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "StableBus",
+    "slug": "stablebus",
+    "scheme": "stablebus",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-asset"
+    ],
+    "android": {
+      "package": "com.stablebus.app"
+    },
+    "ios": {
+      "bundleIdentifier": "com.stablebus.app"
+    }
+  }
+}

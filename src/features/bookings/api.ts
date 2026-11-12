@@ -1,0 +1,1 @@
+import {request} from '@/services/http';import type {RequeryResponse} from '@/types/api';export const bookingApi={requery:(id:string,guestToken?:string)=>request<RequeryResponse>(`/api/v1/bookings/${id}/requery`,{method:'POST',headers:guestToken?{'X-Guest-Access-Token':guestToken}:{}})};
