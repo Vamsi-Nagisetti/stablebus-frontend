@@ -1,7 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   Alert,
+  Animated,
+  Vibration,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   SafeAreaView,
@@ -14,6 +18,9 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { sendOTP, verifyOTP } from '@/features/auth/api';
+import { saveTokens, getTokens, clearTokens } from '@/features/auth/tokenStorage';
+import { request } from '@/services/http';
 
 const C = {
   bg: '#F8F4ED',
@@ -32,6 +39,15 @@ const C = {
 type Passenger = {
   name: string;
   age: string;
+  gender: string;
+  passengerId?: string;
+  seatIndex: number;
+};
+
+type SavedPassenger = {
+  passenger_id: string;
+  name: string;
+  age: number | string;
   gender: string;
 };
 
@@ -93,65 +109,246 @@ function formatTime(value: string): string {
   return `${String(hours % 12 || 12).padStart(2, '0')}:${match[2]} ${suffix}`;
 }
 
-function PassengerCard({
-  index,
-  seatName,
+function SavedPassengerRow({
   passenger,
-  onChange,
+  selected,
+  seatName,
+  disabled,
+  editing,
+  editValue,
+  onToggle,
+  onEdit,
+  onDelete,
+  onEditChange,
+  onSaveEdit,
+  onCancelEdit,
+  savingEdit,
 }: {
-  index: number;
-  seatName: string;
-  passenger: Passenger;
-  onChange: (field: keyof Passenger, value: string) => void;
+  passenger: SavedPassenger;
+  selected: boolean;
+  seatName?: string;
+  disabled: boolean;
+  editing: boolean;
+  editValue: { name: string; age: string; gender: string };
+  onToggle: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+  onEditChange: (field: 'name' | 'age' | 'gender', value: string) => void;
+  onSaveEdit: () => void;
+  onCancelEdit: () => void;
+  savingEdit: boolean;
+}) {
+  const initial = passenger.name?.trim()?.charAt(0)?.toUpperCase() || '?';
+
+  const genderShort =
+    passenger.gender?.toLowerCase() === 'female'
+      ? 'F'
+      : passenger.gender?.toLowerCase() === 'male'
+        ? 'M'
+        : 'O';
+
+  return (
+    <View
+      style={[
+        styles.savedRowWrap,
+        selected && styles.savedRowWrapSelected,
+        disabled && styles.savedRowWrapDisabled,
+      ]}
+    >
+      <View style={styles.savedRow}>
+        <Pressable
+          onPress={onToggle}
+          disabled={disabled && !selected}
+          style={styles.savedRowSelect}
+        >
+          <View
+            style={[
+              styles.checkbox,
+              selected && styles.checkboxSelected,
+              disabled && styles.checkboxDisabled,
+            ]}
+          >
+            {selected && (
+              <Ionicons name="checkmark" size={14} color={C.white} />
+            )}
+          </View>
+
+          <View style={styles.savedAvatar}>
+            <Text style={styles.savedAvatarText}>{initial}</Text>
+          </View>
+
+          <View style={styles.savedInfo}>
+            <Text
+              style={[
+                styles.savedName,
+                disabled && styles.disabledSavedText,
+              ]}
+              numberOfLines={1}
+            >
+              {passenger.name}
+            </Text>
+
+            <Text style={styles.savedMeta}>
+              {genderShort} · {passenger.age}
+              {disabled ? ' · No standard seats left' : ''}
+            </Text>
+          </View>
+
+          {selected && seatName ? (
+            <View style={styles.assignedSeat}>
+              <Ionicons
+                name="ticket-outline"
+                size={13}
+                color={C.green}
+              />
+              <Text style={styles.assignedSeatText}>{seatName}</Text>
+            </View>
+          ) : null}
+        </Pressable>
+
+        <Pressable
+          onPress={onEdit}
+          style={styles.rowAction}
+          hitSlop={8}
+        >
+          <Ionicons name="create-outline" size={17} color={C.muted} />
+        </Pressable>
+
+        <Pressable
+          onPress={onDelete}
+          style={styles.rowAction}
+          hitSlop={8}
+        >
+          <Ionicons name="trash-outline" size={17} color={C.error} />
+        </Pressable>
+      </View>
+
+      {editing && (
+        <View style={styles.inlineEditPanel}>
+          <TextInput
+            value={editValue.name}
+            onChangeText={value => onEditChange('name', value)}
+            placeholder="Full name"
+            placeholderTextColor="#A99D95"
+            autoCapitalize="words"
+            style={styles.inlineEditInput}
+          />
+
+          <TextInput
+            value={editValue.age}
+            onChangeText={value =>
+              onEditChange(
+                'age',
+                value.replace(/[^0-9]/g, '').slice(0, 3)
+              )
+            }
+            placeholder="Age"
+            placeholderTextColor="#A99D95"
+            keyboardType="number-pad"
+            style={[
+              styles.inlineEditInput,
+              styles.inlineAgeInput,
+            ]}
+          />
+
+          <View style={styles.inlineGenderRow}>
+            {['Male', 'Female', 'Other'].map(gender => (
+              <Pressable
+                key={gender}
+                onPress={() => onEditChange('gender', gender)}
+                style={[
+                  styles.genderOption,
+                  styles.inlineGenderOption,
+                  editValue.gender === gender &&
+                    styles.genderOptionSelected,
+                ]}
+              >
+                <Text
+                  style={[
+                    styles.genderText,
+                    editValue.gender === gender &&
+                      styles.genderTextSelected,
+                  ]}
+                >
+                  {gender}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+
+          <View style={styles.inlineEditActions}>
+            <Pressable
+              onPress={onCancelEdit}
+              style={styles.cancelPassengerButton}
+            >
+              <Text style={styles.cancelPassengerText}>Cancel</Text>
+            </Pressable>
+
+            <Pressable
+              onPress={onSaveEdit}
+              disabled={savingEdit}
+              style={styles.savePassengerButton}
+            >
+              {savingEdit ? (
+                <ActivityIndicator color={C.white} size="small" />
+              ) : (
+                <Ionicons
+                  name="checkmark"
+                  size={15}
+                  color={C.white}
+                />
+              )}
+
+              <Text style={styles.savePassengerButtonText}>
+                {savingEdit ? 'Saving…' : 'Save changes'}
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      )}
+    </View>
+  );
+}
+
+function PassengerForm({
+  value,
+  onChange,
+  onSave,
+  onCancel,
+  saving,
+}: {
+  value: Passenger;
+  onChange: (field: 'name' | 'age' | 'gender', value: string) => void;
+  onSave: () => void;
+  onCancel: () => void;
+  saving: boolean;
 }) {
   return (
     <View style={styles.passengerCard}>
-      <View style={styles.passengerHeading}>
-        <View style={styles.passengerNumber}>
-          <Text style={styles.passengerNumberText}>{index + 1}</Text>
-        </View>
-
-        <View style={{ flex: 1 }}>
-          <Text style={styles.passengerTitle}>
-            Passenger {index + 1}
-          </Text>
-          <Text style={styles.passengerSeat}>
-            Seat {seatName}
-          </Text>
-        </View>
-
-        <View style={styles.seatTag}>
-          <Ionicons name="ticket-outline" size={13} color={C.burgundy} />
-          <Text style={styles.seatTagText}>{seatName}</Text>
-        </View>
-      </View>
+      <Text style={styles.passengerTitle}>New passenger details</Text>
 
       <View style={styles.field}>
         <Text style={styles.label}>Full name</Text>
         <TextInput
-          value={passenger.name}
-          onChangeText={value => onChange('name', value)}
-          placeholder="Enter passenger's full name"
+          value={value.name}
+          onChangeText={v => onChange('name', v)}
+          placeholder="Enter full name"
           placeholderTextColor="#A99D95"
           autoCapitalize="words"
-          autoCorrect={false}
           style={styles.input}
-          returnKeyType="next"
         />
       </View>
 
       <View style={styles.field}>
         <Text style={styles.label}>Age</Text>
         <TextInput
-          value={passenger.age}
-          onChangeText={value =>
-            onChange('age', value.replace(/[^0-9]/g, '').slice(0, 3))
+          value={value.age}
+          onChangeText={v =>
+            onChange('age', v.replace(/[^0-9]/g, '').slice(0, 3))
           }
           placeholder="Enter age"
-          placeholderTextColor="#A99D95"
           keyboardType="number-pad"
           style={styles.input}
-          maxLength={3}
         />
       </View>
 
@@ -159,39 +356,55 @@ function PassengerCard({
         <Text style={styles.label}>Gender</Text>
 
         <View style={styles.genderRow}>
-          {['Male', 'Female', 'Other'].map(gender => {
-            const selected = passenger.gender === gender;
-
-            return (
-              <Pressable
-                key={gender}
-                onPress={() => onChange('gender', gender)}
+          {['Male', 'Female', 'Other'].map(g => (
+            <Pressable
+              key={g}
+              onPress={() => onChange('gender', g)}
+              style={[
+                styles.genderOption,
+                value.gender === g && styles.genderOptionSelected,
+              ]}
+            >
+              <Text
                 style={[
-                  styles.genderOption,
-                  selected && styles.genderOptionSelected,
-                  selected && gender === 'Female' && styles.femaleGenderSelected,
+                  styles.genderText,
+                  value.gender === g && styles.genderTextSelected,
                 ]}
               >
-                {selected && (
-                  <Ionicons
-                    name="checkmark-circle"
-                    size={15}
-                    color={gender === 'Female' ? '#A65372' : C.burgundy}
-                  />
-                )}
-                <Text
-                  style={[
-                    styles.genderText,
-                    selected && styles.genderTextSelected,
-                    selected && gender === 'Female' && styles.femaleGenderText,
-                  ]}
-                >
-                  {gender}
-                </Text>
-              </Pressable>
-            );
-          })}
+                {g}
+              </Text>
+            </Pressable>
+          ))}
         </View>
+      </View>
+
+      <View style={styles.formActions}>
+        <Pressable
+          onPress={onCancel}
+          style={styles.cancelPassengerButton}
+        >
+          <Text style={styles.cancelPassengerText}>Cancel</Text>
+        </Pressable>
+
+        <Pressable
+          onPress={onSave}
+          disabled={saving}
+          style={styles.savePassengerButton}
+        >
+          {saving ? (
+            <ActivityIndicator color={C.white} size="small" />
+          ) : (
+            <Ionicons
+              name="bookmark-outline"
+              size={15}
+              color={C.white}
+            />
+          )}
+
+          <Text style={styles.savePassengerButtonText}>
+            {saving ? 'Saving…' : 'Save passenger'}
+          </Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -218,73 +431,604 @@ export default function Passengers({ navigation, route }: any) {
 
   const totalFare = Number(params.totalFare || 0);
 
-  const [passengers, setPassengers] = useState<Passenger[]>(
-    () =>
-      selectedSeats.map(() => ({
-        name: '',
-        age: '',
-        gender: '',
-      }))
-  );
-
+  const [passengers, setPassengers] = useState<Passenger[]>([]);
   const [mobile, setMobile] = useState('');
   const [email, setEmail] = useState('');
 
-  function updatePassenger(
-    index: number,
-    field: keyof Passenger,
+  const [loginVisible, setLoginVisible] = useState(false);
+  const [otpStep, setOtpStep] = useState(false);
+  const [otp, setOtp] = useState('');
+  const [otpCountdown, setOtpCountdown] = useState(0);
+  const [otpError, setOtpError] = useState('');
+
+  const otpInputRef = useRef<TextInput>(null);
+  const otpShake = useRef(new Animated.Value(0)).current;
+
+  const [authLoading, setAuthLoading] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [savedPassengers, setSavedPassengers] = useState<SavedPassenger[]>([]);
+
+  const [showAddPassenger, setShowAddPassenger] = useState(false);
+  const [draftPassenger, setDraftPassenger] = useState<Passenger>({
+    name: '',
+    age: '',
+    gender: '',
+    seatIndex: -1,
+  });
+  const [savingPassenger, setSavingPassenger] = useState(false);
+
+  const [editingPassengerId, setEditingPassengerId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState({
+    name: '',
+    age: '',
+    gender: '',
+  });
+  const [updatingPassenger, setUpdatingPassenger] = useState(false);
+  const [deletingPassengerId, setDeletingPassengerId] = useState<string | null>(null);
+
+  // Restore login from persisted tokens when this screen is opened again.
+  useEffect(() => {
+    let active = true;
+
+    (async () => {
+      try {
+        const tokens = await getTokens();
+        if (!tokens || !active) return;
+
+        setIsAuthenticated(true);
+
+        try {
+          const saved = await request<SavedPassenger[]>(
+            '/api/v1/users/passengers'
+          );
+
+          if (active) {
+            setSavedPassengers(Array.isArray(saved) ? saved : []);
+          }
+        } catch (error: any) {
+          const status =
+            error?.status ??
+            error?.statusCode ??
+            error?.response?.status;
+
+          if (status === 401) {
+            await clearTokens().catch(() => undefined);
+
+            if (active) {
+              setIsAuthenticated(false);
+            }
+          }
+        }
+      } catch {
+        // Keep guest checkout available if token storage cannot be read.
+      }
+    })();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!otpStep || otpCountdown <= 0) return;
+
+    const timer = setInterval(() => {
+      setOtpCountdown(current => Math.max(0, current - 1));
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [otpStep, otpCountdown]);
+
+  function updateDraft(
+    field: 'name' | 'age' | 'gender',
     value: string
   ) {
-    setPassengers(current =>
-      current.map((passenger, passengerIndex) =>
-        passengerIndex === index
-          ? { ...passenger, [field]: value }
-          : passenger
+    setDraftPassenger(current => ({
+      ...current,
+      [field]: value,
+    }));
+  }
+
+  function handleSignIn() {
+    setOtpStep(false);
+    setOtp('');
+    setOtpError('');
+    setOtpCountdown(0);
+    setLoginVisible(true);
+  }
+
+  function shakeOtp() {
+    otpShake.setValue(0);
+
+    Animated.sequence([
+      Animated.timing(otpShake, {
+        toValue: 9,
+        duration: 55,
+        useNativeDriver: true,
+      }),
+      Animated.timing(otpShake, {
+        toValue: -9,
+        duration: 55,
+        useNativeDriver: true,
+      }),
+      Animated.timing(otpShake, {
+        toValue: 6,
+        duration: 55,
+        useNativeDriver: true,
+      }),
+      Animated.timing(otpShake, {
+        toValue: 0,
+        duration: 55,
+        useNativeDriver: true,
+      }),
+    ]).start();
+
+    if (Platform.OS !== 'web') {
+      Vibration.vibrate(160);
+    }
+  }
+
+  function readableApiError(error: any, fallback: string) {
+    const raw = error?.message ?? error?.detail ?? fallback;
+
+    if (typeof raw !== 'string') return fallback;
+
+    const jsonStart = raw.indexOf('{');
+
+    if (jsonStart >= 0) {
+      try {
+        const parsed = JSON.parse(raw.slice(jsonStart));
+        return parsed?.message || parsed?.detail || fallback;
+      } catch {
+        return fallback;
+      }
+    }
+
+    return raw || fallback;
+  }
+
+  async function refreshSavedPassengers() {
+    const result = await request<SavedPassenger[]>(
+      '/api/v1/users/passengers'
+    );
+
+    const list = Array.isArray(result) ? result : [];
+    setSavedPassengers(list);
+
+    return list;
+  }
+
+  async function handleSendOTP() {
+    const number = mobile.trim();
+
+    if (!/^[6-9]\d{9}$/.test(number)) {
+      Alert.alert(
+        'Invalid mobile number',
+        'Enter a valid 10-digit Indian mobile number.'
+      );
+      return;
+    }
+
+    try {
+      setAuthLoading(true);
+      await sendOTP(number);
+
+      setOtpStep(true);
+      setOtp('');
+      setOtpError('');
+      setOtpCountdown(60);
+    } catch (error: any) {
+      Alert.alert(
+        'Unable to send OTP',
+        readableApiError(error, 'Please try again.')
+      );
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function handleVerifyOTP() {
+    if (!/^\d{6}$/.test(otp)) {
+      setOtpError('Please enter all 6 digits.');
+      shakeOtp();
+      return;
+    }
+
+    try {
+      setAuthLoading(true);
+      setOtpError('');
+
+      const result = await verifyOTP(mobile.trim(), otp);
+
+      await saveTokens({
+        access_token: result.access_token,
+        refresh_token: result.refresh_token,
+      });
+
+      setIsAuthenticated(true);
+      setLoginVisible(false);
+      setOtpStep(false);
+      setOtp('');
+
+      await refreshSavedPassengers();
+    } catch (error: any) {
+      const status =
+        error?.status ??
+        error?.statusCode ??
+        error?.response?.status;
+
+      setOtpError(
+        status === 401
+          ? 'Invalid or expired OTP. Please try again.'
+          : readableApiError(
+              error,
+              'Verification failed. Please try again.'
+            )
+      );
+
+      setOtp('');
+      shakeOtp();
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  function isLadiesSeat(seat: any): boolean {
+    const value = seat?.ladies_Seat;
+
+    return (
+      value === true ||
+      value === 1 ||
+      ['true', '1', 'yes', 'y'].includes(
+        String(value).trim().toLowerCase()
       )
     );
   }
 
-  function handleSignIn() {
-    Alert.alert(
-      'Sign in',
-      'Sign-in will be available here soon. You can continue your booking as a guest for now.'
+  function isFemalePassenger(gender: string): boolean {
+    return ['female', 'f', 'woman'].includes(
+      String(gender).trim().toLowerCase()
     );
+  }
+
+  function showLadiesSeatError() {
+    if (Platform.OS !== 'web') {
+      Vibration.vibrate(250);
+    }
+
+    Alert.alert(
+      'Ladies-only seat',
+      'This seat is reserved for female passengers. Please select a female passenger or choose another seat.',
+      [{ text: 'Got it' }]
+    );
+  }
+
+  function nextCompatibleSeat(
+    gender: string,
+    current: Passenger[] = passengers
+  ) {
+    const occupied = new Set(current.map(p => p.seatIndex));
+    const female = isFemalePassenger(gender);
+
+    return selectedSeats.findIndex((seat, index) => {
+      if (occupied.has(index)) return false;
+      if (isLadiesSeat(seat) && !female) return false;
+      return true;
+    });
+  }
+
+  function canAssignPassenger(
+    gender: string,
+    current: Passenger[] = passengers
+  ) {
+    return nextCompatibleSeat(gender, current) >= 0;
+  }
+
+  function beginEditPassenger(saved: SavedPassenger) {
+    setEditingPassengerId(saved.passenger_id);
+    setEditDraft({
+      name: saved.name || '',
+      age: String(saved.age ?? ''),
+      gender: saved.gender || '',
+    });
+  }
+
+  function updateEditDraft(
+    field: 'name' | 'age' | 'gender',
+    value: string
+  ) {
+    setEditDraft(current => ({
+      ...current,
+      [field]: value,
+    }));
+  }
+
+  async function savePassengerEdit(saved: SavedPassenger) {
+    const name = editDraft.name.trim();
+    const age = Number(editDraft.age);
+
+    if (!name || !editDraft.age || !editDraft.gender) {
+      Alert.alert(
+        'Passenger details required',
+        'Enter name, age and gender.'
+      );
+      return;
+    }
+
+    if (!Number.isInteger(age) || age < 1 || age > 100) {
+      Alert.alert('Invalid age', 'Enter an age between 1 and 100.');
+      return;
+    }
+
+    try {
+      setUpdatingPassenger(true);
+
+      await request(
+        `/api/v1/users/passengers/${saved.passenger_id}`,
+        {
+          method: 'PUT',
+          body: JSON.stringify({
+            name,
+            age,
+            gender: editDraft.gender,
+          }),
+        }
+      );
+
+      setSavedPassengers(current =>
+        current.map(item =>
+          item.passenger_id === saved.passenger_id
+            ? {
+                ...item,
+                name,
+                age,
+                gender: editDraft.gender,
+              }
+            : item
+        )
+      );
+
+      setPassengers(current =>
+        current
+          .map(item => {
+            if (item.passengerId !== saved.passenger_id) {
+              return item;
+            }
+
+            if (
+              isLadiesSeat(selectedSeats[item.seatIndex]) &&
+              !isFemalePassenger(editDraft.gender)
+            ) {
+              return null;
+            }
+
+            return {
+              ...item,
+              name,
+              age: String(age),
+              gender: editDraft.gender,
+            };
+          })
+          .filter(Boolean) as Passenger[]
+      );
+
+      setEditingPassengerId(null);
+    } catch (error: any) {
+      Alert.alert(
+        'Unable to update passenger',
+        readableApiError(error, 'Please try again.')
+      );
+    } finally {
+      setUpdatingPassenger(false);
+    }
+  }
+
+  async function deleteSavedPassenger(saved: SavedPassenger) {
+    try {
+      setDeletingPassengerId(saved.passenger_id);
+
+      await request(
+        `/api/v1/users/passengers/${saved.passenger_id}`,
+        {
+          method: 'DELETE',
+        }
+      );
+
+      setSavedPassengers(current =>
+        current.filter(
+          item => item.passenger_id !== saved.passenger_id
+        )
+      );
+
+      setPassengers(current =>
+        current.filter(
+          item => item.passengerId !== saved.passenger_id
+        )
+      );
+
+      if (editingPassengerId === saved.passenger_id) {
+        setEditingPassengerId(null);
+      }
+    } catch (error: any) {
+      Alert.alert(
+        'Unable to delete passenger',
+        readableApiError(error, 'Please try again.')
+      );
+    } finally {
+      setDeletingPassengerId(null);
+    }
+  }
+
+  function toggleSavedPassenger(saved: SavedPassenger) {
+    const existingIndex = passengers.findIndex(
+      p => p.passengerId === saved.passenger_id
+    );
+
+    if (existingIndex >= 0) {
+      setPassengers(current =>
+        current.filter(p => p.passengerId !== saved.passenger_id)
+      );
+      return;
+    }
+
+    const seatIndex = nextCompatibleSeat(saved.gender);
+
+    if (seatIndex < 0) {
+      if (!isFemalePassenger(saved.gender)) {
+        showLadiesSeatError();
+      } else {
+        Alert.alert(
+          'No seats available',
+          'There are no unassigned seats available for this passenger.'
+        );
+      }
+      return;
+    }
+
+    setPassengers(current => [
+      ...current,
+      {
+        name: saved.name,
+        age: String(saved.age ?? ''),
+        gender: saved.gender,
+        passengerId: saved.passenger_id,
+        seatIndex,
+      },
+    ]);
+  }
+
+  async function saveNewPassenger() {
+    const p = draftPassenger;
+
+    if (!p.name.trim() || !p.age || !p.gender) {
+      Alert.alert(
+        'Passenger details required',
+        'Enter name, age and gender.'
+      );
+      return;
+    }
+
+    const age = Number(p.age);
+
+    if (!Number.isInteger(age) || age < 1 || age > 100) {
+      Alert.alert('Invalid age', 'Enter an age between 1 and 100.');
+      return;
+    }
+
+    if (!isAuthenticated) {
+      Alert.alert(
+        'Sign in required',
+        'Sign in before saving a passenger.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          { text: 'Sign in', onPress: handleSignIn },
+        ]
+      );
+      return;
+    }
+
+    try {
+      setSavingPassenger(true);
+
+      // Save the passenger independently of seat availability.
+      await request('/api/v1/users/passengers', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: p.name.trim(),
+          age,
+          gender: p.gender,
+        }),
+      });
+
+      const list = await refreshSavedPassengers();
+
+      const match = list.find(
+        item =>
+          item.name?.trim().toLowerCase() ===
+            p.name.trim().toLowerCase() &&
+          Number(item.age) === age &&
+          item.gender?.toLowerCase() === p.gender.toLowerCase()
+      );
+
+      setDraftPassenger({
+        name: '',
+        age: '',
+        gender: '',
+        seatIndex: -1,
+      });
+
+      setShowAddPassenger(false);
+
+      if (!match) {
+        Alert.alert(
+          'Passenger saved',
+          'Passenger was saved, but could not be selected automatically. You can select them from the saved passenger list.'
+        );
+        return;
+      }
+
+      const seatIndex = nextCompatibleSeat(match.gender);
+
+      if (seatIndex < 0) {
+        Alert.alert(
+          'Passenger saved',
+          isFemalePassenger(match.gender)
+            ? 'Passenger saved successfully. No unassigned seat is available.'
+            : 'Passenger saved successfully, but the remaining seats are ladies-only. Select another seat to assign this passenger.'
+        );
+        return;
+      }
+
+      setPassengers(current => [
+        ...current,
+        {
+          name: match.name,
+          age: String(match.age),
+          gender: match.gender,
+          passengerId: match.passenger_id,
+          seatIndex,
+        },
+      ]);
+
+      Alert.alert(
+        'Passenger saved',
+        `${match.name} has been saved and assigned seat ${seatNames[seatIndex]}.`
+      );
+    } catch (error: any) {
+      Alert.alert(
+        'Unable to save passenger',
+        readableApiError(error, 'Please try again.')
+      );
+    } finally {
+      setSavingPassenger(false);
+    }
   }
 
   function validateAndContinue() {
     if (!selectedSeats.length) {
       Alert.alert(
         'No seats selected',
-        'Please go back and select at least one seat.'
+        'Please go back and select seats.'
       );
       return;
     }
 
-    for (let i = 0; i < passengers.length; i++) {
-      const passenger = passengers[i];
+    if (passengers.length !== selectedSeats.length) {
+      Alert.alert(
+        'Passenger details incomplete',
+        `Select or add passengers for all ${selectedSeats.length} seats. ${selectedSeats.length - passengers.length} seat(s) remain unassigned.`
+      );
+      return;
+    }
 
-      if (!passenger.name.trim()) {
+    for (const passenger of passengers) {
+      if (
+        isLadiesSeat(selectedSeats[passenger.seatIndex]) &&
+        passenger.gender.toLowerCase() !== 'female'
+      ) {
         Alert.alert(
-          'Passenger name required',
-          `Please enter the name for passenger ${i + 1}.`
-        );
-        return;
-      }
-
-      const age = Number(passenger.age);
-
-      if (!passenger.age || !Number.isInteger(age) || age < 1 || age > 100) {
-        Alert.alert(
-          'Invalid age',
-          `Please enter a valid age between 1 and 100 for passenger ${i + 1}.`
-        );
-        return;
-      }
-
-      if (!passenger.gender) {
-        Alert.alert(
-          'Select gender',
-          `Please select the gender for passenger ${i + 1}.`
+          'Ladies seat restriction',
+          'A ladies-only seat can only be assigned to a female passenger.'
         );
         return;
       }
@@ -302,19 +1046,23 @@ export default function Passengers({ navigation, route }: any) {
       email.trim() &&
       !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
     ) {
-      Alert.alert(
-        'Invalid email',
-        'Please enter a valid email address.'
-      );
+      Alert.alert('Invalid email', 'Please enter a valid email address.');
       return;
     }
 
-    const passengerPayload = passengers.map((passenger, index) => ({
+    const orderedPassengers = [...passengers].sort(
+      (a, b) => a.seatIndex - b.seatIndex
+    );
+
+    const passengerPayload = orderedPassengers.map(passenger => ({
       name: passenger.name.trim(),
       age: Number(passenger.age),
       gender: passenger.gender,
-      seat: seatNames[index],
-      seatKey: selectedSeats[index]?.seat_Key,
+      seat: seatNames[passenger.seatIndex],
+      seatKey: selectedSeats[passenger.seatIndex]?.seat_Key,
+      ...(passenger.passengerId
+        ? { passenger_id: passenger.passengerId }
+        : {}),
     }));
 
     const bookingDetails = {
@@ -337,7 +1085,7 @@ export default function Passengers({ navigation, route }: any) {
 
     Alert.alert(
       'Passenger details completed',
-      'All passenger and contact details have been validated. The next step is payment integration.'
+      'Passenger and contact details are ready for the next step.'
     );
 
     console.log('[StableBus] Passenger details validated:', {
@@ -412,7 +1160,9 @@ export default function Passengers({ navigation, route }: any) {
 
             <View style={styles.routeRow}>
               <View style={styles.routeStop}>
-                <Text style={styles.routeTime}>{departureTime || '--'}</Text>
+                <Text style={styles.routeTime}>
+                  {departureTime || '--'}
+                </Text>
                 <Text style={styles.routeCity}>
                   {params.from || 'Departure'}
                 </Text>
@@ -431,7 +1181,9 @@ export default function Passengers({ navigation, route }: any) {
               </View>
 
               <View style={[styles.routeStop, { alignItems: 'flex-end' }]}>
-                <Text style={styles.routeTime}>{arrivalTime || '--'}</Text>
+                <Text style={styles.routeTime}>
+                  {arrivalTime || '--'}
+                </Text>
                 <Text style={styles.routeCity}>
                   {params.to || 'Destination'}
                 </Text>
@@ -500,11 +1252,10 @@ export default function Passengers({ navigation, route }: any) {
           <View style={styles.headingBlock}>
             <Text style={styles.heading}>Passenger information</Text>
             <Text style={styles.subheading}>
-              Please enter the details exactly as required for travel.
+              Select saved passengers or add new passengers.
             </Text>
           </View>
 
-          {/* Sign-in prompt for guest users */}
           <View style={styles.signInCard}>
             <View style={styles.signInIcon}>
               <Ionicons
@@ -516,39 +1267,105 @@ export default function Passengers({ navigation, route }: any) {
 
             <View style={styles.signInContent}>
               <Text style={styles.signInTitle}>
-                Don't lose track of your bookings
+                {isAuthenticated
+                  ? 'You are signed in'
+                  : 'Sign in to access saved passengers'}
               </Text>
 
               <Text style={styles.signInDescription}>
-               Sign in to access your bookings, cancellations and trip details anytime.
+                {isAuthenticated
+                  ? `${savedPassengers.length} saved passengers available.`
+                  : 'Access your bookings and saved passengers anytime.'}
               </Text>
 
-              <Pressable
-                onPress={handleSignIn}
-                hitSlop={8}
-                style={styles.signInLink}
-              >
-                <Text style={styles.signInLinkText}>Sign in</Text>
-                <Ionicons
-                  name="arrow-forward"
-                  size={14}
-                  color={C.burgundy}
-                />
-              </Pressable>
+              {!isAuthenticated && (
+                <Pressable
+                  onPress={handleSignIn}
+                  style={styles.signInLink}
+                >
+                  <Text style={styles.signInLinkText}>Sign in</Text>
+                  <Ionicons
+                    name="arrow-forward"
+                    size={14}
+                    color={C.burgundy}
+                  />
+                </Pressable>
+              )}
             </View>
           </View>
 
-          {passengers.map((passenger, index) => (
-            <PassengerCard
-              key={`${seatNames[index]}-${index}`}
-              index={index}
-              seatName={seatNames[index]}
-              passenger={passenger}
-              onChange={(field, value) =>
-                updatePassenger(index, field, value)
-              }
+          {isAuthenticated && (
+            <View style={styles.savedListCard}>
+              <Text style={styles.savedListTitle}>Saved passengers</Text>
+              <Text style={styles.savedListSubtitle}>
+                Select passengers to assign them to available seats.
+              </Text>
+
+              {savedPassengers.length === 0 ? (
+                <Text style={styles.emptySavedText}>
+                  No saved passengers yet. Add one below.
+                </Text>
+              ) : (
+                savedPassengers.map(saved => {
+                  const assigned = passengers.find(
+                    p => p.passengerId === saved.passenger_id
+                  );
+
+                  const selected = !!assigned;
+
+                  const noCompatibleSeat =
+                    !selected && !canAssignPassenger(saved.gender);
+
+                  return (
+                    <SavedPassengerRow
+                      key={saved.passenger_id}
+                      passenger={saved}
+                      selected={selected}
+                      seatName={
+                        assigned
+                          ? seatNames[assigned.seatIndex]
+                          : undefined
+                      }
+                      disabled={noCompatibleSeat}
+                      editing={editingPassengerId === saved.passenger_id}
+                      editValue={editDraft}
+                      onToggle={() => toggleSavedPassenger(saved)}
+                      onEdit={() => beginEditPassenger(saved)}
+                      onDelete={() => deleteSavedPassenger(saved)}
+                      onEditChange={updateEditDraft}
+                      onSaveEdit={() => savePassengerEdit(saved)}
+                      onCancelEdit={() => setEditingPassengerId(null)}
+                      savingEdit={updatingPassenger}
+                    />
+                  );
+                })
+              )}
+            </View>
+          )}
+
+          <Pressable
+            onPress={() => setShowAddPassenger(v => !v)}
+            style={styles.addPassengerButton}
+          >
+            <Ionicons
+              name={showAddPassenger ? 'close' : 'add-circle-outline'}
+              size={18}
+              color={C.burgundy}
             />
-          ))}
+            <Text style={styles.addPassengerButtonText}>
+              {showAddPassenger ? 'Close passenger form' : 'Add passenger'}
+            </Text>
+          </Pressable>
+
+          {showAddPassenger && (
+            <PassengerForm
+              value={draftPassenger}
+              onChange={updateDraft}
+              onSave={saveNewPassenger}
+              onCancel={() => setShowAddPassenger(false)}
+              saving={savingPassenger}
+            />
+          )}
 
           <View style={styles.contactCard}>
             <View style={styles.contactHeading}>
@@ -623,7 +1440,8 @@ export default function Passengers({ navigation, route }: any) {
             <Text style={styles.fareLabel}>Total seat fare</Text>
             <Text style={styles.fareValue}>{formatFare(totalFare)}</Text>
             <Text style={styles.fareSeats}>
-              {selectedSeats.length} {selectedSeats.length === 1 ? 'seat' : 'seats'}
+              {selectedSeats.length}{' '}
+              {selectedSeats.length === 1 ? 'seat' : 'seats'}
             </Text>
           </View>
 
@@ -640,6 +1458,194 @@ export default function Passengers({ navigation, route }: any) {
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+
+      <Modal
+        visible={loginVisible}
+        transparent
+        animationType="slide"
+        statusBarTranslucent
+        onRequestClose={() => setLoginVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable
+            style={styles.modalBackdrop}
+            onPress={() => setLoginVisible(false)}
+          />
+
+          <KeyboardAvoidingView
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            style={styles.sheetKeyboard}
+          >
+            <View style={styles.loginSheet}>
+              <View style={styles.sheetHandle} />
+
+              <View style={styles.sheetHeader}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.sheetTitle}>
+                    {otpStep ? 'Verify your number' : 'Sign in to StableBus'}
+                  </Text>
+
+                  <Text style={styles.sheetSubtitle}>
+                    {otpStep
+                      ? `Enter the OTP sent to +91 ${mobile}`
+                      : 'Access your bookings and saved passengers'}
+                  </Text>
+                </View>
+
+                <Pressable
+                  onPress={() => setLoginVisible(false)}
+                  style={styles.sheetClose}
+                >
+                  <Ionicons name="close" size={21} color={C.ink} />
+                </Pressable>
+              </View>
+
+              {!otpStep ? (
+                <>
+                  <Text style={styles.sheetLabel}>Mobile number</Text>
+
+                  <View style={styles.sheetPhoneInput}>
+                    <Text style={styles.countryCode}>+91</Text>
+                    <View style={styles.phoneDivider} />
+
+                    <TextInput
+                      value={mobile}
+                      onChangeText={value =>
+                        setMobile(value.replace(/[^0-9]/g, '').slice(0, 10))
+                      }
+                      placeholder="10-digit mobile number"
+                      placeholderTextColor="#A99D95"
+                      keyboardType="phone-pad"
+                      maxLength={10}
+                      autoFocus
+                      style={styles.sheetPhoneText}
+                    />
+                  </View>
+
+                  <Pressable
+                    onPress={handleSendOTP}
+                    disabled={authLoading}
+                    style={[
+                      styles.sheetPrimaryButton,
+                      authLoading && styles.buttonDisabled,
+                    ]}
+                  >
+                    {authLoading ? (
+                      <ActivityIndicator color={C.white} />
+                    ) : (
+                      <Text style={styles.sheetPrimaryText}>Continue</Text>
+                    )}
+                  </Pressable>
+                </>
+              ) : (
+                <>
+                  <Text style={styles.sheetLabel}>6-digit OTP</Text>
+
+                  <Pressable
+                    onPress={() => otpInputRef.current?.focus()}
+                    style={{ width: '100%' }}
+                  >
+                    <Animated.View
+                      style={[
+                        styles.otpBoxesRow,
+                        { transform: [{ translateX: otpShake }] },
+                      ]}
+                    >
+                      {Array.from({ length: 6 }).map((_, index) => (
+                        <View
+                          key={index}
+                          style={[
+                            styles.otpBox,
+                            otp.length === index &&
+                              !otpError &&
+                              styles.otpBoxActive,
+                            !!otpError && styles.otpBoxError,
+                          ]}
+                        >
+                          <Text style={styles.otpDigit}>
+                            {otp[index] || ''}
+                          </Text>
+                        </View>
+                      ))}
+                    </Animated.View>
+
+                    <TextInput
+                      ref={otpInputRef}
+                      value={otp}
+                      onChangeText={value => {
+                        setOtp(value.replace(/[^0-9]/g, '').slice(0, 6));
+                        setOtpError('');
+                      }}
+                      keyboardType="number-pad"
+                      maxLength={6}
+                      autoFocus
+                      caretHidden
+                      textContentType="oneTimeCode"
+                      autoComplete="sms-otp"
+                      style={styles.hiddenOtpInput}
+                    />
+                  </Pressable>
+
+                  {!!otpError && (
+                    <Text style={styles.otpErrorText}>{otpError}</Text>
+                  )}
+
+                  <Pressable
+                    onPress={handleVerifyOTP}
+                    disabled={authLoading}
+                    style={[
+                      styles.sheetPrimaryButton,
+                      authLoading && styles.buttonDisabled,
+                    ]}
+                  >
+                    {authLoading ? (
+                      <ActivityIndicator color={C.white} />
+                    ) : (
+                      <Text style={styles.sheetPrimaryText}>
+                        Verify & sign in
+                      </Text>
+                    )}
+                  </Pressable>
+
+                  <View style={styles.otpActions}>
+                    <Pressable
+                      onPress={() => {
+                        setOtpStep(false);
+                        setOtp('');
+                        setOtpError('');
+                      }}
+                    >
+                      <Text style={styles.sheetTextAction}>
+                        Change number
+                      </Text>
+                    </Pressable>
+
+                    <Pressable
+                      disabled={otpCountdown > 0 || authLoading}
+                      onPress={handleSendOTP}
+                    >
+                      <Text
+                        style={[
+                          styles.sheetTextAction,
+                          otpCountdown > 0 && styles.disabledAction,
+                        ]}
+                      >
+                        {otpCountdown > 0
+                          ? `Resend OTP in ${otpCountdown}s`
+                          : 'Resend OTP'}
+                      </Text>
+                    </Pressable>
+                  </View>
+                </>
+              )}
+
+              <Text style={styles.sheetFootnote}>
+                By continuing, you agree to receive booking-related updates from StableBus.
+              </Text>
+            </View>
+          </KeyboardAvoidingView>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -881,90 +1887,224 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
-  passengerCard: {
+  savedListCard: {
     backgroundColor: C.paper,
     borderWidth: 1,
     borderColor: C.border,
-    borderRadius: 18,
-    padding: 16,
-    marginBottom: 14,
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 12,
   },
-  passengerHeading: {
+  savedListTitle: {
+    color: C.ink,
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  savedListSubtitle: {
+    color: C.muted,
+    fontSize: 11,
+    marginTop: 4,
+    marginBottom: 10,
+  },
+  emptySavedText: {
+    color: C.muted,
+    fontSize: 11,
+    paddingVertical: 10,
+  },
+  savedRowWrap: {
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+    paddingVertical: 5,
+    paddingHorizontal: 4,
+    borderRadius: 10,
+  },
+  savedRowWrapSelected: {
+    borderWidth: 1,
+    borderColor: C.green,
+    backgroundColor: '#F5FAF6',
+    marginVertical: 3,
+  },
+  savedRowWrapDisabled: {
+    opacity: 0.48,
+  },
+  savedRow: {
+    minHeight: 48,
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 18,
+    gap: 5,
   },
-  passengerNumber: {
+  savedRowSelect: {
+    flex: 1,
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    paddingVertical: 5,
+  },
+  rowAction: {
+    width: 27,
+    height: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  disabledSavedText: {
+    color: '#9B928D',
+  },
+  checkboxDisabled: {
+    backgroundColor: '#F0ECE8',
+    borderColor: '#D9D1CB',
+  },
+  inlineEditPanel: {
+    paddingTop: 9,
+    paddingBottom: 8,
+    paddingHorizontal: 2,
+    gap: 8,
+  },
+  inlineEditInput: {
+    height: 39,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.white,
+    paddingHorizontal: 10,
+    color: C.ink,
+    fontSize: 12,
+  },
+  inlineAgeInput: {
+    width: 92,
+  },
+  inlineGenderRow: {
+    flexDirection: 'row',
+    gap: 7,
+  },
+  inlineGenderOption: {
+    minHeight: 34,
+  },
+  inlineEditActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 8,
+    marginTop: 2,
+  },
+  checkbox: {
+    width: 21,
+    height: 21,
+    borderWidth: 1.4,
+    borderColor: C.border,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  checkboxSelected: {
+    backgroundColor: C.burgundy,
+    borderColor: C.burgundy,
+  },
+  savedAvatar: {
     width: 34,
     height: 34,
     borderRadius: 11,
     backgroundColor: C.burgundyLight,
     alignItems: 'center',
     justifyContent: 'center',
-    marginRight: 10,
   },
-  passengerNumberText: {
+  savedAvatarText: {
     color: C.burgundy,
-    fontSize: 14,
     fontWeight: '800',
+    fontSize: 13,
+  },
+  savedInfo: {
+    flex: 1,
+  },
+  savedName: {
+    color: C.ink,
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  savedMeta: {
+    color: C.muted,
+    fontSize: 10,
+    marginTop: 3,
+  },
+  assignedSeat: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: C.burgundyLight,
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  assignedSeatText: {
+    color: C.green,
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  addPassengerButton: {
+    minHeight: 43,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: C.burgundy,
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+    marginBottom: 12,
+    backgroundColor: C.burgundyLight,
+  },
+  addPassengerButtonText: {
+    color: C.burgundy,
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  passengerCard: {
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 12,
   },
   passengerTitle: {
     color: C.ink,
     fontSize: 14,
-    fontWeight: '700',
-  },
-  passengerSeat: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 3,
-  },
-  seatTag: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-    backgroundColor: C.burgundyLight,
-    borderRadius: 9,
-    paddingHorizontal: 9,
-    paddingVertical: 6,
-  },
-  seatTagText: {
-    color: C.burgundy,
-    fontSize: 11,
-    fontWeight: '700',
+    fontWeight: '800',
+    marginBottom: 13,
   },
   field: {
-    marginBottom: 15,
+    marginBottom: 12,
   },
   label: {
     color: C.ink,
     fontSize: 12,
     fontWeight: '700',
-    marginBottom: 8,
+    marginBottom: 6,
   },
   required: {
     color: C.error,
   },
   input: {
-    height: 48,
-    borderRadius: 12,
+    height: 44,
+    borderRadius: 11,
     borderWidth: 1,
     borderColor: C.border,
     backgroundColor: C.input,
-    paddingHorizontal: 13,
+    paddingHorizontal: 12,
     color: C.ink,
     fontSize: 13,
-  },
+    outlineStyle: 'none',
+    outlineWidth: 0,
+  } as any,
   genderRow: {
     flexDirection: 'row',
     gap: 8,
   },
   genderOption: {
     flex: 1,
-    minHeight: 43,
+    minHeight: 39,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 5,
     borderWidth: 1,
     borderColor: C.border,
     borderRadius: 11,
@@ -973,10 +2113,6 @@ const styles = StyleSheet.create({
   genderOptionSelected: {
     borderColor: C.burgundy,
     backgroundColor: C.burgundyLight,
-  },
-  femaleGenderSelected: {
-    borderColor: '#E8A9C1',
-    backgroundColor: '#FCE7EF',
   },
   genderText: {
     color: C.muted,
@@ -987,8 +2123,37 @@ const styles = StyleSheet.create({
     color: C.burgundy,
     fontWeight: '700',
   },
-  femaleGenderText: {
-    color: '#A65372',
+  formActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 9,
+    marginTop: 8,
+  },
+  cancelPassengerButton: {
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderRadius: 10,
+    backgroundColor: C.bg,
+  },
+  cancelPassengerText: {
+    color: C.muted,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  savePassengerButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    paddingHorizontal: 13,
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: C.burgundy,
+  },
+  savePassengerButtonText: {
+    color: C.white,
+    fontSize: 11,
+    fontWeight: '700',
   },
   contactCard: {
     backgroundColor: C.paper,
@@ -1048,7 +2213,9 @@ const styles = StyleSheet.create({
     height: 48,
     color: C.ink,
     fontSize: 13,
-  },
+    outlineStyle: 'none',
+    outlineWidth: 0,
+  } as any,
   optionalText: {
     color: C.muted,
     fontSize: 10,
@@ -1108,6 +2275,163 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 9,
     paddingHorizontal: 20,
+  },
+  modalOverlay: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(35, 25, 23, 0.32)',
+  },
+  modalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+  },
+  sheetKeyboard: {
+    justifyContent: 'flex-end',
+  },
+  loginSheet: {
+    minHeight: 350,
+    maxHeight: '58%',
+    backgroundColor: C.paper,
+    borderTopLeftRadius: 25,
+    borderTopRightRadius: 25,
+    paddingHorizontal: 22,
+    paddingTop: 12,
+    paddingBottom: Platform.OS === 'ios' ? 30 : 22,
+  },
+  sheetHandle: {
+    width: 38,
+    height: 4,
+    borderRadius: 3,
+    backgroundColor: C.border,
+    alignSelf: 'center',
+    marginBottom: 20,
+  },
+  sheetHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    marginBottom: 25,
+  },
+  sheetTitle: {
+    color: C.ink,
+    fontSize: 19,
+    fontWeight: '800',
+  },
+  sheetSubtitle: {
+    color: C.muted,
+    fontSize: 12,
+    marginTop: 6,
+  },
+  sheetClose: {
+    width: 34,
+    height: 34,
+    borderRadius: 11,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sheetLabel: {
+    color: C.ink,
+    fontSize: 12,
+    fontWeight: '700',
+    marginBottom: 9,
+  },
+  sheetPhoneInput: {
+    height: 52,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 13,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    backgroundColor: C.white,
+  },
+  sheetPhoneText: {
+    flex: 1,
+    height: 52,
+    color: C.ink,
+    fontSize: 15,
+    outlineStyle: 'none',
+    outlineWidth: 0,
+  } as any,
+  otpBoxesRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 7,
+    width: '100%',
+  },
+  otpBox: {
+    flex: 1,
+    height: 51,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 10,
+    backgroundColor: C.white,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  otpBoxActive: {
+    borderColor: C.burgundy,
+    borderWidth: 1.5,
+    backgroundColor: C.burgundyLight,
+  },
+  otpBoxError: {
+    borderColor: C.error,
+    backgroundColor: '#FFF1F0',
+    borderWidth: 1.5,
+  },
+  otpDigit: {
+    color: C.ink,
+    fontSize: 21,
+    fontWeight: '700',
+  },
+  hiddenOtpInput: {
+    position: 'absolute',
+    width: 1,
+    height: 1,
+    opacity: 0,
+    left: 0,
+    top: 0,
+  },
+  otpErrorText: {
+    color: C.error,
+    fontSize: 11,
+    fontWeight: '600',
+    marginTop: 7,
+  },
+  sheetPrimaryButton: {
+    height: 51,
+    borderRadius: 14,
+    backgroundColor: C.burgundy,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 18,
+  },
+  buttonDisabled: {
+    opacity: 0.65,
+  },
+  sheetPrimaryText: {
+    color: C.white,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  otpActions: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 18,
+  },
+  sheetTextAction: {
+    color: C.burgundy,
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  disabledAction: {
+    color: C.muted,
+  },
+  sheetFootnote: {
+    color: C.muted,
+    fontSize: 10,
+    lineHeight: 15,
+    marginTop: 22,
+    textAlign: 'center',
   },
   continueText: {
     color: C.white,
