@@ -1,8 +1,8 @@
-
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Modal,
   Platform,
   Pressable,
@@ -15,8 +15,12 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useFocusEffect, useRouter } from 'expo-router';
+import * as SecureStore from 'expo-secure-store';
 import { searchApi } from '@/features/search/api';
 import type { City } from '@/types/api';
+import BusLoader from '@/features/search/screens/Busloader';
+import { setSearchResponse } from '@/features/search/resultsCache';
 
 const C = {
   bg: '#F8F4ED',
@@ -32,6 +36,29 @@ const C = {
 };
 
 type CityField = 'from' | 'to';
+const HOME_PREFS_KEY = 'stablebus_home_preferences';
+
+async function readHomePreferences(): Promise<any | null> {
+  try {
+    const raw = Platform.OS === 'web'
+      ? (typeof localStorage !== 'undefined' ? localStorage.getItem(HOME_PREFS_KEY) : null)
+      : await SecureStore.getItemAsync(HOME_PREFS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function writeHomePreferences(value: any): Promise<void> {
+  try {
+    const raw = JSON.stringify(value);
+    if (Platform.OS === 'web') {
+      if (typeof localStorage !== 'undefined') localStorage.setItem(HOME_PREFS_KEY, raw);
+    } else {
+      await SecureStore.setItemAsync(HOME_PREFS_KEY, raw);
+    }
+  } catch (error) {
+    console.warn('[StableBus Home] Preference save failed:', error);
+  }
+}
 
 const dateKey = (date: Date) => {
   const y = date.getFullYear();
@@ -64,7 +91,8 @@ const cityIcon = (name: string): keyof typeof Ionicons.glyphMap => {
   return 'location-outline';
 };
 
-export default function Home({ navigation }: any) {
+export default function Home() {
+  const router = useRouter();
   const { width } = useWindowDimensions();
   const isMobile = width < 640;
 
@@ -80,6 +108,53 @@ export default function Home({ navigation }: any) {
   const [loadingCities, setLoadingCities] = useState(true);
   const [searching, setSearching] = useState(false);
   const [cityError, setCityError] = useState('');
+  const [preferencesLoaded, setPreferencesLoaded] = useState(false);
+  const [routeFeedback, setRouteFeedback] = useState('');
+  const [searchMessage, setSearchMessage] = useState('');
+  const progress = useRef(new Animated.Value(0)).current;
+  const searchingRef = useRef(false);
+  const loaderWidth = Math.min(width - 50, 520);
+
+  useEffect(() => {
+    searchingRef.current = searching;
+  }, [searching]);
+
+  // Slow, calm progress bar (native driver, keeps moving while JS is busy).
+  useEffect(() => {
+    if (!searching) return;
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(progress, { toValue: 1, duration: 1800, useNativeDriver: true }),
+        Animated.timing(progress, { toValue: 0, duration: 1800, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [searching, progress]);
+
+  const progressMotionStyle = {
+    transform: [
+      {
+        translateX: progress.interpolate({
+          inputRange: [0, 1],
+          outputRange: [-95, 95],
+        }),
+      },
+    ],
+  };
+
+  // Keep the loader up until Home actually loses focus (Results is on screen),
+  // and reset it when Home regains focus (user comes back).
+  useFocusEffect(
+    useCallback(() => {
+      setSearching(false);
+      return () => {
+        if (searchingRef.current) {
+          setTimeout(() => setSearching(false), 600);
+        }
+      };
+    }, [])
+  );
 
   const today = new Date();
   const todayKey = dateKey(today);
@@ -124,6 +199,35 @@ export default function Home({ navigation }: any) {
       alive = false;
     };
   }, []);
+
+  useEffect(() => {
+    let alive = true;
+    const restore = async () => {
+      const saved = await readHomePreferences();
+      if (!alive) return;
+      if (saved?.journeyDate && saved.journeyDate >= todayKey && saved.journeyDate <= maxDateKey) {
+        setJourneyDate(saved.journeyDate);
+      }
+      if (saved && cities.length) {
+        const savedFrom = cities.find(c => String(c.cityID) === String(saved.fromCityId));
+        const savedTo = cities.find(c => String(c.cityID) === String(saved.toCityId));
+        if (savedFrom) setFrom(savedFrom);
+        if (savedTo && String(savedTo.cityID) !== String(savedFrom?.cityID)) setTo(savedTo);
+      }
+      setPreferencesLoaded(true);
+    };
+    restore();
+    return () => { alive = false; };
+  }, [cities.length]);
+
+  useEffect(() => {
+    if (!preferencesLoaded) return;
+    void writeHomePreferences({
+      fromCityId: from ? String(from.cityID) : undefined,
+      toCityId: to ? String(to.cityID) : undefined,
+      journeyDate,
+    });
+  }, [from, to, journeyDate, preferencesLoaded]);
 
   const filteredCities = useMemo(() => {
     const value = query.trim().toLowerCase();
@@ -192,8 +296,14 @@ export default function Home({ navigation }: any) {
     calendarMonth.getMonth() === maxDate.getMonth();
 
   const openPicker = (field: CityField) => {
+    if (picker) return;
     setQuery('');
     setPicker(field);
+  };
+
+  const closePicker = () => {
+    setPicker(null);
+    setQuery('');
   };
 
   const selectCity = (city: City) => {
@@ -205,8 +315,7 @@ export default function Home({ navigation }: any) {
       if (from && String(from.cityID) === String(city.cityID)) setFrom(null);
     }
 
-    setPicker(null);
-    setQuery('');
+    closePicker();
   };
 
   const swapCities = () => {
@@ -214,12 +323,17 @@ export default function Home({ navigation }: any) {
     setTo(from);
   };
 
-  const choosePopular = (city: City) => {
-    if (!from) {
-      setFrom(city);
-    } else if (String(from.cityID) !== String(city.cityID)) {
-      setTo(city);
+  const choosePopularRoute = (fromName: string, toName: string) => {
+    const departure = cities.find(c => c.cityName.toLowerCase() === fromName.toLowerCase());
+    const destination = cities.find(c => c.cityName.toLowerCase() === toName.toLowerCase());
+    if (!departure || !destination) {
+      Alert.alert('Route unavailable', 'This route is not currently available.');
+      return;
     }
+    setFrom(departure);
+    setTo(destination);
+    setRouteFeedback(`${departure.cityName} → ${destination.cityName} selected`);
+    setTimeout(() => setRouteFeedback(''), 1800);
   };
 
   const openCalendar = () => {
@@ -248,6 +362,7 @@ export default function Home({ navigation }: any) {
   };
 
   const searchBuses = async () => {
+  if (searching) return;
   if (!from || !to) {
     const message = 'Please select both departure and destination cities.';
     Platform.OS === 'web'
@@ -264,6 +379,7 @@ export default function Home({ navigation }: any) {
     return;
   }
 
+  setSearchMessage(`${from.cityName}  →  ${to.cityName}`);
   setSearching(true);
 
   try {
@@ -277,21 +393,30 @@ export default function Home({ navigation }: any) {
       travel_date,
     });
 
-    navigation.navigate('results', {
-  response,
-  from: from.cityName,
-  to: to.cityName,
-  date: journeyDate,
-  fromCityId: String(from.cityID),
-  toCityId: String(to.cityID),
-});
+    // Navigate only after the API has returned the complete response.
+    // Keep the loading overlay mounted while the Results route transitions in.
+    // Hand the response over in memory instead of stringifying it into a route param.
+    setSearchResponse(response);
+    router.push({
+      pathname: '/results',
+      params: {
+        from: from.cityName,
+        to: to.cityName,
+        date: journeyDate,
+        fromCityId: String(from.cityID),
+        toCityId: String(to.cityID),
+      },
+    });
+    // Do NOT hide the loader here. Results is still mounting, and hiding now
+    // briefly shows Home again. useFocusEffect above hides it once Home blurs.
+    // Safety net in case navigation never blurs Home:
+    setTimeout(() => setSearching(false), 30000);
   } catch (error: any) {
     const message = error?.message || 'Please try again.';
+    setSearching(false);
     Platform.OS === 'web'
       ? window.alert(`Search failed: ${message}`)
       : Alert.alert('Search failed', message);
-  } finally {
-    setSearching(false);
   }
 };
 
@@ -429,7 +554,11 @@ export default function Home({ navigation }: any) {
             <View style={s.dateHeading}>
               <View>
                 <Text style={s.fieldLabel}>JOURNEY DATE</Text>
-                <Text style={s.dateHint}>Choose your travel day</Text>
+                <Text style={s.dateHint}>
+                  {new Date(`${journeyDate}T00:00:00`).toLocaleDateString('en-IN', {
+                    weekday: 'short', day: 'numeric', month: 'short', year: 'numeric',
+                  })}
+                </Text>
               </View>
 
               <Pressable style={s.calendarButton} onPress={openCalendar}>
@@ -477,32 +606,27 @@ export default function Home({ navigation }: any) {
               onPress={searchBuses}
               disabled={searching}
             >
-              {searching ? (
-                <ActivityIndicator color={C.white} />
-              ) : (
-                <>
-                  <Ionicons name="search-outline" size={18} color={C.white} />
-                  <Text style={s.searchText}>Search buses</Text>
-                  <Ionicons name="arrow-forward" size={17} color={C.white} />
-                </>
-              )}
+              <>
+                <Ionicons name="search-outline" size={18} color={C.white} />
+                <Text style={s.searchText}>Search buses</Text>
+                <Ionicons name="arrow-forward" size={17} color={C.white} />
+              </>
             </Pressable>
           </View>
         </View>
 
-        {/* POPULAR DESTINATIONS */}
+        {/* POPULAR ROUTES */}
         <View style={[s.popularSection, !isMobile && s.wide]}>
           <View style={s.sectionHeading}>
             <View>
-              <Text style={s.sectionTitle}>Popular destinations</Text>
-              <Text style={s.sectionSubtitle}>Explore routes people love</Text>
+              <Text style={s.sectionTitle}>Popular routes</Text>
+              <Text style={s.sectionSubtitle}>Choose a route to fill your search</Text>
             </View>
             <View style={s.popularTag}>
               <Ionicons name="trending-up-outline" size={13} color={C.burgundy} />
               <Text style={s.popularTagText}>Popular</Text>
             </View>
           </View>
-
           {loadingCities ? (
             <ActivityIndicator color={C.burgundy} style={{ marginTop: 22 }} />
           ) : cityError ? (
@@ -512,98 +636,131 @@ export default function Home({ navigation }: any) {
             </View>
           ) : (
             <View style={s.cityGrid}>
-              {popularCities.map((city) => (
+              {[
+                ['Bengaluru', 'Hyderabad'],
+                ['Bengaluru', 'Chennai'],
+                ['Hyderabad', 'Vijayawada'],
+                ['Bengaluru', 'Tirupati'],
+                ['Hyderabad', 'Bengaluru'],
+                ['Vijayawada', 'Hyderabad'],
+              ].map(([departure, destination]) => (
                 <Pressable
-                  key={`${city.cityID}-${city.cityName}`}
+                  key={`${departure}-${destination}`}
                   style={[s.popularCard, isMobile && s.popularCardMobile]}
-                  onPress={() => choosePopular(city)}
+                  onPress={() => choosePopularRoute(departure, destination)}
+                  android_ripple={{ color: C.burgundyLight }}
                 >
                   <View style={s.popularIcon}>
-                    <Ionicons
-                      name={cityIcon(city.cityName)}
-                      size={19}
-                      color={C.burgundy}
-                    />
+                    <Ionicons name="bus-outline" size={19} color={C.burgundy} />
                   </View>
                   <View style={s.popularText}>
-                    <Text style={s.popularName}>{city.cityName}</Text>
-                    <Text style={s.popularCaption}>Explore buses</Text>
+                    <Text style={s.popularName}>{departure}</Text>
+                    <Text style={s.popularCaption}>to {destination}</Text>
                   </View>
-                  <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                  <Ionicons name="arrow-forward-circle-outline" size={19} color={C.burgundy} />
                 </Pressable>
               ))}
             </View>
           )}
-
-          {!loadingCities && !cityError && popularCities.length === 0 && (
-            <Text style={s.emptyPopular}>Popular destinations will appear here.</Text>
+          {!!routeFeedback && (
+            <View style={s.routeFeedback}>
+              <Ionicons name="checkmark-circle" size={15} color="#47765B" />
+              <Text style={s.routeFeedbackText}>{routeFeedback}</Text>
+            </View>
           )}
         </View>
 
-        <View style={s.footer}>
-          <Ionicons name="shield-checkmark-outline" size={15} color={C.muted} />
-          <Text style={s.footerText}>Simple booking. Comfortable journeys.</Text>
-        </View>
       </ScrollView>
 
-      {/* CITY PICKER */}
+      {/* FULL-SCREEN CITY PICKER */}
       <Modal
         visible={!!picker}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setPicker(null)}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        statusBarTranslucent
+        onRequestClose={closePicker}
       >
-        <View style={s.modalBackdrop}>
-          <View style={s.modalCard}>
-            <View style={s.modalHeader}>
-              <View>
-                <Text style={s.modalTitle}>
-                  Choose {picker === 'from' ? 'departure' : 'destination'}
-                </Text>
-                <Text style={s.modalSubtitle}>Search and select a city</Text>
-              </View>
-              <Pressable style={s.closeButton} onPress={() => setPicker(null)}>
-                <Ionicons name="close" size={19} color={C.ink} />
+        <View style={s.fullScreenPicker}>
+          <View style={s.fullScreenPickerHeader}>
+            <Pressable style={s.closeButton} onPress={closePicker}>
+              <Ionicons name="arrow-back" size={20} color={C.ink} />
+            </Pressable>
+            <View style={s.pickerTitleWrap}>
+              <Text style={s.modalTitle}>
+                Select {picker === 'from' ? 'departure' : 'destination'} city
+              </Text>
+              <Text style={s.modalSubtitle}>Choose your travel city</Text>
+            </View>
+          </View>
+          <View style={s.searchInputWrap}>
+            <Ionicons name="search-outline" size={18} color={C.muted} />
+            <TextInput
+              value={query}
+              onChangeText={setQuery}
+              placeholder="Search city"
+              placeholderTextColor="#A99B94"
+              autoFocus
+              style={s.searchInput}
+              returnKeyType="search"
+            />
+            {!!query && (
+              <Pressable onPress={() => setQuery('')} hitSlop={10}>
+                <Ionicons name="close-circle" size={18} color={C.muted} />
               </Pressable>
-            </View>
-
-            <View style={s.searchInputWrap}>
-              <Ionicons name="search-outline" size={18} color={C.muted} />
-              <TextInput
-                value={query}
-                onChangeText={setQuery}
-                placeholder="Search city"
-                placeholderTextColor="#A99B94"
-                autoFocus
-                style={s.searchInput}
-              />
-            </View>
-
-            {loadingCities ? (
-              <ActivityIndicator color={C.burgundy} style={{ padding: 25 }} />
-            ) : (
-              <ScrollView
-                keyboardShouldPersistTaps="handled"
-                style={s.cityList}
-              >
-                {filteredCities.map((city) => (
-                  <Pressable
-                    key={`${city.cityID}-${city.cityName}`}
-                    style={s.cityOption}
-                    onPress={() => selectCity(city)}
-                  >
-                    <View style={s.optionIcon}>
-                      <Ionicons name="location-outline" size={17} color={C.burgundy} />
-                    </View>
-                    <Text style={s.optionName}>{city.cityName}</Text>
-                    <Ionicons name="chevron-forward" size={16} color={C.muted} />
-                  </Pressable>
-                ))}
-                {filteredCities.length === 0 && (
-                  <Text style={s.emptyText}>No cities found.</Text>
-                )}
-              </ScrollView>
             )}
+          </View>
+          {loadingCities ? (
+            <View style={s.pickerLoading}>
+              <ActivityIndicator color={C.burgundy} size="large" />
+              <Text style={s.pickerLoadingText}>Loading cities…</Text>
+            </View>
+          ) : (
+            <ScrollView
+              keyboardShouldPersistTaps="always"
+              keyboardDismissMode="on-drag"
+              style={s.cityList}
+              contentContainerStyle={s.fullScreenCityList}
+            >
+              {filteredCities.map(city => (
+                <Pressable
+                  key={`${city.cityID}-${city.cityName}`}
+                  style={s.cityOption}
+                  onPress={() => selectCity(city)}
+                  android_ripple={{ color: C.burgundyLight }}
+                >
+                  <View style={s.optionIcon}>
+                    <Ionicons name="location-outline" size={17} color={C.burgundy} />
+                  </View>
+                  <Text style={s.optionName}>{city.cityName}</Text>
+                  <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                </Pressable>
+              ))}
+              {filteredCities.length === 0 && (
+                <Text style={s.emptyText}>No cities found.</Text>
+              )}
+            </ScrollView>
+          )}
+        </View>
+      </Modal>
+
+      {/* TRUE FULL-SCREEN SEARCH LOADER: stays above the Home screen */}
+      <Modal
+        visible={searching}
+        animationType="fade"
+        presentationStyle="fullScreen"
+        statusBarTranslucent
+        onRequestClose={() => {}}
+      >
+        <View style={s.searchLoadingScreen}>
+          <View style={s.loadingCenter}>
+            <BusLoader width={loaderWidth} />
+            <Text style={s.searchLoadingTitle}>Finding your buses</Text>
+            {!!searchMessage && (
+              <Text style={s.searchLoadingSubtitle}>{searchMessage}</Text>
+            )}
+            <View style={s.loadingProgressTrack}>
+              <Animated.View style={[s.loadingProgressFill, progressMotionStyle]} />
+            </View>
           </View>
         </View>
       </Modal>
@@ -992,6 +1149,68 @@ const s = StyleSheet.create({
   searchDisabled: { opacity: 0.65 },
   searchText: { fontSize: 13, color: C.white, fontWeight: '600' },
 
+  /* Full-screen city picker and search feedback */
+  fullScreenPicker: {
+    flex: 1,
+    backgroundColor: C.bg,
+    paddingTop: Platform.OS === 'android' ? 34 : 54,
+    paddingHorizontal: 18,
+  },
+  fullScreenPickerHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingBottom: 18,
+  },
+  pickerTitleWrap: { flex: 1 },
+  fullScreenCityList: { paddingBottom: 30 },
+  pickerLoading: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  pickerLoadingText: { color: C.muted, fontSize: 12, marginTop: 12 },
+  routeFeedback: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10, paddingHorizontal: 4 },
+  routeFeedbackText: { color: '#47765B', fontSize: 11, fontWeight: '600' },
+  searchLoadingOverlay: {
+    zIndex: 1000,
+    elevation: 1000,
+    backgroundColor: C.bg,
+  },
+  searchLoadingScreen: {
+    flex: 1,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 25,
+  },
+  loadingCenter: { alignItems: 'center', width: '100%' },
+  searchLoadingTitle: {
+    color: C.ink,
+    fontSize: 20,
+    fontWeight: '600',
+    textAlign: 'center',
+    letterSpacing: -0.3,
+    marginTop: 18,
+  },
+  searchLoadingSubtitle: {
+    color: C.muted,
+    fontSize: 13,
+    fontWeight: '500',
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  loadingProgressTrack: {
+    width: 190,
+    height: 3,
+    borderRadius: 9,
+    overflow: 'hidden',
+    backgroundColor: '#E9DDD7',
+    marginTop: 22,
+  },
+  loadingProgressFill: {
+    width: '34%',
+    height: '100%',
+    borderRadius: 9,
+    backgroundColor: C.burgundy,
+  },
+
   /* Popular cities */
   popularSection: {
     paddingHorizontal: 20,
@@ -1025,6 +1244,7 @@ const s = StyleSheet.create({
     flexWrap: 'wrap',
     gap: 9,
   },
+  popularCardMobile: { minWidth: 0, width: '100%' },
   popularCard: {
     width: '48%',
     flexGrow: 1,
@@ -1061,15 +1281,6 @@ const s = StyleSheet.create({
     backgroundColor: C.burgundyLight,
   },
   errorText: { flex: 1, color: C.burgundy, fontSize: 11 },
-
-  footer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 7,
-    marginTop: 25,
-  },
-  footerText: { color: C.muted, fontSize: 10 },
 
   /* Modals */
   modalBackdrop: {

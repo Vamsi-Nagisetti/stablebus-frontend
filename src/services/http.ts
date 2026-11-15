@@ -7,7 +7,8 @@ import {
 } from '../features/auth/tokenStorage';
 
 const BASE_URL = (
-  process.env.EXPO_PUBLIC_API_BASE_URL || 'http://127.0.0.1:8000'
+  process.env.EXPO_PUBLIC_API_BASE_URL ||
+  'https://blunderer-revival-referee.ngrok-free.dev'
 ).replace(/\/+$/, '');
 
 console.log('[StableBus] Backend URL:', BASE_URL);
@@ -38,6 +39,7 @@ async function refreshAccessToken(): Promise<string | null> {
         headers: {
           Accept: 'application/json',
           'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true',
         },
         body: JSON.stringify({ refresh_token: refreshToken }),
       });
@@ -85,6 +87,7 @@ async function executeRequest(
 
   headers.set('Accept', 'application/json');
   headers.set('Content-Type', 'application/json');
+  headers.set('ngrok-skip-browser-warning', 'true');
 
   if (accessToken) {
     headers.set('Authorization', `Bearer ${accessToken}`);
@@ -166,6 +169,7 @@ export async function request<T>(
 
     if (error instanceof TypeError) {
       console.error('[StableBus API] Network error:', error);
+
       throw new Error(
         `Cannot reach ${BASE_URL}. Check FastAPI and CORS configuration.`
       );

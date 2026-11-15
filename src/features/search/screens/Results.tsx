@@ -1,8 +1,11 @@
-
-import React, { useMemo, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import {
   ActivityIndicator,
   Alert,
+  Animated,
+  FlatList,
+  Keyboard,
   Modal,
   Platform,
   Pressable,
@@ -15,7 +18,9 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { searchApi } from '@/features/search/api';
+import { getSearchResponse } from '@/features/search/resultsCache';
 
 const C = {
   bg: '#F8F4ED',
@@ -66,7 +71,6 @@ const emptyFilters: FilterState = {
   amenities: [],
 };
 
-const quickFilters = ['All', 'AC', 'Non-AC', 'Sleeper', 'Seater'] as const;
 const sortOptions: Sort[] = [
   'Recommended',
   'Early departure',
@@ -108,15 +112,19 @@ function formatPrice(value: any): string {
 
 function timeToMinutes(value?: string): number | null {
   if (!value) return null;
-  const match = value.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  // Accepts "09:30 PM", "21:30", "21:30:00" and ISO date-times.
+  const match = String(value).match(/(\d{1,2}):(\d{2})(?::\d{2})?\s*([AaPp]\.?[Mm]\.?)?/);
   if (!match) return null;
 
   let hour = Number(match[1]);
   const minute = Number(match[2]);
-  const period = match[3].toUpperCase();
+  const period = match[3] ? match[3].replace(/\./g, '').toUpperCase() : '';
 
-  if (hour === 12) hour = 0;
-  if (period === 'PM') hour += 12;
+  if (period) {
+    if (hour === 12) hour = 0;
+    if (period === 'PM') hour += 12;
+  }
+  if (hour > 23 || minute > 59) return null;
 
   return hour * 60 + minute;
 }
@@ -159,7 +167,12 @@ function formatJourneyDate(value?: string): string {
 }
 
 function isAC(bus: Bus): boolean {
-  return String(bus.ac).toLowerCase() === 'true';
+  const text = `${bus.bus_Type || ''} ${bus.seat_Type || ''}`.toLowerCase();
+  if (/non[\s\-_/]*a\/?c/.test(text)) return false;
+  const flag = String(bus.ac ?? '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'y'].includes(flag)) return true;
+  if (['false', '0', 'no', 'n'].includes(flag)) return false;
+  return /(^|[^a-z])a\/?c([^a-z]|$)/.test(text);
 }
 
 function isSleeper(bus: Bus): boolean {
@@ -238,40 +251,552 @@ function getCalendarDays(month: Date): (number | null)[] {
   ];
 }
 
-export default function Results({ navigation, route }: any) {
+function parseRouteResponse(value: unknown): any {
+  if (!value) return {};
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function readRouteString(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? (value[0] || '') : (value || '');
+}
+
+type IconName = keyof typeof Ionicons.glyphMap;
+
+const BUS_TYPE_VALUES = ['AC', 'Non-AC', 'Sleeper', 'Seater'];
+const QUICK_TYPES = ['AC', 'Non-AC', 'Sleeper', 'Seater'] as const;
+const TYPE_ICONS: Record<string, keyof typeof Ionicons.glyphMap> = {
+  AC: 'snow-outline',
+  'Non-AC': 'sunny-outline',
+  Sleeper: 'bed-outline',
+  Seater: 'person-outline',
+};
+const TIME_VALUES = ['Morning', 'Afternoon', 'Evening', 'Night'];
+const TIME_ICONS: Record<string, IconName> = {
+  Morning: 'partly-sunny-outline',
+  Afternoon: 'sunny-outline',
+  Evening: 'cloudy-night-outline',
+  Night: 'moon-outline',
+};
+const TIME_HINTS: Record<string, string> = {
+  Morning: '6 AM – 12 PM',
+  Afternoon: '12 – 5 PM',
+  Evening: '5 – 9 PM',
+  Night: '9 PM – 6 AM',
+};
+
+function amenityIcon(label: string): IconName {
+  const t = label.toLowerCase();
+  if (/wi-?fi/.test(t)) return 'wifi-outline';
+  if (/charg|usb|socket|plug/.test(t)) return 'flash-outline';
+  if (/water/.test(t)) return 'water-outline';
+  if (/blanket|pillow|bed/.test(t)) return 'bed-outline';
+  if (/snack|food|meal/.test(t)) return 'fast-food-outline';
+  if (/track|gps|live/.test(t)) return 'locate-outline';
+  if (/light|lamp/.test(t)) return 'bulb-outline';
+  if (/toilet|wash|rest ?room/.test(t)) return 'male-female-outline';
+  if (/\btv\b|movie|entertain|music/.test(t)) return 'tv-outline';
+  if (/cctv|camera|safety|secur|first ?aid/.test(t)) return 'shield-checkmark-outline';
+  if (/a\/?c|air/.test(t)) return 'snow-outline';
+  return 'checkmark-circle-outline';
+}
+
+const typeIcon = (label: string) => TYPE_ICONS[label];
+const timeIcon = (label: string) => TIME_ICONS[label];
+const operatorIcon = () => 'bus-outline' as IconName;
+
+/** Everything we need per bus, computed ONCE when the results arrive. */
+type Row = {
+  key: string;
+  bus: Bus;
+  operator: string;
+  fare: number;
+  ac: boolean;
+  sleeper: boolean; // sleeper only
+  seater: boolean; // any seats (incl. seater/sleeper)
+  mixed: boolean; // seater/sleeper layout
+  rating: number;
+  depMin: number | null;
+  depBucket: string;
+  arrBucket: string;
+  amenities: string[];
+  duration: string;
+};
+
+function buildRows(buses: Bus[]): Row[] {
+  return buses.map((bus, index) => ({
+    key: `${bus.bus_Key || 'bus'}-${index}`,
+    bus,
+    operator: bus.operator_Name || '',
+    fare: getFare(bus),
+    ac: isAC(bus),
+    // Every bus_Type here contains "Sleeper", and "Seater/Sleeper" buses contain both words.
+    // So: Sleeper = sleeper-only, Seater = any bus that has seats.
+    sleeper: isSleeper(bus) && !isSeater(bus),
+    seater: isSeater(bus),
+    mixed: isSleeper(bus) && isSeater(bus),
+    rating: getRating(bus),
+    depMin: timeToMinutes(bus.departure_Time),
+    depBucket: getTimeBucket(bus.departure_Time),
+    arrBucket: getTimeBucket(bus.arrival_Time),
+    amenities: getAmenities(bus),
+    duration: getDuration(bus.departure_Time, bus.arrival_Time),
+  }));
+}
+
+/**
+ * Same group = OR, different groups = AND.
+ *  e.g. AC + Sleeper            -> AC buses that are sleepers
+ *       Sleeper + Seater        -> sleepers or seaters
+ *       Morning + Night         -> departs in the morning or at night
+ */
+function filterRows(rows: Row[], f: FilterState): Row[] {
+  const wantAC = f.busTypes.includes('AC');
+  const wantNonAC = f.busTypes.includes('Non-AC');
+  const wantSleeper = f.busTypes.includes('Sleeper');
+  const wantSeater = f.busTypes.includes('Seater');
+
+  return rows.filter(r => {
+    if ((wantAC || wantNonAC) && !((wantAC && r.ac) || (wantNonAC && !r.ac))) return false;
+    if ((wantSleeper || wantSeater) && !((wantSleeper && r.sleeper) || (wantSeater && r.seater))) return false;
+    if (f.departure.length && !f.departure.includes(r.depBucket)) return false;
+    if (f.arrival.length && !f.arrival.includes(r.arrBucket)) return false;
+    if (f.operators.length && !f.operators.includes(r.operator)) return false;
+    if (f.amenities.length && !f.amenities.every(item => r.amenities.includes(item))) return false;
+    return true;
+  });
+}
+
+/* ---------------------------------------------------------------- */
+/* Bus card: memoized, so a tap elsewhere never re-renders every card */
+/* ---------------------------------------------------------------- */
+const BusCard = memo(function BusCard({
+  row,
+  from,
+  to,
+  onPress,
+}: {
+  row: Row;
+  from: string;
+  to: string;
+  onPress: (bus: Bus) => void;
+}) {
+  const { bus } = row;
+  return (
+    <Pressable
+      style={s.busCard}
+      onPress={() => onPress(bus)}
+      android_ripple={{ color: C.burgundyLight }}
+    >
+      <View style={s.busTop}>
+        <View style={s.operatorInfo}>
+          <View style={s.busIcon}>
+            <Ionicons name="bus-outline" size={21} color={C.burgundy} />
+          </View>
+          <View style={s.operatorText}>
+            <Text style={s.operatorName} numberOfLines={1}>
+              {bus.operator_Name || 'Bus operator'}
+            </Text>
+            <Text style={s.busType} numberOfLines={2}>
+              {bus.bus_Type || 'Bus service'}
+            </Text>
+          </View>
+        </View>
+
+        <View style={s.fareBlock}>
+          <Text style={s.fareCaption}>Starting from</Text>
+          <Text style={s.fareValue}>{formatPrice(row.fare)}</Text>
+          {row.rating > 0 && (
+            <View style={s.ratingRow}>
+              <Ionicons name="star" size={13} color="#C18A43" />
+              <Text style={s.ratingText}>{row.rating.toFixed(1)}</Text>
+            </View>
+          )}
+        </View>
+      </View>
+
+      <View style={s.tags}>
+        <View style={s.typeTag}>
+          <Ionicons name={row.ac ? 'snow-outline' : 'sunny-outline'} size={13} color={C.muted} />
+          <Text style={s.typeTagText}>{row.ac ? 'AC' : 'NON-AC'}</Text>
+        </View>
+        {row.mixed ? (
+          <View style={s.typeTag}>
+            <Ionicons name="bed-outline" size={13} color={C.muted} />
+            <Text style={s.typeTagText}>SEATER / SLEEPER</Text>
+          </View>
+        ) : row.sleeper ? (
+          <View style={s.typeTag}>
+            <Ionicons name="bed-outline" size={13} color={C.muted} />
+            <Text style={s.typeTagText}>SLEEPER</Text>
+          </View>
+        ) : row.seater ? (
+          <View style={s.typeTag}>
+            <Ionicons name="person-outline" size={13} color={C.muted} />
+            <Text style={s.typeTagText}>SEATER</Text>
+          </View>
+        ) : null}
+      </View>
+
+      <View style={s.cardDivider} />
+
+      <View style={s.journeySection}>
+        <View style={s.timelineColumn}>
+          <View style={s.timelineTrack}>
+            <View style={s.timelineCircle} />
+            <View style={s.timelineLine} />
+            <View style={[s.timelineCircle, s.timelineCircleEnd]} />
+          </View>
+          <View style={s.timelineStops}>
+            <View style={s.timelineStop}>
+              <Text style={s.timeValue}>{bus.departure_Time || '--'}</Text>
+              <Text style={s.timeCaption} numberOfLines={1}>{from}</Text>
+            </View>
+            <View style={s.timelineStop}>
+              <Text style={s.timeValue}>{bus.arrival_Time || '--'}</Text>
+              <Text style={s.timeCaption} numberOfLines={1}>{to}</Text>
+            </View>
+          </View>
+        </View>
+
+        <View style={s.durationBlock}>
+          <Text style={s.durationText}>{row.duration || '—'}</Text>
+          <Text style={s.durationCaption}>Journey duration</Text>
+        </View>
+      </View>
+
+      <View style={s.availabilityRow}>
+        <Ionicons name="ticket-outline" size={13} color={C.muted} />
+        <Text style={s.seatCount}>{bus.available_Seats ?? '—'} seats available</Text>
+      </View>
+    </Pressable>
+  );
+});
+
+/* ---------------------------------------------------------------- */
+/* Filter sheet: owns its draft state, so ticking a box re-renders    */
+/* only this sheet and never the whole results list                   */
+/* ---------------------------------------------------------------- */
+const FilterOption = memo(function FilterOption({
+  group,
+  label,
+  selected,
+  icon,
+  hint,
+  onToggle,
+}: {
+  group: keyof FilterState;
+  label: string;
+  selected: boolean;
+  icon?: IconName;
+  hint?: string;
+  onToggle: (group: keyof FilterState, value: string) => void;
+}) {
+  return (
+    <Pressable
+      onPress={() => onToggle(group, label)}
+      style={s.optionRow}
+      hitSlop={{ top: 4, bottom: 4, left: 4, right: 4 }}
+    >
+      <View style={[s.checkbox, selected && s.checkboxSelected]}>
+        {selected && <Ionicons name="checkmark" size={15} color={C.white} />}
+      </View>
+      {!!icon && <Ionicons name={icon} size={18} color={selected ? C.burgundy : C.muted} />}
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={s.optionText} numberOfLines={2}>{label}</Text>
+        {!!hint && <Text style={s.optionHint}>{hint}</Text>}
+      </View>
+    </Pressable>
+  );
+});
+
+const FilterSection = memo(function FilterSection({
+  title,
+  icon,
+  group,
+  values,
+  selected,
+  optionIcon,
+  optionHint,
+  onToggle,
+}: {
+  title: string;
+  icon: IconName;
+  group: keyof FilterState;
+  values: string[];
+  selected: string[];
+  optionIcon?: (label: string) => IconName | undefined;
+  optionHint?: (label: string) => string | undefined;
+  onToggle: (group: keyof FilterState, value: string) => void;
+}) {
+  return (
+    <View style={s.filterSection}>
+      <View style={s.filterSectionHeader}>
+        <Ionicons name={icon} size={17} color={C.burgundy} />
+        <Text style={s.filterSectionTitle}>{title}</Text>
+      </View>
+      {values.length ? (
+        <View style={s.filterOptions}>
+          {values.map(value => (
+            <FilterOption
+              key={value}
+              group={group}
+              label={value}
+              selected={selected.includes(value)}
+              icon={optionIcon?.(value)}
+              hint={optionHint?.(value)}
+              onToggle={onToggle}
+            />
+          ))}
+        </View>
+      ) : (
+        <Text style={s.unavailableText}>
+          No {title.toLowerCase()} information provided by the operator.
+        </Text>
+      )}
+    </View>
+  );
+});
+
+const FilterSheet = memo(function FilterSheet({
+  visible,
+  onClose,
+  onApply,
+  rows,
+  applied,
+  operators,
+  amenities,
+  isMobile,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onApply: (filters: FilterState) => void;
+  rows: Row[];
+  applied: FilterState;
+  operators: string[];
+  amenities: string[];
+  isMobile: boolean;
+}) {
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const keyboardHeight = useKeyboardHeight();
+  const scrollRef = useRef<ScrollView>(null);
+  const operatorY = useRef(0);
+  const [draft, setDraft] = useState<FilterState>(applied);
+  const [operatorSearch, setOperatorSearch] = useState('');
+
+  useEffect(() => {
+    if (visible) {
+      setDraft(applied);
+      setOperatorSearch('');
+    }
+  }, [visible]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggle = useCallback((group: keyof FilterState, value: string) => {
+    setDraft(current => ({ ...current, [group]: toggleValue(current[group], value) }));
+  }, []);
+
+  const count = useMemo(
+    () => filterRows(rows, draft).length,
+    [rows, draft]
+  );
+
+  const operatorValues = useMemo(() => {
+    const q = operatorSearch.trim().toLowerCase();
+    return q ? operators.filter(name => name.toLowerCase().includes(q)) : operators;
+  }, [operators, operatorSearch]);
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
+      <View style={s.modalBackdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+
+        <View
+          style={[
+            s.filterSheet,
+            !isMobile && s.filterSheetWide,
+            {
+              // Lift the whole sheet above the keyboard and shrink it to the space that is left.
+              marginBottom: keyboardHeight || (isMobile ? 0 : 20),
+              maxHeight: Math.max(280, windowHeight - keyboardHeight - insets.top - 12),
+            },
+          ]}
+        >
+          <View style={s.sheetHandle} />
+
+          <View style={s.sheetHeader}>
+            <View>
+              <Text style={s.sheetTitle}>Filters</Text>
+              <Text style={s.sheetSubtitle}>Refine your search · {count} buses match</Text>
+            </View>
+            <Pressable style={s.closeButton} onPress={onClose}>
+              <Ionicons name="close" size={22} color={C.ink} />
+            </Pressable>
+          </View>
+
+          <ScrollView
+            ref={scrollRef}
+            style={s.filterScroll}
+            contentContainerStyle={s.filterScrollContent}
+            showsVerticalScrollIndicator={false}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+          >
+            <FilterSection title="Bus type" icon="bus-outline" group="busTypes" values={BUS_TYPE_VALUES} selected={draft.busTypes} optionIcon={typeIcon} onToggle={toggle} />
+            <FilterSection title="Departure time" icon="time-outline" group="departure" values={TIME_VALUES} selected={draft.departure} optionIcon={timeIcon} optionHint={label => TIME_HINTS[label]} onToggle={toggle} />
+            <FilterSection title="Arrival time" icon="flag-outline" group="arrival" values={TIME_VALUES} selected={draft.arrival} optionIcon={timeIcon} optionHint={label => TIME_HINTS[label]} onToggle={toggle} />
+
+            <View onLayout={e => { operatorY.current = e.nativeEvent.layout.y; }}>
+            <View style={s.operatorSearch}>
+              <Ionicons name="search-outline" size={17} color={C.muted} />
+              <TextInput
+                value={operatorSearch}
+                onChangeText={setOperatorSearch}
+                onFocus={() =>
+                  setTimeout(() => scrollRef.current?.scrollTo({ y: operatorY.current, animated: true }), 200)
+                }
+                returnKeyType="done"
+                placeholder="Search bus operator"
+                placeholderTextColor={C.muted}
+                style={s.operatorSearchInput}
+              />
+            </View>
+            <FilterSection title="Operators" icon="business-outline" group="operators" values={operatorValues} selected={draft.operators} optionIcon={operatorIcon} onToggle={toggle} />
+            </View>
+
+            {amenities.length > 0 && (
+              <FilterSection title="Amenities" icon="sparkles-outline" group="amenities" values={amenities} selected={draft.amenities} optionIcon={amenityIcon} onToggle={toggle} />
+            )}
+          </ScrollView>
+
+          <View style={[s.filterFooter, { paddingBottom: keyboardHeight ? 12 : 16 + insets.bottom }]}>
+            <Pressable style={s.clearButton} onPress={() => setDraft(emptyFilters)}>
+              <Text style={s.clearButtonText}>Clear all</Text>
+            </Pressable>
+            <Pressable style={s.applyButton} onPress={() => onApply(draft)}>
+              <Text style={s.applyButtonText}>Show buses ({count})</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    </Modal>
+  );
+});
+
+/** Moves bottom sheets above the keyboard (Android edge-to-edge does not resize the window). */
+function useKeyboardHeight(): number {
+  const [height, setHeight] = useState(0);
+  useEffect(() => {
+    const show = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      e => setHeight(e.endCoordinates?.height ?? 0)
+    );
+    const hide = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
+      () => setHeight(0)
+    );
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+  return height;
+}
+
+/** Calm full-screen loader: a title, one line of context and a thin progress bar. No illustration. */
+function OpeningLoader({ visible, title, subtitle }: { visible: boolean; title: string; subtitle?: string }) {
+  const progress = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!visible) return;
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(progress, { toValue: 1, duration: 1600, useNativeDriver: true }),
+        Animated.timing(progress, { toValue: 0, duration: 1600, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [visible, progress]);
+
+  return (
+    <Modal visible={visible} animationType="fade" presentationStyle="fullScreen" statusBarTranslucent onRequestClose={() => {}}>
+      <View style={s.loaderScreen}>
+        <Text style={s.loaderTitle}>{title}</Text>
+        {!!subtitle && <Text style={s.loaderSubtitle} numberOfLines={2}>{subtitle}</Text>}
+        <View style={s.loaderTrack}>
+          <Animated.View
+            style={[
+              s.loaderFill,
+              { transform: [{ translateX: progress.interpolate({ inputRange: [0, 1], outputRange: [-95, 95] }) }] },
+            ]}
+          />
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function Separator() {
+  return <View style={s.listSeparator} />;
+}
+
+export default function Results() {
+  const router = useRouter();
+  const routeParams = useLocalSearchParams<{
+    response?: string | string[];
+    date?: string | string[];
+    from?: string | string[];
+    to?: string | string[];
+    fromCityId?: string | string[];
+    toCityId?: string | string[];
+  }>();
   const { width } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
   const isMobile = width < 640;
 
-  const params = route?.params || {};
-  const initialResponse = params.response || {};
+  const from = readRouteString(routeParams.from) || 'Departure';
+  const to = readRouteString(routeParams.to) || 'Destination';
+  const fromCityId = readRouteString(routeParams.fromCityId);
+  const toCityId = readRouteString(routeParams.toCityId);
+
+  // Parse ONCE (lazy initializer). The old code re-parsed the whole response on every render.
+  // Home now hands the response over through resultsCache; the route param is only a fallback.
+  const [initialResponse] = useState(() => {
+    const legacy = readRouteString(routeParams.response);
+    return legacy ? parseRouteResponse(legacy) : (getSearchResponse() ?? {});
+  });
 
   const [buses, setBuses] = useState<Bus[]>(
     Array.isArray(initialResponse.buses) ? initialResponse.buses : []
   );
   const [searchKey, setSearchKey] = useState(initialResponse.search_Key);
-  const [journeyDate, setJourneyDate] = useState(params.date || '');
+  const [journeyDate, setJourneyDate] = useState(readRouteString(routeParams.date));
 
-  const from = params.from || 'Departure';
-  const to = params.to || 'Destination';
-  const fromCityId = params.fromCityId;
-  const toCityId = params.toCityId;
-
-  const [quickFilter, setQuickFilter] =
-    useState<typeof quickFilters[number]>('All');
   const [sort, setSort] = useState<Sort>('Recommended');
   const [showSort, setShowSort] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
-  const [draftFilters, setDraftFilters] = useState<FilterState>(emptyFilters);
   const [appliedFilters, setAppliedFilters] = useState<FilterState>(emptyFilters);
-  const [operatorSearch, setOperatorSearch] = useState('');
+
+  // Opening the seat screen
+  const [openingSeats, setOpeningSeats] = useState(false);
+  const [openingLabel, setOpeningLabel] = useState('');
+  const openingRef = useRef(false);
+  const fallbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Date calendar state
   const [showDatePicker, setShowDatePicker] = useState(false);
   const [selectedDate, setSelectedDate] = useState(journeyDate);
   const [calendarMonth, setCalendarMonth] = useState(() => {
-    const initial = journeyDate
-      ? new Date(`${journeyDate}T00:00:00`)
-      : new Date();
+    const initial = journeyDate ? new Date(`${journeyDate}T00:00:00`) : new Date();
     return new Date(initial.getFullYear(), initial.getMonth(), 1);
   });
   const [searchingDate, setSearchingDate] = useState(false);
@@ -284,15 +809,9 @@ export default function Results({ navigation, route }: any) {
   );
   const maxDateKey = dateKey(maxDate);
 
-  const calendarDays = useMemo(
-    () => getCalendarDays(calendarMonth),
-    [calendarMonth]
-  );
+  const calendarDays = useMemo(() => getCalendarDays(calendarMonth), [calendarMonth]);
 
-  const monthTitle = calendarMonth.toLocaleDateString('en-IN', {
-    month: 'long',
-    year: 'numeric',
-  });
+  const monthTitle = calendarMonth.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
 
   const isFirstMonth =
     calendarMonth.getFullYear() === new Date().getFullYear() &&
@@ -303,19 +822,14 @@ export default function Results({ navigation, route }: any) {
     calendarMonth.getMonth() === maxDate.getMonth();
 
   const openDatePicker = () => {
-    const current = journeyDate
-      ? new Date(`${journeyDate}T00:00:00`)
-      : new Date();
-
+    const current = journeyDate ? new Date(`${journeyDate}T00:00:00`) : new Date();
     setSelectedDate(journeyDate || todayKey);
     setCalendarMonth(new Date(current.getFullYear(), current.getMonth(), 1));
     setShowDatePicker(true);
   };
 
   const changeMonth = (amount: number) => {
-    setCalendarMonth(current =>
-      new Date(current.getFullYear(), current.getMonth() + amount, 1)
-    );
+    setCalendarMonth(current => new Date(current.getFullYear(), current.getMonth() + amount, 1));
   };
 
   const selectDate = (value: string) => {
@@ -325,18 +839,15 @@ export default function Results({ navigation, route }: any) {
 
   const searchForSelectedDate = async () => {
     if (!fromCityId || !toCityId) {
-      const message =
-        'City IDs are missing. Please go back to Home and search again.';
+      const message = 'City IDs are missing. Please go back to Home and search again.';
       Platform.OS === 'web'
         ? window.alert(message)
         : Alert.alert('Unable to search', message);
       return;
     }
-
     if (!selectedDate) return;
 
     setSearchingDate(true);
-
     try {
       const [year, month, day] = selectedDate.split('-');
       const travel_date = `${month}/${day}/${year}`;
@@ -347,26 +858,16 @@ export default function Results({ navigation, route }: any) {
         travel_date,
       });
 
-      const updatedBuses = Array.isArray(response?.buses)
-        ? response.buses
-        : [];
-
-      setBuses(updatedBuses);
+      setBuses(Array.isArray(response?.buses) ? response.buses : []);
       setSearchKey(response?.search_Key);
       setJourneyDate(selectedDate);
       setShowDatePicker(false);
 
-      // Update route params too, so the current search is retained.
-      navigation.setParams?.({
-        response,
-        date: selectedDate,
-      });
+      // Only the small date param is updated; the big response stays in state.
+      router.setParams({ date: selectedDate });
 
-      // Clear filters that may not exist for the new date.
-      setQuickFilter('All');
       setSort('Recommended');
       setAppliedFilters(emptyFilters);
-      setDraftFilters(emptyFilters);
       setShowSort(false);
     } catch (error: any) {
       const message = error?.message || 'Please try again.';
@@ -378,173 +879,224 @@ export default function Results({ navigation, route }: any) {
     }
   };
 
-  const filterOptions = useMemo(() => {
-    const operators = unique(
-      buses.map(bus => bus.operator_Name || '').filter(Boolean)
-    );
-    const amenities = unique(buses.flatMap(bus => getAmenities(bus)));
-    return { operators, amenities };
-  }, [buses]);
+  /* ---- derived data, each computed only when its inputs change ---- */
+  const rows = useMemo(() => buildRows(buses), [buses]);
+  const operators = useMemo(() => unique(rows.map(r => r.operator).filter(Boolean)), [rows]);
+  const amenities = useMemo(() => unique(rows.flatMap(r => r.amenities)), [rows]);
 
-  const filterBusList = (
-    source: Bus[],
-    selectedQuickFilter: typeof quickFilters[number],
-    selectedFilters: FilterState
-  ): Bus[] => {
-    let result = [...source];
-
-    if (selectedQuickFilter === 'AC') result = result.filter(isAC);
-    else if (selectedQuickFilter === 'Non-AC') result = result.filter(bus => !isAC(bus));
-    else if (selectedQuickFilter === 'Sleeper') result = result.filter(isSleeper);
-    else if (selectedQuickFilter === 'Seater') result = result.filter(isSeater);
-
-    if (selectedFilters.busTypes.length) {
-      result = result.filter(bus => {
-        const matches: boolean[] = [];
-        if (selectedFilters.busTypes.includes('AC')) matches.push(isAC(bus));
-        if (selectedFilters.busTypes.includes('Non-AC')) matches.push(!isAC(bus));
-        if (selectedFilters.busTypes.includes('Sleeper')) matches.push(isSleeper(bus));
-        if (selectedFilters.busTypes.includes('Seater')) matches.push(isSeater(bus));
-        return matches.some(Boolean);
-      });
+  const filteredRows = useMemo(() => {
+    const result = filterRows(rows, appliedFilters);
+    if (sort === 'Early departure') {
+      result.sort((a, b) => (a.depMin ?? Infinity) - (b.depMin ?? Infinity));
+    } else if (sort === 'Late departure') {
+      result.sort((a, b) => (b.depMin ?? -Infinity) - (a.depMin ?? -Infinity));
+    } else if (sort === 'Price: low to high') {
+      result.sort((a, b) => a.fare - b.fare);
+    } else if (sort === 'Price: high to low') {
+      result.sort((a, b) => b.fare - a.fare);
+    } else if (sort === 'Highest rated') {
+      result.sort((a, b) => b.rating - a.rating);
     }
-
-    if (selectedFilters.departure.length) {
-      result = result.filter(bus =>
-        selectedFilters.departure.includes(getTimeBucket(bus.departure_Time))
-      );
-    }
-
-    if (selectedFilters.arrival.length) {
-      result = result.filter(bus =>
-        selectedFilters.arrival.includes(getTimeBucket(bus.arrival_Time))
-      );
-    }
-
-    if (selectedFilters.operators.length) {
-      result = result.filter(bus =>
-        selectedFilters.operators.includes(bus.operator_Name || '')
-      );
-    }
-
-    if (selectedFilters.amenities.length) {
-      result = result.filter(bus =>
-        selectedFilters.amenities.every(item => getAmenities(bus).includes(item))
-      );
-    }
-
     return result;
-  };
+  }, [rows, appliedFilters, sort]);
 
-  const filteredBuses = useMemo(() => {
-    const result = filterBusList(buses, quickFilter, appliedFilters);
-
-   if (sort === 'Early departure') {
-  result.sort(
-    (a, b) =>
-      (timeToMinutes(a.departure_Time) ?? Infinity) -
-      (timeToMinutes(b.departure_Time) ?? Infinity)
-  );
-} else if (sort === 'Late departure') {
-  result.sort(
-    (a, b) =>
-      (timeToMinutes(b.departure_Time) ?? -Infinity) -
-      (timeToMinutes(a.departure_Time) ?? -Infinity)
-  );
-} else if (sort === 'Price: low to high') {
-  result.sort((a, b) => getFare(a) - getFare(b));
-} else if (sort === 'Price: high to low') {
-  result.sort((a, b) => getFare(b) - getFare(a));
-} else if (sort === 'Highest rated') {
-  result.sort((a, b) => getRating(b) - getRating(a));
-}
-
-    return result;
-  }, [buses, quickFilter, appliedFilters, sort]);
-
-  const draftBusCount = useMemo(
-    () => filterBusList(buses, quickFilter, draftFilters).length,
-    [buses, quickFilter, draftFilters]
+  // Bus-type picks are already visible as chips next to the button, so they are not counted here.
+  const hasRatings = useMemo(() => rows.some(r => r.rating > 0), [rows]);
+  const sortChoices = useMemo(
+    () => (hasRatings ? sortOptions : sortOptions.filter(item => item !== 'Highest rated')),
+    [hasRatings]
   );
 
   const activeFilterCount =
-    appliedFilters.busTypes.length +
     appliedFilters.departure.length +
     appliedFilters.arrival.length +
     appliedFilters.operators.length +
     appliedFilters.amenities.length;
 
-  const openFilters = () => {
-    setDraftFilters({
-      busTypes: [...appliedFilters.busTypes],
-      departure: [...appliedFilters.departure],
-      arrival: [...appliedFilters.arrival],
-      operators: [...appliedFilters.operators],
-      amenities: [...appliedFilters.amenities],
-    });
-    setOperatorSearch('');
-    setShowFilters(true);
-  };
-
-  const updateDraft = (key: keyof FilterState, value: string) => {
-    setDraftFilters(current => ({
-      ...current,
-      [key]: toggleValue(current[key], value),
-    }));
-  };
+  const closeFilters = useCallback(() => setShowFilters(false), []);
+  const applyFilters = useCallback((filters: FilterState) => {
+    setAppliedFilters(filters);
+    setShowFilters(false);
+  }, []);
 
   const clearFilters = () => {
-    setDraftFilters(emptyFilters);
     setAppliedFilters(emptyFilters);
-    setQuickFilter('All');
+    setSort('Recommended');
   };
 
-  const openBus = (bus: Bus) => {
-    navigation.navigate('seats', {
-      bus,
-      searchKey,
-      busKey: bus.bus_Key,
-      from,
-      to,
-      date: journeyDate,
-      boardingDetails: bus.boardingDetails || [],
-      droppingDetails: bus.droppingDetails || [],
-      dropPointMandatory: bus.dropPoint_Mandatory,
-    });
-  };
+  // Quick chips share state with the Bus type section of the filter sheet; any number can be on.
+  const toggleQuick = useCallback((item: string) => {
+    setAppliedFilters(current => ({ ...current, busTypes: toggleValue(current.busTypes, item) }));
+  }, []);
 
-  const renderOption = (
-    label: string,
-    selected: boolean,
-    onPress: () => void
-  ) => (
-    <Pressable key={label} onPress={onPress} style={s.optionRow}>
-      <View style={[s.checkbox, selected && s.checkboxSelected]}>
-        {selected && <Ionicons name="checkmark" size={13} color={C.white} />}
-      </View>
-      <Text style={s.optionText} numberOfLines={2}>{label}</Text>
-    </Pressable>
+  /* ---- open seats with a full-screen loader ---- */
+  const openBus = useCallback(
+    (bus: Bus) => {
+      if (openingRef.current) return; // ignore double taps
+      openingRef.current = true;
+      setOpeningLabel(bus.operator_Name || '');
+      setOpeningSeats(true);
+
+      // Let the loader paint first, then navigate.
+      setTimeout(() => {
+        router.push({
+          pathname: '/seats',
+          params: {
+            bus: JSON.stringify(bus),
+            searchKey: searchKey == null ? '' : String(searchKey),
+            busKey: bus.bus_Key == null ? '' : String(bus.bus_Key),
+            from,
+            to,
+            fromCityId,
+            toCityId,
+            date: journeyDate,
+            boardingDetails: JSON.stringify(bus.boardingDetails || []),
+            droppingDetails: JSON.stringify(bus.droppingDetails || []),
+            dropPointMandatory: String(Boolean(bus.dropPoint_Mandatory)),
+          },
+        });
+        // Safety net in case navigation never leaves this screen.
+        fallbackTimer.current = setTimeout(() => {
+          openingRef.current = false;
+          setOpeningSeats(false);
+        }, 30000);
+      }, 80);
+    },
+    [router, searchKey, from, to, fromCityId, toCityId, journeyDate]
   );
 
-  const renderFilterSection = (
-    title: string,
-    values: string[],
-    selected: string[],
-    key: keyof FilterState
-  ) => (
-    <View style={s.filterSection}>
-      <Text style={s.filterSectionTitle}>{title}</Text>
-      {values.length ? (
-        <View style={s.filterOptions}>
-          {values.map(value =>
-            renderOption(value, selected.includes(value), () => updateDraft(key, value))
-          )}
+  // Hide the loader once this screen has actually been left; reset when we come back.
+  useFocusEffect(
+    useCallback(() => {
+      if (fallbackTimer.current) clearTimeout(fallbackTimer.current);
+      openingRef.current = false;
+      setOpeningSeats(false);
+      return () => {
+        if (openingRef.current) {
+          setTimeout(() => setOpeningSeats(false), 600);
+        }
+      };
+    }, [])
+  );
+
+  const renderItem = useCallback(
+    ({ item }: { item: Row }) => (
+      <BusCard row={item} from={from} to={to} onPress={openBus} />
+    ),
+    [from, to, openBus]
+  );
+
+  const keyExtractor = useCallback((item: Row) => item.key, []);
+
+  const listHeader = (
+    <View>
+      {/* SUMMARY */}
+      <View style={s.summary}>
+        <View>
+          <Text style={s.pageTitle}>Available buses</Text>
+          <Text style={s.resultCount}>
+            {filteredRows.length} of {rows.length} buses
+          </Text>
         </View>
-      ) : (
-        <Text style={s.unavailableText}>
-          No {title.toLowerCase()} information provided by the operator.
-        </Text>
+
+        <Pressable style={s.dateBadge} onPress={openDatePicker}>
+          <Ionicons name="calendar-outline" size={15} color={C.burgundy} />
+          <Text style={s.dateBadgeText}>{formatJourneyDate(journeyDate)}</Text>
+          <Ionicons name="chevron-down" size={13} color={C.burgundy} />
+        </Pressable>
+      </View>
+
+      {/* FILTERS AND SORT */}
+      <View style={s.controls}>
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={s.filterRow}
+          keyboardShouldPersistTaps="handled"
+        >
+          <Pressable
+            style={[s.filterButton, activeFilterCount > 0 && s.filterButtonActive]}
+            onPress={() => setShowFilters(true)}
+          >
+            <Ionicons
+              name="options-outline"
+              size={18}
+              color={activeFilterCount > 0 ? C.white : C.burgundy}
+            />
+            <Text style={[s.filterButtonText, activeFilterCount > 0 && s.filterButtonTextActive]}>
+              Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
+            </Text>
+          </Pressable>
+
+          <Pressable style={s.sortButton} onPress={() => setShowSort(true)}>
+            <Ionicons name="swap-vertical-outline" size={18} color={C.burgundy} />
+            <Text style={s.sortButtonText}>Sort</Text>
+            <Ionicons name="chevron-down" size={14} color={C.muted} />
+          </Pressable>
+
+          <View style={s.controlsDivider} />
+
+          {QUICK_TYPES.map(item => {
+            const active = appliedFilters.busTypes.includes(item);
+            return (
+              <Pressable
+                key={item}
+                onPress={() => toggleQuick(item)}
+                style={[s.filterChip, active && s.filterChipActive]}
+              >
+                <Ionicons
+                  name={TYPE_ICONS[item]}
+                  size={16}
+                  color={active ? C.white : C.burgundy}
+                />
+                <Text style={[s.filterText, active && s.filterTextActive]}>{item}</Text>
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      </View>
+
+      {sort !== 'Recommended' && (
+        <View style={s.sortLabel}>
+          <Text style={s.sortLabelText}>Sorted by {sort.toLowerCase()}</Text>
+          <Pressable onPress={() => setSort('Recommended')} hitSlop={12}>
+            <Text style={s.clearSort}>Reset</Text>
+          </Pressable>
+        </View>
       )}
+    </View>
+  );
+
+  const listEmpty =
+    rows.length === 0 ? (
+      <View style={s.emptyCard}>
+        <View style={s.emptyIcon}>
+          <Ionicons name="bus-outline" size={31} color={C.burgundy} />
+        </View>
+        <Text style={s.emptyTitle}>No buses found</Text>
+        <Text style={s.emptySubtitle}>
+          There are no buses available for this route and date. Try changing your journey date.
+        </Text>
+        <Pressable style={s.backHomeButton} onPress={openDatePicker}>
+          <Text style={s.backHomeText}>Change travel date</Text>
+        </Pressable>
+      </View>
+    ) : (
+      <View style={s.emptyCard}>
+        <Text style={s.emptyTitle}>No matching buses</Text>
+        <Text style={s.emptySubtitle}>Try changing or clearing your filters.</Text>
+        <Pressable style={s.backHomeButton} onPress={clearFilters}>
+          <Text style={s.backHomeText}>Clear filters</Text>
+        </Pressable>
+      </View>
+    );
+
+  const listFooter = (
+    <View style={s.bottomNote}>
+      <Ionicons name="information-circle-outline" size={15} color={C.muted} />
+      <Text style={s.bottomNoteText}>
+        Fares and seat availability are provided by the bus operator.
+      </Text>
     </View>
   );
 
@@ -553,10 +1105,10 @@ export default function Results({ navigation, route }: any) {
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
       {/* ROUTE HEADER */}
-      <View style={s.header}>
+      <View style={[s.header, { paddingTop: insets.top }]}>
         <View style={[s.headerInner, !isMobile && s.wide]}>
-          <Pressable style={s.backButton} onPress={() => navigation.goBack()}>
-            <Ionicons name="arrow-back" size={19} color={C.ink} />
+          <Pressable style={s.backButton} onPress={() => router.back()}>
+            <Ionicons name="arrow-back" size={21} color={C.ink} />
           </Pressable>
 
           <View style={s.headerRoute}>
@@ -566,288 +1118,75 @@ export default function Results({ navigation, route }: any) {
             <Text style={s.headerDate}>{formatJourneyDate(journeyDate)}</Text>
           </View>
 
-          <Pressable style={s.editButton} onPress={() => navigation.goBack()}>
-            <Ionicons name="create-outline" size={17} color={C.burgundy} />
+          <Pressable style={s.editButton} onPress={() => router.back()}>
+            <Ionicons name="create-outline" size={18} color={C.burgundy} />
             <Text style={s.editText}>Edit</Text>
           </Pressable>
         </View>
       </View>
 
-      <ScrollView
+      {/* Virtualized list: only the cards near the screen are rendered */}
+      <View style={{ flex: 1, paddingBottom: insets.bottom }}>
+      <FlatList
+        data={filteredRows}
+        keyExtractor={keyExtractor}
+        renderItem={renderItem}
+        ItemSeparatorComponent={Separator}
+        ListHeaderComponent={listHeader}
+        ListEmptyComponent={listEmpty}
+        ListFooterComponent={listFooter}
+        initialNumToRender={8}
+        maxToRenderPerBatch={8}
+        updateCellsBatchSize={8}
+        windowSize={7}
+        removeClippedSubviews={Platform.OS === 'android'}
         showsVerticalScrollIndicator={false}
-        contentContainerStyle={s.scroll}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={[s.scroll, !isMobile && s.wide]}
+      />
+      </View>
+
+      {/* SORT SHEET */}
+      <Modal
+        visible={showSort}
+        transparent
+        statusBarTranslucent
+        animationType="fade"
+        onRequestClose={() => setShowSort(false)}
       >
-        <View style={[s.content, !isMobile && s.wide]}>
-          {/* SUMMARY */}
-          <View style={s.summary}>
-            <View>
-              <Text style={s.pageTitle}>Available buses</Text>
-              <Text style={s.resultCount}>
-                {filteredBuses.length} of {buses.length} buses
-              </Text>
-            </View>
-
-            <Pressable style={s.dateBadge} onPress={openDatePicker}>
-              <Ionicons name="calendar-outline" size={14} color={C.burgundy} />
-              <Text style={s.dateBadgeText}>
-                {formatJourneyDate(journeyDate)}
-              </Text>
-              <Ionicons name="chevron-down" size={12} color={C.burgundy} />
-            </Pressable>
-          </View>
-
-          {/* FILTERS AND SORT */}
-          <View style={s.controls}>
-            <Pressable
-              style={[s.filterButton, activeFilterCount > 0 && s.filterButtonActive]}
-              onPress={openFilters}
-            >
-              <Ionicons
-                name="options-outline"
-                size={16}
-                color={activeFilterCount > 0 ? C.white : C.burgundy}
-              />
-              <Text style={[
-                s.filterButtonText,
-                activeFilterCount > 0 && s.filterButtonTextActive,
-              ]}>
-                Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
-              </Text>
-            </Pressable>
-
-            <View style={s.sortContainer}>
+        <View style={s.sortBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setShowSort(false)} />
+          <View style={[s.sortSheet, !isMobile && s.sortSheetWide, { paddingBottom: 18 + insets.bottom }]}>
+            <View style={s.sheetHandle} />
+            <Text style={s.sortSheetTitle}>Sort by</Text>
+            {sortChoices.map(item => (
               <Pressable
-                style={s.sortButton}
-                onPress={() => setShowSort(value => !value)}
-              >
-                <Ionicons name="swap-vertical-outline" size={16} color={C.burgundy} />
-                <Text style={s.sortButtonText}>Sort</Text>
-                <Ionicons name="chevron-down" size={13} color={C.muted} />
-              </Pressable>
-
-              {showSort && (
-                <>
-                  <Pressable
-                    style={s.dismissSort}
-                    onPress={() => setShowSort(false)}
-                  />
-                  <View style={s.sortMenu}>
-                    {sortOptions.map(item => (
-                      <Pressable
-                        key={item}
-                        style={s.sortOption}
-                        onPress={() => {
-                          setSort(item);
-                          setShowSort(false);
-                        }}
-                      >
-                        <Text style={[
-                          s.sortOptionText,
-                          sort === item && s.sortOptionSelected,
-                        ]}>
-                          {item}
-                        </Text>
-                        {sort === item && (
-                          <Ionicons name="checkmark" size={16} color={C.burgundy} />
-                        )}
-                      </Pressable>
-                    ))}
-                  </View>
-                </>
-              )}
-            </View>
-
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={s.quickFilterScroll}
-              contentContainerStyle={s.filterRow}
-            >
-              {quickFilters.map(item => {
-                const active = quickFilter === item;
-                return (
-                  <Pressable
-                    key={item}
-                    onPress={() => setQuickFilter(item === quickFilter ? 'All' : item)}
-                    style={[s.filterChip, active && s.filterChipActive]}
-                  >
-                    <Text style={[s.filterText, active && s.filterTextActive]}>
-                      {item}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </ScrollView>
-          </View>
-
-          {sort !== 'Recommended' && (
-            <View style={s.sortLabel}>
-              <Text style={s.sortLabelText}>Sorted by {sort.toLowerCase()}</Text>
-              <Pressable onPress={() => setSort('Recommended')}>
-                <Text style={s.clearSort}>Reset</Text>
-              </Pressable>
-            </View>
-          )}
-
-          {/* BUS RESULTS */}
-          {buses.length === 0 ? (
-            <View style={s.emptyCard}>
-              <View style={s.emptyIcon}>
-                <Ionicons name="bus-outline" size={31} color={C.burgundy} />
-              </View>
-              <Text style={s.emptyTitle}>No buses found</Text>
-              <Text style={s.emptySubtitle}>
-                There are no buses available for this route and date.
-                Try changing your journey date.
-              </Text>
-              <Pressable style={s.backHomeButton} onPress={openDatePicker}>
-                <Text style={s.backHomeText}>Change travel date</Text>
-              </Pressable>
-            </View>
-          ) : filteredBuses.length === 0 ? (
-            <View style={s.emptyCard}>
-              <Text style={s.emptyTitle}>No matching buses</Text>
-              <Text style={s.emptySubtitle}>
-                Try changing or clearing your filters.
-              </Text>
-              <Pressable
-                style={s.backHomeButton}
+                key={item}
+                style={s.sortOption}
                 onPress={() => {
-                  clearFilters();
-                  setSort('Recommended');
+                  setSort(item);
+                  setShowSort(false);
                 }}
               >
-                <Text style={s.backHomeText}>Clear filters</Text>
+                <Text style={[s.sortOptionText, sort === item && s.sortOptionSelected]}>
+                  {item}
+                </Text>
+                {sort === item && <Ionicons name="checkmark" size={20} color={C.burgundy} />}
               </Pressable>
-            </View>
-          ) : (
-            <View style={s.busList}>
-              {filteredBuses.map((bus, index) => {
-                const fare = getFare(bus);
-                const duration = getDuration(bus.departure_Time, bus.arrival_Time);
-                const ac = isAC(bus);
-                const sleeper = isSleeper(bus);
-                const seater = isSeater(bus);
-                const rating = getRating(bus);
-
-                return (
-                  <Pressable
-                    key={`${bus.bus_Key || 'bus'}-${index}`}
-                    style={s.busCard}
-                    onPress={() => openBus(bus)}
-                    android_ripple={{ color: C.burgundyLight }}
-                  >
-                    <View style={s.busTop}>
-                      <View style={s.operatorInfo}>
-                        <View style={s.busIcon}>
-                          <Ionicons name="bus-outline" size={20} color={C.burgundy} />
-                        </View>
-
-                        <View style={s.operatorText}>
-                          <Text style={s.operatorName} numberOfLines={1}>
-                            {bus.operator_Name || 'Bus operator'}
-                          </Text>
-                          <Text style={s.busType} numberOfLines={2}>
-                            {bus.bus_Type || 'Bus service'}
-                          </Text>
-                        </View>
-                      </View>
-
-                      <View style={s.fareBlock}>
-                        <Text style={s.fareCaption}>Starting from</Text>
-                        <Text style={s.fareValue}>{formatPrice(fare)}</Text>
-                        {rating > 0 && (
-                          <View style={s.ratingRow}>
-                            <Ionicons name="star" size={12} color="#C18A43" />
-                            <Text style={s.ratingText}>{rating.toFixed(1)}</Text>
-                          </View>
-                        )}
-                      </View>
-                    </View>
-
-                    <View style={s.tags}>
-                      <View style={s.typeTag}>
-                        <Ionicons
-                          name={ac ? 'snow-outline' : 'sunny-outline'}
-                          size={12}
-                          color={C.muted}
-                        />
-                        <Text style={s.typeTagText}>{ac ? 'AC' : 'NON-AC'}</Text>
-                      </View>
-
-                      {sleeper && (
-                        <View style={s.typeTag}>
-                          <Ionicons name="bed-outline" size={12} color={C.muted} />
-                          <Text style={s.typeTagText}>SLEEPER</Text>
-                        </View>
-                      )}
-
-                      {seater && (
-                        <View style={s.typeTag}>
-                          <Ionicons name="briefcase-outline" size={12} color={C.muted} />
-                          <Text style={s.typeTagText}>SEATER</Text>
-                        </View>
-                      )}
-                    </View>
-
-                    <View style={s.cardDivider} />
-
-                    <View style={s.journeySection}>
-                      <View style={s.timelineColumn}>
-                        <View style={s.timelineTrack}>
-                          <View style={s.timelineCircle} />
-                          <View style={s.timelineLine} />
-                          <View style={[s.timelineCircle, s.timelineCircleEnd]} />
-                        </View>
-
-                        <View style={s.timelineStops}>
-                          <View style={s.timelineStop}>
-                            <Text style={s.timeValue}>{bus.departure_Time || '--'}</Text>
-                            <Text style={s.timeCaption} numberOfLines={1}>{from}</Text>
-                          </View>
-
-                          <View style={s.timelineStop}>
-                            <Text style={s.timeValue}>{bus.arrival_Time || '--'}</Text>
-                            <Text style={s.timeCaption} numberOfLines={1}>{to}</Text>
-                          </View>
-                        </View>
-                      </View>
-
-                      <View style={s.durationBlock}>
-                        <Text style={s.durationText}>{duration || '—'}</Text>
-                        <Text style={s.durationCaption}>Journey duration</Text>
-                      </View>
-                    </View>
-
-                    <View style={s.availabilityRow}>
-                      <Ionicons name="ticket-outline" size={12} color={C.muted} />
-                      <Text style={s.seatCount}>
-                        {bus.available_Seats ?? '—'} seats available
-                      </Text>
-                    </View>
-                  </Pressable>
-                );
-              })}
-            </View>
-          )}
-
-          <View style={s.bottomNote}>
-            <Ionicons name="information-circle-outline" size={15} color={C.muted} />
-            <Text style={s.bottomNoteText}>
-              Fares and seat availability are provided by the bus operator.
-            </Text>
+            ))}
           </View>
         </View>
-      </ScrollView>
+      </Modal>
 
       {/* DATE PICKER */}
       <Modal
         visible={showDatePicker}
         transparent
+        statusBarTranslucent
         animationType="fade"
         onRequestClose={() => setShowDatePicker(false)}
       >
-        <View style={s.dateBackdrop}>
+        <View style={[s.dateBackdrop, { paddingTop: 18 + insets.top, paddingBottom: 18 + insets.bottom }]}>
           <Pressable
             style={StyleSheet.absoluteFill}
             onPress={() => setShowDatePicker(false)}
@@ -964,118 +1303,24 @@ export default function Results({ navigation, route }: any) {
         </View>
       </Modal>
 
-      {/* FILTER MODAL */}
-      <Modal
+      {/* FILTER SHEET */}
+      <FilterSheet
         visible={showFilters}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setShowFilters(false)}
-      >
-        <View style={s.modalBackdrop}>
-          <Pressable
-            style={StyleSheet.absoluteFill}
-            onPress={() => setShowFilters(false)}
-          />
+        onClose={closeFilters}
+        onApply={applyFilters}
+        rows={rows}
+        applied={appliedFilters}
+        operators={operators}
+        amenities={amenities}
+        isMobile={isMobile}
+      />
 
-          <View style={[s.filterSheet, !isMobile && s.filterSheetWide]}>
-            <View style={s.sheetHandle} />
-
-            <View style={s.sheetHeader}>
-              <View>
-                <Text style={s.sheetTitle}>Filters</Text>
-                <Text style={s.sheetSubtitle}>
-                  Refine your bus search · {draftBusCount} buses match
-                </Text>
-              </View>
-
-              <Pressable
-                style={s.closeButton}
-                onPress={() => setShowFilters(false)}
-              >
-                <Ionicons name="close" size={20} color={C.ink} />
-              </Pressable>
-            </View>
-
-            <ScrollView
-              style={s.filterScroll}
-              contentContainerStyle={s.filterScrollContent}
-              showsVerticalScrollIndicator={false}
-            >
-              {renderFilterSection(
-                'Bus type',
-                ['AC', 'Non-AC', 'Sleeper', 'Seater'],
-                draftFilters.busTypes,
-                'busTypes'
-              )}
-
-              {renderFilterSection(
-                'Departure time',
-                ['Morning', 'Afternoon', 'Evening', 'Night'],
-                draftFilters.departure,
-                'departure'
-              )}
-
-              {renderFilterSection(
-                'Arrival time',
-                ['Morning', 'Afternoon', 'Evening', 'Night'],
-                draftFilters.arrival,
-                'arrival'
-              )}
-
-              <View style={s.filterSection}>
-                <Text style={s.filterSectionTitle}>Operator</Text>
-                <View style={s.operatorSearch}>
-                  <Ionicons name="search-outline" size={16} color={C.muted} />
-                  <TextInput
-                    value={operatorSearch}
-                    onChangeText={setOperatorSearch}
-                    placeholder="Search bus operator"
-                    placeholderTextColor={C.muted}
-                    style={s.operatorSearchInput}
-                  />
-                </View>
-
-                {renderFilterSection(
-                  'Available operators',
-                  filterOptions.operators.filter(name =>
-                    name.toLowerCase().includes(operatorSearch.toLowerCase())
-                  ),
-                  draftFilters.operators,
-                  'operators'
-                )}
-              </View>
-
-              {renderFilterSection(
-                'Amenities',
-                filterOptions.amenities,
-                draftFilters.amenities,
-                'amenities'
-              )}
-            </ScrollView>
-
-            <View style={s.filterFooter}>
-              <Pressable
-                style={s.clearButton}
-                onPress={() => setDraftFilters(emptyFilters)}
-              >
-                <Text style={s.clearButtonText}>Clear all</Text>
-              </Pressable>
-
-              <Pressable
-                style={s.applyButton}
-                onPress={() => {
-                  setAppliedFilters(draftFilters);
-                  setShowFilters(false);
-                }}
-              >
-                <Text style={s.applyButtonText}>
-                  Show buses ({draftBusCount})
-                </Text>
-              </Pressable>
-            </View>
-          </View>
-        </View>
-      </Modal>
+      {/* FULL-SCREEN LOADER WHILE OPENING SEATS */}
+      <OpeningLoader
+        visible={openingSeats}
+        title="Opening your seats"
+        subtitle={openingLabel}
+      />
     </View>
   );
 }
@@ -1101,27 +1346,27 @@ const s = StyleSheet.create({
     gap: 12,
   },
   backButton: {
-    width: 36,
-    height: 36,
-    borderRadius: 11,
+    width: 44,
+    height: 44,
+    borderRadius: 13,
     backgroundColor: C.bg,
     alignItems: 'center',
     justifyContent: 'center',
   },
   headerRoute: { flex: 1, minWidth: 0 },
-  headerTitle: { fontSize: 15, fontWeight: '700', color: C.ink },
+  headerTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
   routeArrow: { color: C.burgundy },
-  headerDate: { fontSize: 10, color: C.muted, marginTop: 3 },
+  headerDate: { fontSize: 12, color: C.muted, marginTop: 3 },
   editButton: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
+    paddingHorizontal: 13,
+    paddingVertical: 11,
     borderRadius: 9,
     backgroundColor: C.burgundyLight,
   },
-  editText: { fontSize: 11, color: C.burgundy, fontWeight: '600' },
+  editText: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
 
   scroll: { paddingHorizontal: 13, paddingTop: 15, paddingBottom: 35 },
   content: { width: '100%' },
@@ -1131,23 +1376,23 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 14,
   },
-  pageTitle: { fontSize: 19, fontWeight: '700', color: C.ink },
-  resultCount: { fontSize: 10, color: C.muted, marginTop: 4 },
+  pageTitle: { fontSize: 22, fontWeight: '700', color: C.ink },
+  resultCount: { fontSize: 12, color: C.muted, marginTop: 4 },
   dateBadge: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
-    paddingHorizontal: 9,
-    paddingVertical: 7,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
     borderRadius: 9,
     backgroundColor: C.burgundyLight,
   },
-  dateBadgeText: { fontSize: 9, color: C.burgundy, fontWeight: '600' },
+  dateBadgeText: { fontSize: 12, color: C.burgundy, fontWeight: '600' },
 
   controls: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 7,
+    gap: 10,
     marginBottom: 13,
     zIndex: 20,
   },
@@ -1155,84 +1400,64 @@ const s = StyleSheet.create({
   filterRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    paddingRight: 2,
+    gap: 8,
+    paddingRight: 13,
   },
   filterChip: {
-    paddingHorizontal: 11,
-    paddingVertical: 9,
-    borderRadius: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    height: 44,
+    paddingHorizontal: 14,
+    borderRadius: 22,
     borderWidth: 1,
     borderColor: C.border,
     backgroundColor: C.paper,
   },
   filterChipActive: { backgroundColor: C.burgundy, borderColor: C.burgundy },
-  filterText: { fontSize: 10, color: C.muted, fontWeight: '600' },
+  filterText: { fontSize: 13, color: C.muted, fontWeight: '600' },
   filterTextActive: { color: C.white, fontWeight: '700' },
 
   filterButton: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    paddingHorizontal: 10,
+    paddingHorizontal: 14,
     paddingVertical: 9,
     borderRadius: 10,
     borderWidth: 1,
     borderColor: C.border,
     backgroundColor: C.paper,
+    height: 44,
+    justifyContent: 'center',
   },
   filterButtonActive: { backgroundColor: C.burgundy, borderColor: C.burgundy },
-  filterButtonText: { fontSize: 10, color: C.ink, fontWeight: '600' },
+  filterButtonText: { fontSize: 13, color: C.ink, fontWeight: '600' },
   filterButtonTextActive: { color: C.white },
 
-  sortContainer: { position: 'relative', zIndex: 30 },
   sortButton: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    paddingHorizontal: 10,
+    paddingHorizontal: 14,
     paddingVertical: 9,
     borderRadius: 10,
     borderWidth: 1,
     borderColor: C.border,
     backgroundColor: C.paper,
+    height: 44,
+    justifyContent: 'center',
   },
-  sortButtonText: { fontSize: 10, color: C.ink, fontWeight: '600' },
-  dismissSort: {
-    ...StyleSheet.absoluteFillObject,
-    position: 'absolute',
-    width: 2000,
-    height: 2000,
-    left: -1000,
-    top: -1000,
-    zIndex: 1,
-  },
-  sortMenu: {
-    position: 'absolute',
-    top: 42,
-    right: 0,
-    width: 190,
-    backgroundColor: C.paper,
-    borderWidth: 1,
-    borderColor: C.border,
-    borderRadius: 12,
-    paddingHorizontal: 11,
-    elevation: 10,
-    shadowColor: '#000',
-    shadowOpacity: 0.13,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 5 },
-    zIndex: 50,
-  },
+  sortButtonText: { fontSize: 13, color: C.ink, fontWeight: '600' },
   sortOption: {
-    minHeight: 42,
+    minHeight: 54,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  sortOptionText: { fontSize: 11, color: C.muted },
+  sortOptionText: { fontSize: 15, color: C.muted },
   sortOptionSelected: { color: C.burgundy, fontWeight: '700' },
   sortLabel: {
     flexDirection: 'row',
@@ -1240,8 +1465,8 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 11,
   },
-  sortLabelText: { fontSize: 10, color: C.muted },
-  clearSort: { fontSize: 10, color: C.burgundy, fontWeight: '600' },
+  sortLabelText: { fontSize: 12, color: C.muted },
+  clearSort: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
 
   busList: { gap: 9 },
   busCard: {
@@ -1249,7 +1474,7 @@ const s = StyleSheet.create({
     borderRadius: 13,
     borderWidth: 1,
     borderColor: C.border,
-    padding: 10,
+    padding: 14,
     overflow: 'hidden',
   },
   busTop: {
@@ -1266,20 +1491,20 @@ const s = StyleSheet.create({
     minWidth: 0,
   },
   busIcon: {
-    width: 32,
-    height: 32,
-    borderRadius: 9,
+    width: 40,
+    height: 40,
+    borderRadius: 11,
     backgroundColor: C.burgundyLight,
     alignItems: 'center',
     justifyContent: 'center',
   },
   operatorText: { flex: 1, minWidth: 0 },
-  operatorName: { fontSize: 12, fontWeight: '700', color: C.ink },
-  busType: { fontSize: 9, color: C.muted, marginTop: 3, lineHeight: 13 },
+  operatorName: { fontSize: 14, fontWeight: '700', color: C.ink },
+  busType: { fontSize: 11, color: C.muted, marginTop: 3, lineHeight: 15},
   fareBlock: { alignItems: 'flex-end', minWidth: 85 },
-  fareCaption: { fontSize: 8, color: C.muted },
+  fareCaption: { fontSize: 10, color: C.muted },
   fareValue: {
-    fontSize: 17,
+    fontSize: 19,
     fontWeight: '700',
     color: C.burgundy,
     marginTop: 2,
@@ -1290,20 +1515,20 @@ const s = StyleSheet.create({
     gap: 3,
     marginTop: 3,
   },
-  ratingText: { fontSize: 9, color: C.muted, fontWeight: '600' },
+  ratingText: { fontSize: 11, color: C.muted, fontWeight: '600' },
 
   tags: { flexDirection: 'row', flexWrap: 'wrap', gap: 5, marginTop: 6 },
   typeTag: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 4,
-    paddingHorizontal: 7,
-    paddingVertical: 3,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
     borderRadius: 6,
     backgroundColor: '#F3EFE9',
   },
   typeTagText: {
-    fontSize: 8,
+    fontSize: 10,
     color: C.muted,
     fontWeight: '700',
     letterSpacing: 0.2,
@@ -1325,12 +1550,12 @@ const s = StyleSheet.create({
   timelineStops: { flex: 1, justifyContent: 'space-between', minWidth: 0 },
   timelineStop: { flex: 1, justifyContent: 'center', paddingVertical: 1 },
   timeValue: {
-    fontSize: 14,
+    fontSize: 17,
     fontWeight: '700',
     color: C.ink,
     letterSpacing: -0.3,
   },
-  timeCaption: { fontSize: 9, color: C.muted, marginTop: 2, maxWidth: 115 },
+  timeCaption: { fontSize: 11, color: C.muted, marginTop: 2, maxWidth: 160},
   timelineTrack: {
     width: 18,
     alignItems: 'center',
@@ -1360,9 +1585,9 @@ const s = StyleSheet.create({
     minWidth: 75,
     paddingLeft: 6,
   },
-  durationText: { fontSize: 12, color: C.ink, fontWeight: '700' },
+  durationText: { fontSize: 14, color: C.ink, fontWeight: '700' },
   durationCaption: {
-    fontSize: 8,
+    fontSize: 10,
     color: C.muted,
     marginTop: 4,
     textAlign: 'right',
@@ -1374,7 +1599,7 @@ const s = StyleSheet.create({
     gap: 4,
     marginTop: 3,
   },
-  seatCount: { fontSize: 9, color: C.muted, fontWeight: '500' },
+  seatCount: { fontSize: 11, color: C.muted, fontWeight: '500' },
 
   emptyCard: {
     backgroundColor: C.paper,
@@ -1394,10 +1619,10 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 13,
   },
-  emptyTitle: { fontSize: 15, fontWeight: '700', color: C.ink },
+  emptyTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
   emptySubtitle: {
-    fontSize: 11,
-    lineHeight: 17,
+    fontSize: 13,
+    lineHeight: 19,
     color: C.muted,
     textAlign: 'center',
     marginTop: 7,
@@ -1408,9 +1633,9 @@ const s = StyleSheet.create({
     backgroundColor: C.burgundy,
     borderRadius: 10,
     paddingHorizontal: 17,
-    paddingVertical: 11,
+    paddingVertical: 14,
   },
-  backHomeText: { color: C.white, fontSize: 11, fontWeight: '600' },
+  backHomeText: { color: C.white, fontSize: 13, fontWeight: '600' },
   bottomNote: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1418,7 +1643,7 @@ const s = StyleSheet.create({
     gap: 6,
     marginTop: 18,
   },
-  bottomNoteText: { fontSize: 9, color: C.muted },
+  bottomNoteText: { fontSize: 11, color: C.muted },
 
   // Date calendar
   dateBackdrop: {
@@ -1441,8 +1666,8 @@ const s = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  calendarTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
-  calendarSubtitle: { fontSize: 10, color: C.muted, marginTop: 4 },
+  calendarTitle: { fontSize: 18, fontWeight: '700', color: C.ink },
+  calendarSubtitle: { fontSize: 12, color: C.muted, marginTop: 4 },
   monthNavigation: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1451,27 +1676,27 @@ const s = StyleSheet.create({
     marginBottom: 12,
   },
   monthArrow: {
-    width: 34,
-    height: 34,
+    width: 44,
+    height: 44,
     borderRadius: 10,
     backgroundColor: C.bg,
     alignItems: 'center',
     justifyContent: 'center',
   },
   disabledArrow: { opacity: 0.3 },
-  monthTitle: { fontSize: 13, fontWeight: '700', color: C.burgundy },
+  monthTitle: { fontSize: 15, fontWeight: '700', color: C.burgundy },
   calendarGrid: { flexDirection: 'row', flexWrap: 'wrap' },
   calendarCell: {
     width: '14.2857%',
-    height: 42,
+    height: 46,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  weekdayText: { fontSize: 10, color: C.muted, fontWeight: '700' },
+  weekdayText: { fontSize: 12, color: C.muted, fontWeight: '700' },
   calendarDay: { borderRadius: 12 },
   calendarDaySelected: { backgroundColor: C.burgundy },
   calendarDayDisabled: { opacity: 0.3 },
-  calendarDayText: { fontSize: 12, color: C.ink, fontWeight: '600' },
+  calendarDayText: { fontSize: 14, color: C.ink, fontWeight: '600' },
   calendarDayTextSelected: { color: C.white, fontWeight: '700' },
   calendarDayTextDisabled: { color: '#B8ADA5' },
   selectedDateRow: {
@@ -1483,9 +1708,9 @@ const s = StyleSheet.create({
     padding: 11,
     marginTop: 15,
   },
-  selectedDateText: { fontSize: 11, color: C.burgundy, fontWeight: '600' },
+  selectedDateText: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
   searchDateButton: {
-    height: 46,
+    height: 52,
     borderRadius: 11,
     backgroundColor: C.burgundy,
     flexDirection: 'row',
@@ -1495,7 +1720,7 @@ const s = StyleSheet.create({
     marginTop: 13,
   },
   searchDateButtonDisabled: { opacity: 0.65 },
-  searchDateButtonText: { color: C.white, fontSize: 12, fontWeight: '700' },
+  searchDateButtonText: { color: C.white, fontSize: 14, fontWeight: '700' },
 
   // Filter modal
   modalBackdrop: {
@@ -1535,11 +1760,11 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  sheetTitle: { fontSize: 19, fontWeight: '700', color: C.ink },
-  sheetSubtitle: { fontSize: 10, color: C.muted, marginTop: 3 },
+  sheetTitle: { fontSize: 21, fontWeight: '700', color: C.ink },
+  sheetSubtitle: { fontSize: 12, color: C.muted, marginTop: 3 },
   closeButton: {
-    width: 34,
-    height: 34,
+    width: 44,
+    height: 44,
     borderRadius: 10,
     backgroundColor: C.bg,
     alignItems: 'center',
@@ -1552,39 +1777,36 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  filterSectionTitle: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: C.ink,
-    marginBottom: 11,
-  },
+  filterSectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 11 },
+  filterSectionTitle: { fontSize: 14, fontWeight: '600', color: C.ink },
+  optionHint: { fontSize: 11, color: C.muted, marginTop: 2 },
   filterOptions: {
     flexDirection: 'row',
     flexWrap: 'wrap',
     columnGap: 15,
-    rowGap: 10,
+    rowGap: 2,
   },
   optionRow: {
     flexDirection: 'row',
     alignItems: 'center',
     width: '47%',
-    minHeight: 27,
-    gap: 8,
+    minHeight: 44,
+    gap: 10,
   },
   checkbox: {
-    width: 17,
-    height: 17,
-    borderRadius: 5,
+    width: 22,
+    height: 22,
+    borderRadius: 6,
     borderWidth: 1,
     borderColor: '#CFC3B9',
     alignItems: 'center',
     justifyContent: 'center',
   },
   checkboxSelected: { backgroundColor: C.burgundy, borderColor: C.burgundy },
-  optionText: { flex: 1, fontSize: 10, color: C.ink },
-  unavailableText: { fontSize: 10, color: C.muted, lineHeight: 16 },
+  optionText: { fontSize: 13, color: C.ink },
+  unavailableText: { fontSize: 12, color: C.muted, lineHeight: 16 },
   operatorSearch: {
-    height: 40,
+    height: 46,
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
@@ -1595,7 +1817,7 @@ const s = StyleSheet.create({
     borderRadius: 10,
     marginBottom: 12,
   },
-  operatorSearchInput: { flex: 1, fontSize: 11, color: C.ink, paddingVertical: 0 },
+  operatorSearchInput: { flex: 1, fontSize: 13, color: C.ink, paddingVertical: 0 },
   filterFooter: {
     flexDirection: 'row',
     gap: 10,
@@ -1608,7 +1830,7 @@ const s = StyleSheet.create({
   },
   clearButton: {
     flex: 1,
-    height: 46,
+    height: 52,
     borderRadius: 11,
     borderWidth: 1,
     borderColor: C.border,
@@ -1616,14 +1838,32 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: C.paper,
   },
-  clearButtonText: { fontSize: 12, fontWeight: '600', color: C.burgundy },
+  clearButtonText: { fontSize: 14, fontWeight: '600', color: C.burgundy },
   applyButton: {
     flex: 1.5,
-    height: 46,
+    height: 52,
     borderRadius: 11,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: C.burgundy,
   },
-  applyButtonText: { fontSize: 12, fontWeight: '700', color: C.white },
+  applyButtonText: { fontSize: 14, fontWeight: '700', color: C.white },
+  loaderScreen: { flex: 1, backgroundColor: '#F8F4ED', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 25 },
+  loaderTitle: { color: '#382B28', fontSize: 20, fontWeight: '600', letterSpacing: -0.3, textAlign: 'center' },
+  loaderSubtitle: { color: '#887A73', fontSize: 13, fontWeight: '500', marginTop: 8, textAlign: 'center' },
+  loaderTrack: { width: 190, height: 3, borderRadius: 9, overflow: 'hidden', backgroundColor: '#E9DDD7', marginTop: 22 },
+  loaderFill: { width: '34%', height: '100%', borderRadius: 9, backgroundColor: '#783D4A' },
+  controlsDivider: { width: 1, height: 24, backgroundColor: C.border, marginHorizontal: 2 },
+  listSeparator: { height: 10 },
+  sortBackdrop: { flex: 1, backgroundColor: 'rgba(35, 27, 25, 0.42)', justifyContent: 'flex-end' },
+  sortSheet: {
+    backgroundColor: C.paper,
+    borderTopLeftRadius: 23,
+    borderTopRightRadius: 23,
+    paddingHorizontal: 20,
+    paddingTop: 9,
+    paddingBottom: 26,
+  },
+  sortSheetWide: { width: 420, alignSelf: 'center', borderRadius: 22, marginBottom: 20 },
+  sortSheetTitle: { fontSize: 19, fontWeight: '700', color: C.ink, marginBottom: 6 },
 });

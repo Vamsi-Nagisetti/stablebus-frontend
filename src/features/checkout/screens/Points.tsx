@@ -1,9 +1,10 @@
-import React, { useMemo, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import {
-  Alert,
+  Animated,
+  FlatList,
+  Modal,
   Pressable,
-  SafeAreaView,
-  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -11,10 +12,11 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-type Point = {
-  [key: string]: any;
-};
+type Point = { [key: string]: any };
+type Kind = 'boarding' | 'dropping';
+type IconName = keyof typeof Ionicons.glyphMap;
 
 const C = {
   bg: '#F8F4ED',
@@ -25,754 +27,768 @@ const C = {
   burgundy: '#783D4A',
   burgundyLight: '#F4EAEB',
   white: '#FFFFFF',
-  green: '#47765B',
+  // calm, warm tint for pickup notes (visible, never alarming)
+  noteBg: '#FAF4E8',
+  noteBorder: '#EFE3C8',
+  noteInk: '#6F5B38',
+  noteIcon: '#A88445',
 };
 
-function pointId(point: Point, type: 'boarding' | 'dropping'): string {
-  const prefix = type === 'boarding' ? 'boarding' : 'dropping';
+/* =====================================================
+   Helpers: reading provider data
+===================================================== */
 
-  const value =
-    point?.[`${prefix}_Id`] ??
-    point?.[`${prefix}_ID`] ??
-    point?.[`${prefix}Id`] ??
-    point?.point_Id ??
-    point?.point_ID ??
-    point?.pointId ??
-    point?.id;
+function parseJson(value: unknown): any {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
 
+function asArray(value: unknown): Point[] {
+  const parsed = parseJson(value);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function str(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? (value[0] || '') : (value || '');
+}
+
+function firstValue(obj: any, keys: string[]) {
+  for (const key of keys) {
+    const value = obj?.[key];
+    if (value !== undefined && value !== null && value !== '') return value;
+  }
+  return undefined;
+}
+
+function pointId(point: Point, kind: Kind): string {
+  const p = kind;
+  const value = firstValue(point, [
+    `${p}_Id`, `${p}_ID`, `${p}Id`, `${p}_Point_Id`, `${p}_Point_ID`,
+    `${p}_Point_Key`, `${p}PointKey`, `${p}PointId`,
+    'point_Id', 'point_ID', 'pointId', 'id',
+  ]);
   return value == null ? '' : String(value);
 }
 
-function pointName(point: Point, type: 'boarding' | 'dropping'): string {
-  const prefix = type === 'boarding' ? 'boarding' : 'dropping';
-
-  return String(
-    point?.[`${prefix}_Name`] ??
-    point?.[`${prefix}Name`] ??
-    point?.point_Name ??
-    point?.pointName ??
-    point?.name ??
-    point?.[`${prefix}_Address`] ??
-    'Location'
+function rawName(point: Point, kind: Kind): string {
+  return stripPhones(
+    String(
+      firstValue(point, [
+        `${kind}_Name`, `${kind}Name`, 'point_Name', 'pointName', 'name', `${kind}_Address`,
+      ]) ?? 'Location'
+    )
   );
 }
 
-function cleanPointText(value: any): string {
-  if (!value) return '';
+// Things we treat as a "heads-up" note rather than part of the address.
+const NOTE_RE =
+  /\bvan\b|shuttle|feeder|metro|might require|may require|pick[\s-]?up (?:by|from|at|in|via|required)|transfer|\bcab\b/i;
 
-  const parts = String(value)
+function isNoise(part: string): boolean {
+  return (
+    /^\d{1,2}:\d{2}(\s*(AM|PM))?$/i.test(part) ||
+    /^\d+$/.test(part) ||
+    /^N\/?A$/i.test(part) ||
+    /^(true|false|yes|no|null|undefined)$/i.test(part)
+  );
+}
+
+/**
+ * Operators send their contact number themselves after booking, so phone numbers are never shown.
+ * Removes "Ph: 98450 12345", "+91-9071997773", "080 2234 5678" and the dangling "-" they leave.
+ */
+const PHONE_LABEL_RE = /\b(?:ph(?:one)?|mob(?:ile)?|contact|tel|call|cell|whatsapp)\.?\s*(?:no\.?|number|nos\.?)?\s*[:\-]?\s*/gi;
+const PHONE_RE = /(?:\+?\d{1,3}[\s-]*)?(?:\d[\s-]?){8,11}\d/g;
+
+function stripPhones(text: string): string {
+  return text
+    .replace(new RegExp(`(?:${PHONE_LABEL_RE.source})(?:${PHONE_RE.source})(?:\\s*[,/&]\\s*(?:${PHONE_RE.source}))*`, 'gi'), '')
+    .replace(PHONE_RE, '')
+    .replace(/\(\s*\)/g, '')
+    .replace(/\s*[-,:;/&]+\s*$/g, '')
+    .replace(/^\s*[-,:;/&]+\s*/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function segments(value: any): string[] {
+  if (value === undefined || value === null || typeof value === 'object') return [];
+  return String(value)
     .split('^')
-    .map(part => part.trim())
-    .filter(Boolean);
+    .map(part => stripPhones(part.trim()))
+    .filter(part => part && !isNoise(part));
+}
 
-  const cleaned: string[] = [];
+function dedupe(list: string[]): string[] {
+  const seen = new Set<string>();
+  return list.filter(item => {
+    const k = item.toLowerCase();
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
 
-  for (const part of parts) {
-    if (/^\d{1,2}:\d{2}(\s*(AM|PM))?$/i.test(part)) continue;
-    if (/^\d+$/.test(part)) continue;
+function humanize(key: string): string {
+  const words = key
+    .replace(/^(is|has)_?/i, '')
+    .replace(/[_-]+/g, ' ')
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .trim()
+    .toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
+}
 
-    if (!cleaned.some(item => item.toLowerCase() === part.toLowerCase())) {
-      cleaned.push(part);
+const FLAG_KEY_RE = /van|metro|pick[\s_-]?up|shuttle|feeder|note|remark|instruction/i;
+const SKIP_KEY_RE = /name|time|(^|_)id$|key|lat|lon|phone|mobile|contact/i;
+
+/** Display name without a "(Van pickup)" style suffix. */
+function pointName(point: Point, kind: Kind): string {
+  let name = rawName(point, kind);
+  name = name.replace(/\(([^)]*)\)/g, (whole, inner) => (NOTE_RE.test(inner) ? '' : whole));
+  name = segments(name)[0] || name.trim();
+  return name.replace(/\s{2,}/g, ' ').trim() || 'Location';
+}
+
+/** Notes such as "Might require van pickup" or "Metro pickup", gathered from any field. */
+function pointNotes(point: Point, kind: Kind): { text: string; icon: IconName }[] {
+  const found: string[] = [];
+
+  // Parenthetical in the name, e.g. "Kukatpally (Van pickup)"
+  for (const m of rawName(point, kind).matchAll(/\(([^)]*)\)/g)) {
+    if (NOTE_RE.test(m[1])) found.push(m[1].trim());
+  }
+
+  for (const key of Object.keys(point)) {
+    const value = point[key];
+    if (SKIP_KEY_RE.test(key) && !FLAG_KEY_RE.test(key)) continue;
+
+    // Flag fields: is_Van_Pickup: true
+    if (FLAG_KEY_RE.test(key) && (value === true || /^(true|y|yes|1)$/i.test(String(value)))) {
+      const label = humanize(key);
+      if (label && !/^(note|remark|instruction)s?$/i.test(label)) found.push(label);
+      continue;
+    }
+
+    for (const part of segments(value)) {
+      if (NOTE_RE.test(part) || (FLAG_KEY_RE.test(key) && part.length > 2)) found.push(part);
     }
   }
 
-  return cleaned.join(' · ');
+  return dedupe(found)
+    .slice(0, 3)
+    .map(text => ({
+      text,
+      icon: /metro/i.test(text)
+        ? 'train-outline'
+        : /van|shuttle|feeder|cab|transfer/i.test(text)
+          ? 'car-outline'
+          : 'information-circle-outline',
+    }));
 }
 
-function pointAddress(point: Point, type: 'boarding' | 'dropping'): string {
-  const prefix = type === 'boarding' ? 'boarding' : 'dropping';
-
-  const address = cleanPointText(point?.[`${prefix}_Address`]);
-  const landmark = cleanPointText(point?.[`${prefix}_Landmark`]);
-
-  const name = cleanPointText(
-    point?.[`${prefix}_Name`] ??
-    point?.[`${prefix}Name`] ??
-    point?.point_Name ??
-    point?.pointName ??
-    point?.name
-  );
-
-  const parts = [address, landmark]
-    .filter(Boolean)
-    .filter(value => !/^N\/?A$/i.test(value.trim()))
-    .filter((value, index, array) =>
-      array.findIndex(item => item.toLowerCase() === value.toLowerCase()) === index
-    )
-    .filter(value => value.toLowerCase() !== name.toLowerCase());
-
+function pointAddress(point: Point, kind: Kind): string {
+  const name = pointName(point, kind).toLowerCase();
+  const parts = dedupe(
+    [point?.[`${kind}_Address`], point?.[`${kind}_Landmark`]]
+      .flatMap(segments)
+      .filter(part => !NOTE_RE.test(part))
+  ).filter(part => part.toLowerCase() !== name);
   return parts.join(' · ');
 }
 
-function pointTime(point: Point, type: 'boarding' | 'dropping'): string {
-  const prefix = type === 'boarding' ? 'boarding' : 'dropping';
-  const value = point?.[`${prefix}_Time`] ?? point?.time;
-
+function pointTime(point: Point, kind: Kind): string {
+  const value = point?.[`${kind}_Time`] ?? point?.time;
   if (!value) return '';
-
   const raw = String(value).trim();
-
   if (/am|pm/i.test(raw)) return raw.toUpperCase();
-
   const match = raw.match(/^(\d{1,2}):(\d{2})/);
-
   if (match) {
     const hours = Number(match[1]);
-    const suffix = hours >= 12 ? 'PM' : 'AM';
-    const displayHours = hours % 12 || 12;
-
-    return `${String(displayHours).padStart(2, '0')}:${match[2]} ${suffix}`;
+    return `${String(hours % 12 || 12).padStart(2, '0')}:${match[2]} ${hours >= 12 ? 'PM' : 'AM'}`;
   }
-
   return raw;
 }
 
-function PointOption({
-  point,
-  type,
+function formatDate(value: string): string {
+  if (!value) return '';
+  const date = value.includes('/')
+    ? (() => {
+        const [m, d, y] = value.split('/');
+        return new Date(Number(y), Number(m) - 1, Number(d));
+      })()
+    : new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+/* =====================================================
+   Data prepared once per list
+===================================================== */
+
+type Item = {
+  id: string;
+  point: Point;
+  name: string;
+  address: string;
+  time: string;
+  notes: { text: string; icon: IconName }[];
+};
+
+function buildItems(points: Point[], kind: Kind): Item[] {
+  return points.map((point, index) => ({
+    id: pointId(point, kind) || `${kind}-${index}`,
+    point,
+    name: pointName(point, kind),
+    address: pointAddress(point, kind),
+    time: pointTime(point, kind),
+    notes: pointNotes(point, kind),
+  }));
+}
+
+/* =====================================================
+   Point card
+===================================================== */
+
+const PointOption = memo(function PointOption({
+  item,
   selected,
   onPress,
 }: {
-  point: Point;
-  type: 'boarding' | 'dropping';
+  item: Item;
   selected: boolean;
-  onPress: () => void;
+  onPress: (id: string) => void;
 }) {
-  const name = pointName(point, type);
-  const address = pointAddress(point, type);
-  const time = pointTime(point, type);
-
   return (
     <Pressable
-      onPress={onPress}
-      style={[
-        styles.pointCard,
-        selected && styles.pointCardSelected,
-      ]}
+      onPress={() => onPress(item.id)}
+      accessibilityRole="radio"
+      accessibilityState={{ selected }}
+      style={[styles.pointCard, selected && styles.pointCardSelected]}
     >
-      <View style={styles.radioColumn}>
+      <View style={styles.pointRow}>
         <View style={[styles.radio, selected && styles.radioSelected]}>
           {selected && <View style={styles.radioInner} />}
         </View>
+
+        <View style={styles.pointDetails}>
+          <Text style={styles.pointName}>{item.name}</Text>
+          {!!item.address && <Text style={styles.pointAddress}>{item.address}</Text>}
+        </View>
+
+        {!!item.time && <Text style={styles.pointTime}>{item.time}</Text>}
       </View>
 
-      <View style={styles.pointDetails}>
-        <Text style={styles.pointName}>{name}</Text>
-
-        {!!address && (
-          <Text style={styles.pointAddress}>{address}</Text>
-        )}
-
-        {!!time && (
-          <View style={styles.timeRow}>
-            <Ionicons name="time-outline" size={14} color={C.burgundy} />
-            <Text style={styles.pointTime}>{time}</Text>
-          </View>
-        )}
-      </View>
-
-      {selected && (
-        <Ionicons name="checkmark-circle" size={21} color={C.burgundy} />
+      {item.notes.length > 0 && (
+        <View style={styles.notes}>
+          {item.notes.map(note => (
+            <View key={note.text} style={styles.note}>
+              <Ionicons name={note.icon} size={15} color={C.noteIcon} />
+              <Text style={styles.noteText}>{note.text}</Text>
+            </View>
+          ))}
+        </View>
       )}
     </Pressable>
   );
+});
+
+/** Calm full-screen loader: a title, one line of context and a thin progress bar. */
+function BarLoader({ visible, title, subtitle }: { visible: boolean; title: string; subtitle?: string }) {
+  const progress = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    if (!visible) return;
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(progress, { toValue: 1, duration: 1600, useNativeDriver: true }),
+        Animated.timing(progress, { toValue: 0, duration: 1600, useNativeDriver: true }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [visible, progress]);
+
+  return (
+    <Modal visible={visible} animationType="fade" presentationStyle="fullScreen" statusBarTranslucent onRequestClose={() => {}}>
+      <View style={styles.loaderScreen}>
+        <Text style={styles.loaderTitle}>{title}</Text>
+        {!!subtitle && <Text style={styles.loaderSubtitle} numberOfLines={2}>{subtitle}</Text>}
+        <View style={styles.loaderTrack}>
+          <Animated.View
+            style={[
+              styles.loaderFill,
+              { transform: [{ translateX: progress.interpolate({ inputRange: [0, 1], outputRange: [-95, 95] }) }] },
+            ]}
+          />
+        </View>
+      </View>
+    </Modal>
+  );
 }
 
-export default function Points({ navigation, route }: any) {
+/* =====================================================
+   Screen
+===================================================== */
+
+export default function Points() {
+  const router = useRouter();
+  const routeParams = useLocalSearchParams();
   const { width } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
   const isWide = width >= 640;
 
-  const params = route?.params || {};
+  // Calm, non-blocking message (replaces Alert boxes).
+  const [toast, setToast] = useState<string | null>(null);
+  const toastAnim = useRef(new Animated.Value(0)).current;
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback(
+    (message: string) => {
+      setToast(message);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      Animated.timing(toastAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+      toastTimer.current = setTimeout(() => {
+        Animated.timing(toastAnim, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => setToast(null));
+      }, 3200);
+    },
+    [toastAnim]
+  );
+  useEffect(
+    () => () => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    },
+    []
+  );
+  const listRef = useRef<FlatList<Item>>(null);
 
-  const boardingPoints: Point[] = useMemo(
-    () => Array.isArray(params.boardingDetails) ? params.boardingDetails : [],
-    [params.boardingDetails]
+  // Parse route JSON once.
+  const bus = useMemo(() => parseJson(routeParams.bus) || {}, [routeParams.bus]);
+  const boardingItems = useMemo(
+    () => buildItems(asArray(routeParams.boardingDetails), 'boarding'),
+    [routeParams.boardingDetails]
+  );
+  const droppingItems = useMemo(
+    () => buildItems(asArray(routeParams.droppingDetails), 'dropping'),
+    [routeParams.droppingDetails]
   );
 
-  const droppingPoints: Point[] = useMemo(
-    () => Array.isArray(params.droppingDetails) ? params.droppingDetails : [],
-    [params.droppingDetails]
+  const initialId = (raw: unknown, kind: Kind, items: Item[]): string => {
+    const preset = parseJson(raw);
+    if (preset && typeof preset === 'object') {
+      const id = pointId(preset, kind);
+      if (id && items.some(i => i.id === id)) return id;
+    }
+    return items.length === 1 ? items[0].id : '';
+  };
+
+  const [boardingId, setBoardingId] = useState(() =>
+    initialId(routeParams.selectedBoardingPoint || routeParams.defaultBoarding, 'boarding', boardingItems)
+  );
+  const [droppingId, setDroppingId] = useState(() =>
+    initialId(routeParams.selectedDroppingPoint || routeParams.defaultDropping, 'dropping', droppingItems)
+  );
+  const [tab, setTab] = useState<Kind>('boarding');
+
+  const [continuing, setContinuing] = useState(false);
+  const continuingRef = useRef(false);
+  const fallbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (__DEV__) {
+      // Handy when tuning which fields hold pickup notes.
+      console.log('[Points] sample boarding point:', boardingItems[0]?.point);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const boarding = useMemo(() => boardingItems.find(i => i.id === boardingId) || null, [boardingItems, boardingId]);
+  const dropping = useMemo(() => droppingItems.find(i => i.id === droppingId) || null, [droppingItems, droppingId]);
+
+  const items = tab === 'boarding' ? boardingItems : droppingItems;
+  const selectedId = tab === 'boarding' ? boardingId : droppingId;
+
+  const choose = useCallback(
+    (id: string) => (tab === 'boarding' ? setBoardingId(id) : setDroppingId(id)),
+    [tab]
   );
 
-  const [boarding, setBoarding] = useState<Point | null>(
-    params.selectedBoardingPoint ||
-      params.defaultBoarding ||
-      (boardingPoints.length === 1 ? boardingPoints[0] : null)
+  const renderItem = useCallback(
+    ({ item }: { item: Item }) => (
+      <PointOption item={item} selected={item.id === selectedId} onPress={choose} />
+    ),
+    [selectedId, choose]
   );
+  const keyExtractor = useCallback((item: Item) => item.id, []);
 
-  const [dropping, setDropping] = useState<Point | null>(
-    params.selectedDroppingPoint ||
-      params.defaultDropping ||
-      (droppingPoints.length === 1 ? droppingPoints[0] : null)
-  );
+  const seatCount = useMemo(() => {
+    const seats = parseJson(routeParams.selectedSeats);
+    return Array.isArray(seats) ? seats.length : 0;
+  }, [routeParams.selectedSeats]);
 
-  const [pointStep, setPointStep] = useState<'boarding' | 'dropping'>('boarding');
+  const from = str(routeParams.from) || 'Departure';
+  const to = str(routeParams.to) || 'Destination';
+  const busName = bus.operator_Name || bus.travel_Name || '';
+  const subtitle = [`${from} → ${to}`, formatDate(str(routeParams.date)), busName]
+    .filter(Boolean)
+    .join(' · ');
 
-  const bus = params.bus || {};
-  const busName = bus.operator_Name || bus.travel_Name || 'Selected bus';
-
-  const selectedBoardingId = boarding
-    ? pointId(boarding, 'boarding')
-    : '';
-
-  const selectedDroppingId = dropping
-    ? pointId(dropping, 'dropping')
-    : '';
+  const canContinue = tab === 'boarding' ? !!boarding : !!dropping;
+  // Exactly what the seat screen showed: the sum of each seat's basic fare (no service tax / GST).
+  // Calculated here from the selected seats, so it never depends on the taxed `totalFare` param.
+  // The payable total including taxes belongs to the final checkout.
+  const seatFare = useMemo(() => {
+    const seats = parseJson(routeParams.selectedSeats);
+    if (Array.isArray(seats)) {
+      return seats.reduce((sum: number, seat: any) => sum + (Number(seat?.fareMaster?.basic_Amount) || 0), 0);
+    }
+    return Number(str(routeParams.baseFare) || 0);
+  }, [routeParams.selectedSeats, routeParams.baseFare]);
 
   function handleContinue() {
-    if (pointStep === 'boarding') {
+    if (continuingRef.current) return;
+
+    if (tab === 'boarding') {
       if (!boarding) {
-        Alert.alert(
-          'Select boarding point',
-          'Please choose where you want to board the bus.'
-        );
+        showToast('Choose a boarding point to continue.');
         return;
       }
-
-      setPointStep('dropping');
+      setTab('dropping');
+      listRef.current?.scrollToOffset({ offset: 0, animated: false });
       return;
     }
 
     if (!dropping) {
-      Alert.alert(
-        'Select dropping point',
-        'Please choose where you want to get off the bus.'
-      );
+      showToast('Choose a dropping point to continue.');
       return;
     }
 
-    navigation.navigate('passengers', {
-      ...params,
-      selectedBoardingPoint: boarding,
-      selectedDroppingPoint: dropping,
-      defaultBoarding: boarding,
-      defaultDropping: dropping,
-      boardingId: selectedBoardingId,
-      droppingId: selectedDroppingId,
-    });
+    continuingRef.current = true;
+    setContinuing(true);
+
+    // Forward everything we received (expo-router params are strings), plus the choices.
+    const forward: Record<string, string> = {};
+    for (const [key, value] of Object.entries(routeParams)) {
+      forward[key] = Array.isArray(value) ? (value[0] ?? '') : String(value ?? '');
+    }
+    const boardingJson = JSON.stringify(boarding!.point);
+    const droppingJson = JSON.stringify(dropping.point);
+
+    setTimeout(() => {
+      router.push({
+        pathname: '/passengers',
+        params: {
+          ...forward,
+          selectedBoardingPoint: boardingJson,
+          selectedDroppingPoint: droppingJson,
+          defaultBoarding: boardingJson,
+          defaultDropping: droppingJson,
+          boardingId: pointId(boarding!.point, 'boarding'),
+          droppingId: pointId(dropping.point, 'dropping'),
+        },
+      });
+      fallbackTimer.current = setTimeout(() => {
+        continuingRef.current = false;
+        setContinuing(false);
+      }, 30000);
+    }, 80);
   }
 
+  // Hide the loader once this screen has been left; reset when we come back.
+  useFocusEffect(
+    useCallback(() => {
+      if (fallbackTimer.current) clearTimeout(fallbackTimer.current);
+      continuingRef.current = false;
+      setContinuing(false);
+      return () => {
+        if (continuingRef.current) setTimeout(() => setContinuing(false), 600);
+      };
+    }, [])
+  );
+
+  const goBack = () => {
+    if (tab === 'dropping') {
+      setTab('boarding');
+      listRef.current?.scrollToOffset({ offset: 0, animated: false });
+    } else {
+      router.back();
+    }
+  };
+
+  const header = (
+    <View>
+      <View style={styles.tabs}>
+        {(['boarding', 'dropping'] as Kind[]).map(kind => {
+          const active = tab === kind;
+          const chosen = kind === 'boarding' ? boarding : dropping;
+          return (
+            <Pressable
+              key={kind}
+              onPress={() => {
+                setTab(kind);
+                listRef.current?.scrollToOffset({ offset: 0, animated: false });
+              }}
+              style={[styles.tab, active && styles.tabActive]}
+            >
+              <Text style={styles.tabLabel}>{kind === 'boarding' ? 'Boarding' : 'Dropping'}</Text>
+              <Text style={styles.tabValue} numberOfLines={1}>
+                {chosen ? chosen.name : 'Select point'}
+              </Text>
+              {!!chosen?.time && <Text style={styles.tabTime}>{chosen.time}</Text>}
+            </Pressable>
+          );
+        })}
+      </View>
+
+      <View style={styles.listHeading}>
+        <Text style={styles.listTitle}>
+          {tab === 'boarding' ? 'Where will you board?' : 'Where will you get off?'}
+        </Text>
+        <Text style={styles.listCount}>{items.length} points</Text>
+      </View>
+    </View>
+  );
+
   return (
-    <SafeAreaView style={styles.root}>
+    <View style={styles.root}>
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
-      <View style={[styles.header, isWide && styles.wide]}>
-        <Pressable
-          onPress={() => {
-            if (pointStep === 'dropping') {
-              setPointStep('boarding');
-            } else {
-              navigation.goBack();
-            }
-          }}
-          style={styles.backButton}
-        >
+      <View style={[styles.header, isWide && styles.wide, { paddingTop: 10 + insets.top }]}>
+        <Pressable onPress={goBack} style={styles.backButton}>
           <Ionicons name="arrow-back" size={21} color={C.ink} />
         </Pressable>
-
         <View style={styles.headerText}>
-          <Text style={styles.headerTitle}>Journey points</Text>
-          <Text style={styles.headerSubtitle}>
-            {pointStep === 'boarding'
-              ? 'Choose your boarding location'
-              : 'Choose your dropping location'}
-          </Text>
-        </View>
-
-        <View style={styles.stepBadge}>
-          <Text style={styles.stepText}>2 of 4</Text>
+          <Text style={styles.headerTitle}>Boarding & dropping</Text>
+          <Text style={styles.headerSubtitle} numberOfLines={1}>{subtitle}</Text>
         </View>
       </View>
 
-      <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={[
-          styles.content,
-          isWide && styles.wide,
-        ]}
+      <FlatList
+        ref={listRef}
+        data={items}
+        extraData={selectedId}
+        keyExtractor={keyExtractor}
+        renderItem={renderItem}
+        ListHeaderComponent={header}
+        ListEmptyComponent={
+          <Text style={styles.emptyText}>
+            No {tab} points are available for this bus.
+          </Text>
+        }
+        ItemSeparatorComponent={Separator}
+        initialNumToRender={10}
+        windowSize={7}
         showsVerticalScrollIndicator={false}
-      >
-        <View style={styles.routeCard}>
-          <View style={styles.routeIcon}>
-            <Ionicons name="bus-outline" size={22} color={C.burgundy} />
-          </View>
+        contentContainerStyle={[styles.content, isWide && styles.wide]}
+      />
 
-          <View style={styles.routeText}>
-            <Text style={styles.routeTitle} numberOfLines={1}>
-              {params.from || 'Departure'} → {params.to || 'Destination'}
-            </Text>
-            <Text style={styles.routeSubtitle}>
-              {params.date || 'Selected journey'} · {busName}
-            </Text>
-          </View>
-        </View>
-
-        <View style={styles.progressRow}>
-          <View style={styles.progressDone}>
-            <Ionicons name="checkmark" size={13} color={C.white} />
-          </View>
-
-          <View style={styles.progressLine} />
-
-          <View style={pointStep === 'boarding' ? styles.progressActive : styles.progressDone}>
-            {pointStep === 'boarding' ? (
-              <Text style={styles.progressActiveText}>2</Text>
-            ) : (
-              <Ionicons name="checkmark" size={13} color={C.white} />
-            )}
-          </View>
-
-          <View style={pointStep === 'dropping' ? styles.progressLine : styles.progressLineInactive} />
-
-          <View style={pointStep === 'dropping' ? styles.progressActive : styles.progressPending}>
-            <Text style={pointStep === 'dropping' ? styles.progressActiveText : styles.progressPendingText}>
-              3
-            </Text>
-          </View>
-
-          <View style={styles.progressLineInactive} />
-
-          <View style={styles.progressPending}>
-            <Text style={styles.progressPendingText}>4</Text>
-          </View>
-        </View>
-
-        {pointStep === 'boarding' && (
-          <View style={styles.section}>
-            <View style={styles.sectionHeading}>
-              <View style={styles.sectionIcon}>
-                <Ionicons name="location-outline" size={19} color={C.burgundy} />
-              </View>
-
-              <View style={{ flex: 1 }}>
-                <Text style={styles.sectionTitle}>Boarding point</Text>
-                <Text style={styles.sectionSubtitle}>
-                  Where would you like to board?
-                </Text>
-              </View>
-
-              <Text style={styles.count}>
-                {boardingPoints.length} points
-              </Text>
-            </View>
-
-            {boardingPoints.length === 0 ? (
-              <Text style={styles.emptyText}>
-                No boarding points are available for this bus.
-              </Text>
-            ) : (
-              boardingPoints.map((point, index) => {
-                const id = pointId(point, 'boarding');
-                const selected =
-                  !!boarding &&
-                  (selectedBoardingId
-                    ? selectedBoardingId === id
-                    : boarding === point);
-
-                return (
-                  <PointOption
-                    key={id || `boarding-${index}`}
-                    point={point}
-                    type="boarding"
-                    selected={selected}
-                    onPress={() => setBoarding(point)}
-                  />
-                );
-              })
-            )}
-          </View>
-        )}
-
-        {pointStep === 'dropping' && (
-          <View style={styles.section}>
-            <View style={styles.sectionHeading}>
-              <View style={styles.sectionIcon}>
-                <Ionicons name="flag-outline" size={19} color={C.burgundy} />
-              </View>
-
-              <View style={{ flex: 1 }}>
-                <Text style={styles.sectionTitle}>Dropping point</Text>
-                <Text style={styles.sectionSubtitle}>
-                  Where would you like to get off?
-                </Text>
-              </View>
-
-              <Text style={styles.count}>
-                {droppingPoints.length} points
-              </Text>
-            </View>
-
-            {droppingPoints.length === 0 ? (
-              <Text style={styles.emptyText}>
-                No dropping points are available for this bus.
-              </Text>
-            ) : (
-              droppingPoints.map((point, index) => {
-                const id = pointId(point, 'dropping');
-                const selected =
-                  !!dropping &&
-                  (selectedDroppingId
-                    ? selectedDroppingId === id
-                    : dropping === point);
-
-                return (
-                  <PointOption
-                    key={id || `dropping-${index}`}
-                    point={point}
-                    type="dropping"
-                    selected={selected}
-                    onPress={() => setDropping(point)}
-                  />
-                );
-              })
-            )}
-          </View>
-        )}
-
-        <View style={styles.infoCard}>
-          <Ionicons
-            name="information-circle-outline"
-            size={18}
-            color={C.burgundy}
-          />
-          <Text style={styles.infoText}>
-            {pointStep === 'boarding'
-              ? 'Choose your boarding location to continue to the drop point.'
-              : 'Please verify your dropping location before continuing.'}
-          </Text>
-        </View>
-      </ScrollView>
-
-      <View style={styles.bottomBar}>
+      <View style={[styles.bottomBar, isWide && styles.wide, { paddingBottom: 12 + insets.bottom }]}>
         <View style={styles.fareInfo}>
-          <Text style={styles.fareLabel}>Total seat fare</Text>
-          <Text style={styles.fareValue}>
-            ₹{Number(params.totalFare || 0).toLocaleString('en-IN')}
+          <Text style={styles.fareLabel}>
+            Seat fare{seatCount > 0 ? ` · ${seatCount} seat${seatCount > 1 ? 's' : ''}` : ''}
           </Text>
+          <Text style={styles.fareValue}>₹{seatFare.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</Text>
         </View>
 
         <Pressable
           onPress={handleContinue}
-          disabled={pointStep === 'boarding' ? !boarding : !dropping}
-          style={[
-            styles.continueButton,
-            ((pointStep === 'boarding' && !boarding) ||
-              (pointStep === 'dropping' && !dropping)) &&
-              styles.continueDisabled,
-          ]}
+          style={[styles.continueButton, !canContinue && styles.continueDisabled]}
         >
-          <Text style={styles.continueText}>
-            {pointStep === 'boarding' ? 'Continue to dropping' : 'Continue'}
-          </Text>
+          <Text style={styles.continueText}>{tab === 'boarding' ? 'Next' : 'Continue'}</Text>
           <Ionicons name="arrow-forward" size={18} color={C.white} />
         </Pressable>
       </View>
-    </SafeAreaView>
+
+      <BarLoader
+        visible={continuing}
+        title="Preparing passenger details"
+        subtitle={dropping ? `${boarding?.name ?? ''} → ${dropping.name}` : ''}
+      />
+
+      {!!toast && (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.toastWrap,
+            {
+              top: insets.top + 10,
+              opacity: toastAnim,
+              transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-12, 0] }) }],
+            },
+          ]}
+        >
+          <View style={styles.toast}>
+            <View style={styles.toastIcon}>
+              <Ionicons name="information" size={14} color={C.white} />
+            </View>
+            <Text style={styles.toastText}>{toast}</Text>
+          </View>
+        </Animated.View>
+      )}
+    </View>
   );
 }
 
+function Separator() {
+  return <View style={styles.separator} />;
+}
+
+/* =====================================================
+   Styles
+===================================================== */
+
 const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: C.bg,
-  },
+  root: { flex: 1, backgroundColor: C.bg },
+  wide: { width: '100%', maxWidth: 760, alignSelf: 'center' },
+
   header: {
-    minHeight: 76,
-    paddingHorizontal: 18,
-    paddingVertical: 12,
+    minHeight: 68,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     flexDirection: 'row',
     alignItems: 'center',
     borderBottomWidth: 1,
     borderBottomColor: C.border,
-  },
-  wide: {
-    width: '100%',
-    maxWidth: 760,
-    alignSelf: 'center',
+    backgroundColor: C.paper,
   },
   backButton: {
-    width: 42,
-    height: 42,
+    width: 44,
+    height: 44,
+    borderRadius: 13,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerText: { flex: 1, marginLeft: 12 },
+  headerTitle: { color: C.ink, fontSize: 17, fontWeight: '600' },
+  headerSubtitle: { color: C.muted, fontSize: 13, marginTop: 3 },
+
+  content: { padding: 14, paddingBottom: 24 },
+
+  tabs: { flexDirection: 'row', gap: 10, marginBottom: 20 },
+  tab: {
+    flex: 1,
+    minWidth: 0,
+    padding: 12,
     borderRadius: 14,
-    backgroundColor: C.paper,
     borderWidth: 1,
     borderColor: C.border,
-    alignItems: 'center',
-    justifyContent: 'center',
+    backgroundColor: 'transparent',
   },
-  headerText: {
-    flex: 1,
-    marginLeft: 13,
-  },
-  headerTitle: {
-    color: C.ink,
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  headerSubtitle: {
-    color: C.muted,
-    fontSize: 12,
-    marginTop: 3,
-  },
-  stepBadge: {
-    paddingHorizontal: 11,
-    paddingVertical: 7,
-    borderRadius: 20,
-    backgroundColor: C.burgundyLight,
-  },
-  stepText: {
-    color: C.burgundy,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  scroll: {
-    flex: 1,
-  },
-  content: {
-    padding: 16,
-    paddingBottom: 28,
-  },
-  routeCard: {
+  tabActive: { backgroundColor: C.paper, borderColor: C.burgundy },
+  tabLabel: { color: C.muted, fontSize: 12 },
+  tabValue: { color: C.ink, fontSize: 14, fontWeight: '600', marginTop: 4 },
+  tabTime: { color: C.muted, fontSize: 12, marginTop: 3 },
+
+  listHeading: {
     flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: C.paper,
-    borderRadius: 17,
-    borderWidth: 1,
-    borderColor: C.border,
-    padding: 15,
-    marginBottom: 20,
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+    paddingHorizontal: 2,
   },
-  routeIcon: {
-    width: 43,
-    height: 43,
-    borderRadius: 13,
-    backgroundColor: C.burgundyLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  routeText: {
-    flex: 1,
-    marginLeft: 12,
-  },
-  routeTitle: {
-    color: C.ink,
-    fontSize: 15,
-    fontWeight: '700',
-  },
-  routeSubtitle: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 4,
-  },
-  progressRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 22,
-    paddingHorizontal: 25,
-  },
-  progressDone: {
-    width: 25,
-    height: 25,
-    borderRadius: 13,
-    backgroundColor: C.green,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  progressActive: {
-    width: 27,
-    height: 27,
-    borderRadius: 14,
-    backgroundColor: C.burgundy,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  progressActiveText: {
-    color: C.white,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  progressPending: {
-    width: 25,
-    height: 25,
-    borderRadius: 13,
-    backgroundColor: '#E9E3DC',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  progressPendingText: {
-    color: C.muted,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  progressLine: {
-    width: 35,
-    height: 2,
-    backgroundColor: C.green,
-  },
-  progressLineInactive: {
-    width: 35,
-    height: 2,
-    backgroundColor: C.border,
-  },
-  section: {
-    backgroundColor: C.paper,
-    borderRadius: 19,
-    borderWidth: 1,
-    borderColor: C.border,
-    padding: 15,
-    marginBottom: 16,
-  },
-  sectionHeading: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 15,
-  },
-  sectionIcon: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
-    backgroundColor: C.burgundyLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 10,
-  },
-  sectionTitle: {
-    color: C.ink,
-    fontSize: 16,
-    fontWeight: '700',
-  },
-  sectionSubtitle: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 3,
-  },
-  count: {
-    color: C.muted,
-    fontSize: 10,
-    fontWeight: '600',
-  },
+  listTitle: { color: C.ink, fontSize: 16, fontWeight: '600' },
+  listCount: { color: C.muted, fontSize: 12 },
+
+  separator: { height: 10 },
   pointCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 13,
+    padding: 14,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
-    backgroundColor: C.white,
-    marginBottom: 9,
+    backgroundColor: C.paper,
   },
-  pointCardSelected: {
-    borderColor: C.burgundy,
-    backgroundColor: C.burgundyLight,
-  },
-  radioColumn: {
-    paddingRight: 11,
-  },
+  pointCardSelected: { borderColor: C.burgundy, backgroundColor: C.burgundyLight },
+  pointRow: { flexDirection: 'row', alignItems: 'flex-start' },
   radio: {
-    width: 19,
-    height: 19,
-    borderRadius: 10,
+    width: 22,
+    height: 22,
+    borderRadius: 11,
     borderWidth: 1.5,
     borderColor: '#B8AAA2',
     alignItems: 'center',
     justifyContent: 'center',
+    marginRight: 12,
+    marginTop: 1,
   },
-  radioSelected: {
-    borderColor: C.burgundy,
-  },
-  radioInner: {
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-    backgroundColor: C.burgundy,
-  },
-  pointDetails: {
-    flex: 1,
-  },
-  pointName: {
-    color: C.ink,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  pointAddress: {
-    color: C.muted,
-    fontSize: 11,
-    lineHeight: 16,
-    marginTop: 4,
-  },
-  timeRow: {
+  radioSelected: { borderColor: C.burgundy },
+  radioInner: { width: 10, height: 10, borderRadius: 5, backgroundColor: C.burgundy },
+  pointDetails: { flex: 1, minWidth: 0 },
+  pointName: { color: C.ink, fontSize: 15, fontWeight: '600' },
+  pointAddress: { color: C.muted, fontSize: 13, lineHeight: 19, marginTop: 4 },
+  pointTime: { color: C.ink, fontSize: 13, fontWeight: '500', marginLeft: 10, marginTop: 2 },
+
+  notes: { marginTop: 12, gap: 6 },
+  note: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginTop: 7,
+    gap: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: C.noteBorder,
+    backgroundColor: C.noteBg,
   },
-  pointTime: {
-    color: C.burgundy,
-    fontSize: 11,
-    fontWeight: '700',
-    marginLeft: 5,
-  },
-  emptyText: {
-    color: C.muted,
-    fontSize: 12,
-    paddingVertical: 12,
-  },
-  infoCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    padding: 13,
-    borderRadius: 13,
-    backgroundColor: C.burgundyLight,
-    marginBottom: 10,
-  },
-  infoText: {
-    flex: 1,
-    color: C.ink,
-    fontSize: 11,
-    lineHeight: 16,
-    marginLeft: 9,
-  },
+  noteText: { flex: 1, color: C.noteInk, fontSize: 13, lineHeight: 18 },
+
+  emptyText: { color: C.muted, fontSize: 14, paddingVertical: 20, textAlign: 'center' },
+
   bottomBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 18,
-    paddingVertical: 13,
-    paddingBottom: 16,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 14,
+    gap: 14,
     backgroundColor: C.paper,
     borderTopWidth: 1,
     borderTopColor: C.border,
   },
-  fareInfo: {
-    flex: 1,
-  },
-  fareLabel: {
-    color: C.muted,
-    fontSize: 11,
-  },
-  fareValue: {
-    color: C.ink,
-    fontSize: 19,
-    fontWeight: '800',
-    marginTop: 3,
-  },
+  fareInfo: { flex: 1, minWidth: 0 },
+  fareLabel: { color: C.muted, fontSize: 13 },
+  fareValue: { color: C.ink, fontSize: 19, fontWeight: '700', marginTop: 3 },
   continueButton: {
-    minWidth: 150,
-    height: 49,
-    borderRadius: 14,
+    height: 50,
+    paddingHorizontal: 24,
+    borderRadius: 13,
     backgroundColor: C.burgundy,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 9,
-    paddingHorizontal: 20,
+    gap: 8,
   },
-  continueDisabled: {
-    opacity: 0.45,
+  continueDisabled: { opacity: 0.45 },
+
+  toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center', zIndex: 50, elevation: 50 },
+  toast: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    maxWidth: 420,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderRadius: 18,
+    backgroundColor: 'rgba(56, 43, 40, 0.95)',
   },
-  continueText: {
-    color: C.white,
-    fontSize: 14,
-    fontWeight: '700',
+  toastIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#A65372',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
+  toastText: { flexShrink: 1, color: C.white, fontSize: 14 },
+
+  loaderScreen: { flex: 1, backgroundColor: '#F8F4ED', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 25 },
+  loaderTitle: { color: '#382B28', fontSize: 20, fontWeight: '600', letterSpacing: -0.3, textAlign: 'center' },
+  loaderSubtitle: { color: '#887A73', fontSize: 13, fontWeight: '500', marginTop: 8, textAlign: 'center' },
+  loaderTrack: { width: 190, height: 3, borderRadius: 9, overflow: 'hidden', backgroundColor: '#E9DDD7', marginTop: 22 },
+  loaderFill: { width: '34%', height: '100%', borderRadius: 9, backgroundColor: '#783D4A' },
+  continueText: { color: C.white, fontSize: 15, fontWeight: '600' },
 });

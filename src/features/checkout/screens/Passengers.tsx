@@ -1,23 +1,23 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useLocalSearchParams, useRouter } from 'expo-router';
 import {
   ActivityIndicator,
-  Alert,
   Animated,
-  Vibration,
-  KeyboardAvoidingView,
+  Keyboard,
   Modal,
   Platform,
   Pressable,
-  SafeAreaView,
   ScrollView,
   StatusBar,
   StyleSheet,
   Text,
   TextInput,
+  Vibration,
   View,
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { sendOTP, verifyOTP } from '@/features/auth/api';
 import { saveTokens, getTokens, clearTokens } from '@/features/auth/tokenStorage';
 import { request } from '@/services/http';
@@ -27,16 +27,19 @@ const C = {
   paper: '#FFFEFC',
   ink: '#382B28',
   muted: '#887A73',
+  placeholder: '#B0A49C',
   border: '#EAE0D7',
   burgundy: '#783D4A',
   burgundyLight: '#F4EAEB',
   white: '#FFFFFF',
   green: '#47765B',
-  input: '#FFFEFC',
-  error: '#C34242',
+  rose: '#A65372',
+  error: '#B8453F',
 };
 
 type Passenger = {
+  title?: string;
+  dob?: string; // API format YYYY-MM-DD
   name: string;
   age: string;
   gender: string;
@@ -49,487 +52,838 @@ type SavedPassenger = {
   name: string;
   age: number | string;
   gender: string;
+  title?: string;
+  date_of_birth?: string;
 };
 
+/* =====================================================
+   Helpers
+===================================================== */
+
+function parseJson(value: unknown): any {
+  if (!value) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function asArray(value: unknown): any[] {
+  const parsed = parseJson(value);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function str(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? (value[0] || '') : (value || '');
+}
+
 function formatFare(value: number): string {
-  return `₹${value.toLocaleString('en-IN', {
-    maximumFractionDigits: 2,
-  })}`;
+  return `₹${value.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 }
 
 function getSeatName(seat: any, index: number): string {
   return String(
-    seat?.seat_Number ??
-    seat?.seat_Name ??
-    seat?.seatNo ??
-    seat?.seat_Key ??
-    `Seat ${index + 1}`
+    seat?.seat_Number ?? seat?.seat_Name ?? seat?.seatNo ?? seat?.seat_Key ?? `Seat ${index + 1}`
   );
 }
 
 function getPointName(point: any, type: 'boarding' | 'dropping'): string {
   if (!point) return 'Not selected';
-
-  const prefix = type === 'boarding' ? 'boarding' : 'dropping';
-
-  return String(
-    point?.[`${prefix}_Name`] ??
-    point?.[`${prefix}Name`] ??
-    point?.point_Name ??
-    point?.pointName ??
-    point?.name ??
-    'Selected point'
+  const raw = String(
+    point?.[`${type}_Name`] ??
+      point?.[`${type}Name`] ??
+      point?.point_Name ??
+      point?.pointName ??
+      point?.name ??
+      'Selected point'
   );
+  return raw.split('^')[0].replace(/\([^)]*\)/g, '').replace(/\s{2,}/g, ' ').trim() || 'Selected point';
+}
+
+function formatClock(value: string): string {
+  const v = value.trim();
+  if (!v) return '';
+  if (/am|pm/i.test(v)) return v.toUpperCase();
+  const match = v.match(/(\d{1,2}):(\d{2})/);
+  if (!match) return v;
+  const hours = Number(match[1]);
+  return `${String(hours % 12 || 12).padStart(2, '0')}:${match[2]} ${hours >= 12 ? 'PM' : 'AM'}`;
 }
 
 function getPointTime(point: any, type: 'boarding' | 'dropping'): string {
   if (!point) return '';
+  const value = String(point?.[`${type}_Time`] ?? point?.time ?? '').trim();
+  if (!value) return '';
+  if (/am|pm/i.test(value)) return value.toUpperCase();
+  const match = value.match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return value;
+  const hours = Number(match[1]);
+  return `${String(hours % 12 || 12).padStart(2, '0')}:${match[2]} ${hours >= 12 ? 'PM' : 'AM'}`;
+}
 
-  const prefix = type === 'boarding' ? 'boarding' : 'dropping';
+function formatDate(value: string): string {
+  if (!value) return '';
+  const date = value.includes('/')
+    ? (() => {
+        const [m, d, y] = value.split('/');
+        return new Date(Number(y), Number(m) - 1, Number(d));
+      })()
+    : new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+}
 
-  return String(
-    point?.[`${prefix}_Time`] ??
-    point?.time ??
-    ''
+function isLadiesSeat(seat: any): boolean {
+  const value = seat?.ladies_Seat;
+  return (
+    value === true ||
+    value === 1 ||
+    ['true', '1', 'yes', 'y'].includes(String(value).trim().toLowerCase())
   );
 }
 
-function formatTime(value: string): string {
-  if (!value) return '';
-
-  if (/am|pm/i.test(value)) return value.toUpperCase();
-
-  const match = value.match(/^(\d{1,2}):(\d{2})/);
-
-  if (!match) return value;
-
-  const hours = Number(match[1]);
-  const suffix = hours >= 12 ? 'PM' : 'AM';
-
-  return `${String(hours % 12 || 12).padStart(2, '0')}:${match[2]} ${suffix}`;
+function isFemalePassenger(gender: string): boolean {
+  return ['female', 'f', 'woman'].includes(String(gender).trim().toLowerCase());
 }
 
-function SavedPassengerRow({
+function formatDobInput(v: string): string {
+  const d = v.replace(/\D/g, '').slice(0, 8);
+  if (d.length > 4) return `${d.slice(0, 2)}/${d.slice(2, 4)}/${d.slice(4)}`;
+  if (d.length > 2) return `${d.slice(0, 2)}/${d.slice(2)}`;
+  return d;
+}
+
+function isValidDob(v: string): boolean {
+  const m = v.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return false;
+  const d = Number(m[1]), mo = Number(m[2]), y = Number(m[3]);
+  const dt = new Date(y, mo - 1, d);
+  return dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === d && dt <= new Date() && y >= 1900;
+}
+
+/** DD/MM/YYYY -> YYYY-MM-DD ('' when invalid) */
+function dobToApi(v: string): string {
+  if (!isValidDob(v)) return '';
+  const [d, m, y] = v.split('/');
+  return `${y}-${m}-${d}`;
+}
+
+/** YYYY-MM-DD -> DD/MM/YYYY ('' when missing) */
+function apiToDob(v?: string): string {
+  const m = String(v || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : '';
+}
+
+function ageFromDob(v: string): number {
+  const [d, m, y] = v.split('/').map(Number);
+  const now = new Date();
+  let age = now.getFullYear() - y;
+  if (now.getMonth() + 1 < m || (now.getMonth() + 1 === m && now.getDate() < d)) age--;
+  return age;
+}
+
+/** Survives leaving and re-opening this screen (e.g. going back to change seats). */
+const sessionCache: {
+  authed: boolean;
+  saved: SavedPassenger[] | null;
+  contact: { mobile: string; email: string };
+  draft: Omit<Passenger, 'seatIndex'>[];
+} = { authed: false, saved: null, contact: { mobile: '', email: '' }, draft: [] };
+
+function statusOf(error: any): number | undefined {
+  return error?.status ?? error?.statusCode ?? error?.response?.status;
+}
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    return fn();
+  }
+}
+
+/** Screen opened after the passenger details are complete. Change this if your checkout route has another name. */
+const CHECKOUT_ROUTE = '/payment';
+
+const MOBILE_RE = /^[6-9]\d{9}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/* =====================================================
+   Small building blocks
+===================================================== */
+
+function Gender({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <View style={styles.segmented}>
+      {['Male', 'Female'].map(item => {
+        const active = value.toLowerCase() === item.toLowerCase();
+        return (
+          <Pressable
+            key={item}
+            onPress={() => onChange(item)}
+            style={[styles.segment, active && styles.segmentActive]}
+          >
+            <Text style={[styles.segmentText, active && styles.segmentTextActive]}>{item}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+/** Top edge of the keyboard in screen coordinates (null while it is hidden). */
+function useKeyboardTop(): number | null {
+  const [top, setTop] = useState<number | null>(null);
+  useEffect(() => {
+    const show = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      e => setTop(e.endCoordinates?.screenY ?? null)
+    );
+    const hide = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
+      () => setTop(null)
+    );
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+  return top;
+}
+
+/**
+ * How much of a full-height container's bottom edge the keyboard actually covers.
+ * Measured, not assumed: if Android already shrank the window for the keyboard the overlap is 0,
+ * so nothing is lifted twice.
+ */
+function useKeyboardOverlap(ref: React.RefObject<View | null>, keyboardTop: number | null) {
+  const [frame, setFrame] = useState({ y: 0, h: 0 });
+  const measure = useCallback(() => {
+    ref.current?.measureInWindow((_x, y, _w, h) => {
+      setFrame(f => (Math.abs(f.y - y) < 1 && Math.abs(f.h - h) < 1 ? f : { y, h }));
+    });
+  }, [ref]);
+  useEffect(() => {
+    measure();
+    const t = setTimeout(measure, 150);
+    return () => clearTimeout(t);
+  }, [keyboardTop, measure]);
+  const overlap = keyboardTop == null ? 0 : Math.max(0, Math.round(frame.y + frame.h - keyboardTop));
+  return { overlap, frame, measure };
+}
+
+/**
+ * Bottom sheet that stays above the keyboard and the phone's navigation bar.
+ * It shrinks to the space left, so the form scrolls instead of hiding behind the keyboard.
+ */
+function BottomSheet({
+  visible,
+  onClose,
+  children,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const overlayRef = useRef<View>(null);
+  const keyboardTop = useKeyboardTop();
+  const { overlap, frame, measure } = useKeyboardOverlap(overlayRef, keyboardTop);
+  const available = frame.h > 0 ? frame.h : windowHeight;
+
+  return (
+    <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
+      <View ref={overlayRef} collapsable={false} onLayout={measure} style={styles.overlay}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+        <View
+          style={[
+            styles.sheet,
+            {
+              marginBottom: overlap,
+              maxHeight: Math.max(260, available - overlap - insets.top - 12),
+              paddingBottom: keyboardTop != null ? 16 : 18 + insets.bottom,
+            },
+          ]}
+        >
+          <View style={styles.handle} />
+          {children}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+const SeatRow = memo(function SeatRow({
+  seatName,
+  ladies,
+  passenger,
+  onAdd,
+  onRemove,
+}: {
+  seatName: string;
+  ladies: boolean;
+  passenger?: Passenger;
+  onAdd: () => void;
+  onRemove: () => void;
+}) {
+  const filled = !!passenger;
+  return (
+    <Pressable onPress={filled ? undefined : onAdd} style={styles.seatRow}>
+      <View style={[styles.seatChip, filled && styles.seatChipFilled]}>
+        <Text style={[styles.seatChipText, filled && styles.seatChipTextFilled]} numberOfLines={1}>
+          {seatName}
+        </Text>
+      </View>
+
+      <View style={styles.seatInfo}>
+        {filled ? (
+          <>
+            <Text style={styles.seatPassenger} numberOfLines={1}>
+              {[passenger!.title, passenger!.name].filter(Boolean).join(' ')}
+            </Text>
+            <Text style={styles.seatMeta}>
+              {passenger!.gender} · {passenger!.age}
+              {ladies ? ' · Ladies seat' : ''}
+            </Text>
+          </>
+        ) : (
+          <>
+            <Text style={styles.seatEmpty}>Add passenger</Text>
+            {ladies && <Text style={[styles.seatMeta, { color: C.rose }]}>Ladies seat</Text>}
+          </>
+        )}
+      </View>
+
+      {filled ? (
+        <Pressable onPress={onRemove} hitSlop={10} style={styles.iconButton} accessibilityLabel="Remove passenger">
+          <Ionicons name="close" size={19} color={C.muted} />
+        </Pressable>
+      ) : (
+        <Ionicons name="add" size={22} color={C.burgundy} style={{ marginRight: 10 }} />
+      )}
+    </Pressable>
+  );
+});
+
+const SavedRow = memo(function SavedRow({
   passenger,
   selected,
   seatName,
-  disabled,
-  editing,
-  editValue,
   onToggle,
   onEdit,
-  onDelete,
-  onEditChange,
-  onSaveEdit,
-  onCancelEdit,
-  savingEdit,
 }: {
   passenger: SavedPassenger;
   selected: boolean;
   seatName?: string;
-  disabled: boolean;
-  editing: boolean;
-  editValue: { name: string; age: string; gender: string };
   onToggle: () => void;
   onEdit: () => void;
-  onDelete: () => void;
-  onEditChange: (field: 'name' | 'age' | 'gender', value: string) => void;
-  onSaveEdit: () => void;
-  onCancelEdit: () => void;
-  savingEdit: boolean;
 }) {
-  const initial = passenger.name?.trim()?.charAt(0)?.toUpperCase() || '?';
-
-  const genderShort =
-    passenger.gender?.toLowerCase() === 'female'
-      ? 'F'
-      : passenger.gender?.toLowerCase() === 'male'
-        ? 'M'
-        : 'O';
-
   return (
-    <View
-      style={[
-        styles.savedRowWrap,
-        selected && styles.savedRowWrapSelected,
-        disabled && styles.savedRowWrapDisabled,
-      ]}
-    >
-      <View style={styles.savedRow}>
-        <Pressable
-          onPress={onToggle}
-          disabled={disabled && !selected}
-          style={styles.savedRowSelect}
-        >
-          <View
-            style={[
-              styles.checkbox,
-              selected && styles.checkboxSelected,
-              disabled && styles.checkboxDisabled,
-            ]}
-          >
-            {selected && (
-              <Ionicons name="checkmark" size={14} color={C.white} />
-            )}
-          </View>
-
-          <View style={styles.savedAvatar}>
-            <Text style={styles.savedAvatarText}>{initial}</Text>
-          </View>
-
-          <View style={styles.savedInfo}>
-            <Text
-              style={[
-                styles.savedName,
-                disabled && styles.disabledSavedText,
-              ]}
-              numberOfLines={1}
-            >
-              {passenger.name}
-            </Text>
-
-            <Text style={styles.savedMeta}>
-              {genderShort} · {passenger.age}
-              {disabled ? ' · No standard seats left' : ''}
-            </Text>
-          </View>
-
-          {selected && seatName ? (
-            <View style={styles.assignedSeat}>
-              <Ionicons
-                name="ticket-outline"
-                size={13}
-                color={C.green}
-              />
-              <Text style={styles.assignedSeatText}>{seatName}</Text>
-            </View>
-          ) : null}
-        </Pressable>
-
-        <Pressable
-          onPress={onEdit}
-          style={styles.rowAction}
-          hitSlop={8}
-        >
-          <Ionicons name="create-outline" size={17} color={C.muted} />
-        </Pressable>
-
-        <Pressable
-          onPress={onDelete}
-          style={styles.rowAction}
-          hitSlop={8}
-        >
-          <Ionicons name="trash-outline" size={17} color={C.error} />
-        </Pressable>
+    <Pressable onPress={onToggle} style={styles.savedRow}>
+      <View style={[styles.checkbox, selected && styles.checkboxSelected]}>
+        {selected && <Ionicons name="checkmark" size={15} color={C.white} />}
       </View>
 
-      {editing && (
-        <View style={styles.inlineEditPanel}>
-          <TextInput
-            value={editValue.name}
-            onChangeText={value => onEditChange('name', value)}
-            placeholder="Full name"
-            placeholderTextColor="#A99D95"
-            autoCapitalize="words"
-            style={styles.inlineEditInput}
-          />
+      <View style={{ flex: 1, minWidth: 0 }}>
+        <Text style={styles.savedName} numberOfLines={1}>
+          {[passenger.title, passenger.name].filter(Boolean).join(' ')}
+        </Text>
+        <Text style={styles.savedMeta}>
+          {passenger.gender} · {passenger.age}
+        </Text>
+      </View>
 
-          <TextInput
-            value={editValue.age}
-            onChangeText={value =>
-              onEditChange(
-                'age',
-                value.replace(/[^0-9]/g, '').slice(0, 3)
-              )
-            }
-            placeholder="Age"
-            placeholderTextColor="#A99D95"
-            keyboardType="number-pad"
-            style={[
-              styles.inlineEditInput,
-              styles.inlineAgeInput,
-            ]}
-          />
+      {selected && !!seatName && <Text style={styles.assignedSeat}>Seat {seatName}</Text>}
 
-          <View style={styles.inlineGenderRow}>
-            {['Male', 'Female', 'Other'].map(gender => (
-              <Pressable
-                key={gender}
-                onPress={() => onEditChange('gender', gender)}
-                style={[
-                  styles.genderOption,
-                  styles.inlineGenderOption,
-                  editValue.gender === gender &&
-                    styles.genderOptionSelected,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.genderText,
-                    editValue.gender === gender &&
-                      styles.genderTextSelected,
-                  ]}
-                >
-                  {gender}
-                </Text>
-              </Pressable>
-            ))}
-          </View>
+      <Pressable onPress={onEdit} hitSlop={8} style={styles.iconButton} accessibilityLabel="Edit passenger">
+        <Ionicons name="create-outline" size={19} color={C.muted} />
+      </Pressable>
+    </Pressable>
+  );
+});
 
-          <View style={styles.inlineEditActions}>
+/* =====================================================
+   Passenger form (shared by Add and Edit sheets)
+===================================================== */
+
+type Form = { title: string; name: string; age: string; gender: string; dob: string };
+const EMPTY_FORM: Form = { title: '', name: '', age: '', gender: '', dob: '' };
+const TITLES = ['Mr', 'Mrs', 'Ms'];
+
+function validateForm(f: Form): string | null {
+  if (!f.name.trim()) return "Enter the passenger's name.";
+  const age = Number(f.age);
+  if (!Number.isInteger(age) || age < 1 || age > 100) return 'Enter an age between 1 and 100.';
+  if (!f.gender) return 'Select a gender.';
+  if (f.dob && !isValidDob(f.dob)) return 'Enter date of birth as DD/MM/YYYY.';
+  return null;
+}
+
+/** Body for POST / PUT /api/v1/users/passengers */
+function toApiBody(f: Form) {
+  const dob = dobToApi(f.dob);
+  return {
+    title: f.title || (isFemalePassenger(f.gender) ? 'Ms' : 'Mr'),
+    name: f.name.trim(),
+    ...(dob ? { date_of_birth: dob } : {}),
+    age: Number(f.age),
+    gender: f.gender,
+  };
+}
+
+const PassengerFields = memo(function PassengerFields({
+  form,
+  onChange,
+}: {
+  form: Form;
+  onChange: (patch: Partial<Form>) => void;
+}) {
+  return (
+    <>
+      <Text style={styles.label}>Title</Text>
+      <View style={styles.titleRow}>
+        {TITLES.map(item => {
+          const active = form.title === item;
+          return (
             <Pressable
-              onPress={onCancelEdit}
-              style={styles.cancelPassengerButton}
+              key={item}
+              onPress={() => onChange({ title: item })}
+              style={[styles.titleChip, active && styles.titleChipActive]}
             >
-              <Text style={styles.cancelPassengerText}>Cancel</Text>
+              <Text style={[styles.titleChipText, active && styles.titleChipTextActive]}>{item}</Text>
             </Pressable>
+          );
+        })}
+      </View>
 
-            <Pressable
-              onPress={onSaveEdit}
-              disabled={savingEdit}
-              style={styles.savePassengerButton}
+      <Text style={[styles.label, { marginTop: 12 }]}>Full name</Text>
+      <TextInput
+        value={form.name}
+        onChangeText={name => onChange({ name })}
+        placeholder="As on ID"
+        placeholderTextColor={C.placeholder}
+        autoCapitalize="words"
+        style={styles.input}
+      />
+
+      <View style={styles.row}>
+        <View style={{ width: 96 }}>
+          <Text style={styles.label}>Age</Text>
+          <TextInput
+            value={form.age}
+            onChangeText={v => onChange({ age: v.replace(/[^0-9]/g, '').slice(0, 3) })}
+            placeholder="Age"
+            placeholderTextColor={C.placeholder}
+            keyboardType="number-pad"
+            style={styles.input}
+          />
+        </View>
+        <View style={{ flex: 1 }}>
+          <Text style={styles.label}>Gender</Text>
+          <Gender
+            value={form.gender}
+            onChange={gender =>
+              onChange({
+                gender,
+                title: isFemalePassenger(gender)
+                  ? form.title === 'Mrs' ? 'Mrs' : 'Ms'
+                  : 'Mr',
+              })
+            }
+          />
+        </View>
+      </View>
+
+      <Text style={[styles.label, { marginTop: 12 }]}>
+        Date of birth <Text style={styles.optional}>(optional)</Text>
+      </Text>
+      <TextInput
+        value={form.dob}
+        onChangeText={v => {
+          const dob = formatDobInput(v);
+          const patch: Partial<Form> = { dob };
+          if (isValidDob(dob)) patch.age = String(Math.min(100, Math.max(1, ageFromDob(dob))));
+          onChange(patch);
+        }}
+        placeholder="DD/MM/YYYY"
+        placeholderTextColor={C.placeholder}
+        keyboardType="number-pad"
+        maxLength={10}
+        style={styles.input}
+      />
+    </>
+  );
+});
+
+/* =====================================================
+   Add passenger sheet (own form state, so typing never re-renders the page)
+===================================================== */
+
+const AddPassengerSheet = memo(function AddPassengerSheet({
+  visible,
+  seatName,
+  authenticated,
+  saving,
+  onClose,
+  onSubmit,
+}: {
+  visible: boolean;
+  seatName?: string;
+  authenticated: boolean;
+  saving: boolean;
+  onClose: () => void;
+  onSubmit: (form: Form, saveForLater: boolean) => Promise<string | null>;
+}) {
+  const [form, setForm] = useState<Form>(EMPTY_FORM);
+  const [saveForLater, setSaveForLater] = useState(true);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (visible) {
+      setForm(EMPTY_FORM);
+      setSaveForLater(true);
+      setError('');
+    }
+  }, [visible]);
+
+  const patch = useCallback((p: Partial<Form>) => setForm(f => ({ ...f, ...p })), []);
+
+  async function submit() {
+    setError('');
+    const message = await onSubmit(form, saveForLater);
+    if (message) setError(message);
+  }
+
+  return (
+    <BottomSheet visible={visible} onClose={onClose}>
+            <View style={styles.sheetHeader}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.sheetTitle}>Add passenger</Text>
+                {!!seatName && <Text style={styles.sheetSubtitle}>For seat {seatName}</Text>}
+              </View>
+              <Pressable onPress={onClose} style={styles.iconButton} hitSlop={6}>
+                <Ionicons name="close" size={22} color={C.ink} />
+              </Pressable>
+            </View>
+
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              style={styles.sheetScroll}
             >
-              {savingEdit ? (
-                <ActivityIndicator color={C.white} size="small" />
-              ) : (
-                <Ionicons
-                  name="checkmark"
-                  size={15}
-                  color={C.white}
-                />
+              <PassengerFields form={form} onChange={patch} />
+
+              {authenticated && (
+                <Pressable onPress={() => setSaveForLater(v => !v)} style={styles.checkRow}>
+                  <View style={[styles.checkbox, saveForLater && styles.checkboxSelected]}>
+                    {saveForLater && <Ionicons name="checkmark" size={15} color={C.white} />}
+                  </View>
+                  <Text style={styles.checkRowText}>Save for future bookings</Text>
+                </Pressable>
               )}
 
-              <Text style={styles.savePassengerButtonText}>
-                {savingEdit ? 'Saving…' : 'Save changes'}
-              </Text>
-            </Pressable>
-          </View>
-        </View>
-      )}
-    </View>
-  );
-}
+              {!!error && <Text style={styles.errorText}>{error}</Text>}
+            </ScrollView>
 
-function PassengerForm({
-  value,
-  onChange,
-  onSave,
-  onCancel,
-  saving,
-}: {
-  value: Passenger;
-  onChange: (field: 'name' | 'age' | 'gender', value: string) => void;
-  onSave: () => void;
-  onCancel: () => void;
-  saving: boolean;
-}) {
-  return (
-    <View style={styles.passengerCard}>
-      <Text style={styles.passengerTitle}>New passenger details</Text>
-
-      <View style={styles.field}>
-        <Text style={styles.label}>Full name</Text>
-        <TextInput
-          value={value.name}
-          onChangeText={v => onChange('name', v)}
-          placeholder="Enter full name"
-          placeholderTextColor="#A99D95"
-          autoCapitalize="words"
-          style={styles.input}
-        />
-      </View>
-
-      <View style={styles.field}>
-        <Text style={styles.label}>Age</Text>
-        <TextInput
-          value={value.age}
-          onChangeText={v =>
-            onChange('age', v.replace(/[^0-9]/g, '').slice(0, 3))
-          }
-          placeholder="Enter age"
-          keyboardType="number-pad"
-          style={styles.input}
-        />
-      </View>
-
-      <View style={styles.field}>
-        <Text style={styles.label}>Gender</Text>
-
-        <View style={styles.genderRow}>
-          {['Male', 'Female', 'Other'].map(g => (
             <Pressable
-              key={g}
-              onPress={() => onChange('gender', g)}
-              style={[
-                styles.genderOption,
-                value.gender === g && styles.genderOptionSelected,
-              ]}
+              onPress={submit}
+              disabled={saving}
+              style={[styles.primaryButton, saving && styles.buttonDisabled]}
             >
-              <Text
-                style={[
-                  styles.genderText,
-                  value.gender === g && styles.genderTextSelected,
-                ]}
-              >
-                {g}
-              </Text>
+              {saving ? <ActivityIndicator color={C.white} /> : <Text style={styles.primaryText}>Add passenger</Text>}
             </Pressable>
-          ))}
-        </View>
-      </View>
-
-      <View style={styles.formActions}>
-        <Pressable
-          onPress={onCancel}
-          style={styles.cancelPassengerButton}
-        >
-          <Text style={styles.cancelPassengerText}>Cancel</Text>
-        </Pressable>
-
-        <Pressable
-          onPress={onSave}
-          disabled={saving}
-          style={styles.savePassengerButton}
-        >
-          {saving ? (
-            <ActivityIndicator color={C.white} size="small" />
-          ) : (
-            <Ionicons
-              name="bookmark-outline"
-              size={15}
-              color={C.white}
-            />
-          )}
-
-          <Text style={styles.savePassengerButtonText}>
-            {saving ? 'Saving…' : 'Save passenger'}
-          </Text>
-        </Pressable>
-      </View>
-    </View>
+    </BottomSheet>
   );
-}
+});
 
-export default function Passengers({ navigation, route }: any) {
+/* =====================================================
+   Edit saved passenger sheet
+===================================================== */
+
+const EditPassengerSheet = memo(function EditPassengerSheet({
+  visible,
+  passenger,
+  saving,
+  deleting,
+  onClose,
+  onSave,
+  onDelete,
+}: {
+  visible: boolean;
+  passenger: SavedPassenger | null;
+  saving: boolean;
+  deleting: boolean;
+  onClose: () => void;
+  onSave: (form: Form) => Promise<string | null>;
+  onDelete: () => Promise<string | null>;
+}) {
+  const [form, setForm] = useState<Form>(EMPTY_FORM);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!visible || !passenger) return;
+    setForm({
+      title: passenger.title || (isFemalePassenger(passenger.gender) ? 'Ms' : 'Mr'),
+      name: passenger.name || '',
+      age: String(passenger.age ?? ''),
+      gender: passenger.gender || '',
+      dob: apiToDob(passenger.date_of_birth),
+    });
+    setError('');
+  }, [visible, passenger]);
+
+  const patch = useCallback((p: Partial<Form>) => setForm(f => ({ ...f, ...p })), []);
+
+  async function submit() {
+    setError('');
+    const message = await onSave(form);
+    if (message) setError(message);
+  }
+
+  async function remove() {
+    setError('');
+    const message = await onDelete();
+    if (message) setError(message);
+  }
+
+  return (
+    <BottomSheet visible={visible} onClose={onClose}>
+            <View style={styles.sheetHeader}>
+              <Text style={[styles.sheetTitle, { flex: 1 }]}>Edit passenger</Text>
+              <Pressable onPress={remove} disabled={deleting || saving} style={styles.iconButton} hitSlop={6}>
+                {deleting ? (
+                  <ActivityIndicator color={C.error} size="small" />
+                ) : (
+                  <Ionicons name="trash-outline" size={20} color={C.error} />
+                )}
+              </Pressable>
+              <Pressable onPress={onClose} style={styles.iconButton} hitSlop={6}>
+                <Ionicons name="close" size={22} color={C.ink} />
+              </Pressable>
+            </View>
+
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              showsVerticalScrollIndicator={false}
+              style={styles.sheetScroll}
+            >
+              <PassengerFields form={form} onChange={patch} />
+              {!!error && <Text style={styles.errorText}>{error}</Text>}
+            </ScrollView>
+
+            <Pressable
+              onPress={submit}
+              disabled={saving || deleting}
+              style={[styles.primaryButton, (saving || deleting) && styles.buttonDisabled]}
+            >
+              {saving ? <ActivityIndicator color={C.white} /> : <Text style={styles.primaryText}>Save changes</Text>}
+            </Pressable>
+    </BottomSheet>
+  );
+});
+
+
+/* =====================================================
+   Screen
+===================================================== */
+
+export default function Passengers() {
+  const router = useRouter();
+  const routeParams = useLocalSearchParams();
   const { width } = useWindowDimensions();
+  const insets = useSafeAreaInsets();
+  const rootRef = useRef<View>(null);
+  const keyboardTop = useKeyboardTop();
+  const { overlap: keyboardOverlap, measure: measureRoot } = useKeyboardOverlap(rootRef, keyboardTop);
   const isWide = width >= 640;
 
-  const params = route?.params || {};
-  const bus = params.bus || {};
+  // Calm, non-blocking message (replaces Alert boxes). Messages that belong to an open sheet show inside it.
+  const [toast, setToast] = useState<string | null>(null);
+  const toastAnim = useRef(new Animated.Value(0)).current;
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback(
+    (message: string) => {
+      setToast(message);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      Animated.timing(toastAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+      toastTimer.current = setTimeout(() => {
+        Animated.timing(toastAnim, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => setToast(null));
+      }, 3200);
+    },
+    [toastAnim]
+  );
+  useEffect(
+    () => () => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    },
+    []
+  );
+  const scrollRef = useRef<ScrollView>(null);
 
-  const selectedSeats: any[] = Array.isArray(params.selectedSeats)
-    ? params.selectedSeats
-    : [];
-
-  const boarding = params.selectedBoardingPoint || params.defaultBoarding;
-  const dropping = params.selectedDroppingPoint || params.defaultDropping;
+  // Parse the route JSON once (expo-router params are strings).
+  const bus = useMemo(() => parseJson(routeParams.bus) || {}, [routeParams.bus]);
+  const selectedSeats = useMemo(() => asArray(routeParams.selectedSeats), [routeParams.selectedSeats]);
+  const boarding = useMemo(
+    () => parseJson(routeParams.selectedBoardingPoint) || parseJson(routeParams.defaultBoarding),
+    [routeParams.selectedBoardingPoint, routeParams.defaultBoarding]
+  );
+  const dropping = useMemo(
+    () => parseJson(routeParams.selectedDroppingPoint) || parseJson(routeParams.defaultDropping),
+    [routeParams.selectedDroppingPoint, routeParams.defaultDropping]
+  );
 
   const seatNames = useMemo(
     () => selectedSeats.map((seat, index) => getSeatName(seat, index)),
     [selectedSeats]
   );
+  const totalFare = Number(str(routeParams.totalFare) || 0); // includes taxes: used at checkout, not shown here
+  // Shown here: the sum of each seat's basic fare, exactly as on the seat screen.
+  const baseFare = useMemo(
+    () => selectedSeats.reduce((sum: number, seat: any) => sum + (Number(seat?.fareMaster?.basic_Amount) || 0), 0),
+    [selectedSeats]
+  );
 
-  const totalFare = Number(params.totalFare || 0);
-
-  const [passengers, setPassengers] = useState<Passenger[]>([]);
-  const [mobile, setMobile] = useState('');
-  const [email, setEmail] = useState('');
+  // Re-fill passengers from the last visit (e.g. after changing seats), respecting ladies seats.
+  const [passengers, setPassengers] = useState<Passenger[]>(() => {
+    const result: Passenger[] = [];
+    const taken = new Set<number>();
+    for (const draft of sessionCache.draft) {
+      const female = isFemalePassenger(draft.gender);
+      const index = selectedSeats.findIndex(
+        (seat, i) => !taken.has(i) && (!isLadiesSeat(seat) || female)
+      );
+      if (index < 0) continue;
+      taken.add(index);
+      result.push({ ...draft, seatIndex: index });
+    }
+    return result;
+  });
+  const [mobile, setMobile] = useState(sessionCache.contact.mobile);
+  const [email, setEmail] = useState(sessionCache.contact.email);
+  const [accountError, setAccountError] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [savingContact, setSavingContact] = useState(false);
 
   const [loginVisible, setLoginVisible] = useState(false);
   const [otpStep, setOtpStep] = useState(false);
   const [otp, setOtp] = useState('');
   const [otpCountdown, setOtpCountdown] = useState(0);
   const [otpError, setOtpError] = useState('');
-
+  const [phoneError, setPhoneError] = useState('');
   const otpInputRef = useRef<TextInput>(null);
   const otpShake = useRef(new Animated.Value(0)).current;
 
   const [authLoading, setAuthLoading] = useState(false);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [savedPassengers, setSavedPassengers] = useState<SavedPassenger[]>([]);
+  const [isAuthenticated, setIsAuthenticated] = useState(sessionCache.authed);
+  const [savedPassengers, setSavedPassengers] = useState<SavedPassenger[]>(sessionCache.saved ?? []);
 
-  const [showAddPassenger, setShowAddPassenger] = useState(false);
-  const [draftPassenger, setDraftPassenger] = useState<Passenger>({
-    name: '',
-    age: '',
-    gender: '',
-    seatIndex: -1,
-  });
+  const [showAdd, setShowAdd] = useState(false);
+  const [addTarget, setAddTarget] = useState<number | null>(null);
   const [savingPassenger, setSavingPassenger] = useState(false);
+  const [editingPassenger, setEditingPassenger] = useState<SavedPassenger | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editDeleting, setEditDeleting] = useState(false);
 
-  const [editingPassengerId, setEditingPassengerId] = useState<string | null>(null);
-  const [editDraft, setEditDraft] = useState({
-    name: '',
-    age: '',
-    gender: '',
-  });
-  const [updatingPassenger, setUpdatingPassenger] = useState(false);
-  const [deletingPassengerId, setDeletingPassengerId] = useState<string | null>(null);
-
-  // Restore login from persisted tokens when this screen is opened again.
   useEffect(() => {
-    let active = true;
+    sessionCache.draft = passengers.map(({ seatIndex, ...rest }) => rest);
+  }, [passengers]);
 
+  useEffect(() => {
+    sessionCache.contact = { mobile, email };
+  }, [mobile, email]);
+
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // Contact currently stored on the account (to know whether a PUT is needed).
+  const savedContact = useRef({ mobile: '', email: '' });
+
+  /** GET /api/v1/users/contact-details and prefill the form. */
+  async function loadContact() {
+    const res: any = await request<any>('/api/v1/users/contact-details');
+    const data = res?.data ?? res ?? {};
+    const m = String(data.mobile_number ?? '').replace(/\D/g, '').slice(-10);
+    const e = String(data.email ?? '');
+    savedContact.current = { mobile: m, email: e };
+    if (!mounted.current) return;
+    if (m) setMobile(m);
+    if (e) setEmail(e);
+  }
+
+  /** Load saved passengers + contact for a signed-in user. 401 => back to guest. */
+  async function loadAccount() {
+    let unauthorized = false;
+    let failed = false;
+
+    try {
+      await withRetry(refreshSavedPassengers);
+    } catch (error) {
+      console.warn('[Passengers] saved passengers failed', error);
+      if (statusOf(error) === 401) unauthorized = true;
+      else failed = true;
+    }
+
+    if (!unauthorized) {
+      try {
+        await withRetry(loadContact);
+      } catch (error) {
+        console.warn('[Passengers] contact details failed', error);
+        if (statusOf(error) === 401) unauthorized = true;
+      }
+    }
+
+    if (!mounted.current) return;
+    if (unauthorized) {
+      await clearTokens().catch(() => undefined);
+      sessionCache.authed = false;
+      sessionCache.saved = null;
+      setIsAuthenticated(false);
+      setSavedPassengers([]);
+      return;
+    }
+    setAccountError(failed);
+  }
+
+  // Restore login from persisted tokens.
+  useEffect(() => {
     (async () => {
       try {
         const tokens = await getTokens();
-        if (!tokens || !active) return;
-
+        if (!tokens || !mounted.current) return;
+        sessionCache.authed = true;
         setIsAuthenticated(true);
-
-        try {
-          const saved = await request<SavedPassenger[]>(
-            '/api/v1/users/passengers'
-          );
-
-          if (active) {
-            setSavedPassengers(Array.isArray(saved) ? saved : []);
-          }
-        } catch (error: any) {
-          const status =
-            error?.status ??
-            error?.statusCode ??
-            error?.response?.status;
-
-          if (status === 401) {
-            await clearTokens().catch(() => undefined);
-
-            if (active) {
-              setIsAuthenticated(false);
-            }
-          }
-        }
+        await loadAccount();
       } catch {
-        // Keep guest checkout available if token storage cannot be read.
+        // Guest checkout stays available if token storage cannot be read.
       }
     })();
-
-    return () => {
-      active = false;
-    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (!otpStep || otpCountdown <= 0) return;
-
-    const timer = setInterval(() => {
-      setOtpCountdown(current => Math.max(0, current - 1));
-    }, 1000);
-
+    const timer = setInterval(() => setOtpCountdown(c => Math.max(0, c - 1)), 1000);
     return () => clearInterval(timer);
   }, [otpStep, otpCountdown]);
 
-  function updateDraft(
-    field: 'name' | 'age' | 'gender',
-    value: string
-  ) {
-    setDraftPassenger(current => ({
-      ...current,
-      [field]: value,
-    }));
-  }
-
   function handleSignIn() {
+    setPhoneError('');
     setOtpStep(false);
     setOtp('');
     setOtpError('');
@@ -539,42 +893,19 @@ export default function Passengers({ navigation, route }: any) {
 
   function shakeOtp() {
     otpShake.setValue(0);
-
     Animated.sequence([
-      Animated.timing(otpShake, {
-        toValue: 9,
-        duration: 55,
-        useNativeDriver: true,
-      }),
-      Animated.timing(otpShake, {
-        toValue: -9,
-        duration: 55,
-        useNativeDriver: true,
-      }),
-      Animated.timing(otpShake, {
-        toValue: 6,
-        duration: 55,
-        useNativeDriver: true,
-      }),
-      Animated.timing(otpShake, {
-        toValue: 0,
-        duration: 55,
-        useNativeDriver: true,
-      }),
+      Animated.timing(otpShake, { toValue: 9, duration: 55, useNativeDriver: true }),
+      Animated.timing(otpShake, { toValue: -9, duration: 55, useNativeDriver: true }),
+      Animated.timing(otpShake, { toValue: 6, duration: 55, useNativeDriver: true }),
+      Animated.timing(otpShake, { toValue: 0, duration: 55, useNativeDriver: true }),
     ]).start();
-
-    if (Platform.OS !== 'web') {
-      Vibration.vibrate(160);
-    }
+    if (Platform.OS !== 'web') Vibration.vibrate(160);
   }
 
   function readableApiError(error: any, fallback: string) {
     const raw = error?.message ?? error?.detail ?? fallback;
-
     if (typeof raw !== 'string') return fallback;
-
     const jsonStart = raw.indexOf('{');
-
     if (jsonStart >= 0) {
       try {
         const parsed = JSON.parse(raw.slice(jsonStart));
@@ -583,45 +914,36 @@ export default function Passengers({ navigation, route }: any) {
         return fallback;
       }
     }
-
     return raw || fallback;
   }
 
   async function refreshSavedPassengers() {
-    const result = await request<SavedPassenger[]>(
-      '/api/v1/users/passengers'
-    );
-
-    const list = Array.isArray(result) ? result : [];
-    setSavedPassengers(list);
-
+    const result: any = await request<any>('/api/v1/users/passengers');
+    const raw = Array.isArray(result) ? result : result?.passengers ?? result?.data ?? [];
+    const list: SavedPassenger[] = Array.isArray(raw) ? raw : [];
+    sessionCache.saved = list;
+    if (mounted.current) setSavedPassengers(list);
     return list;
   }
 
   async function handleSendOTP() {
     const number = mobile.trim();
-
-    if (!/^[6-9]\d{9}$/.test(number)) {
-      Alert.alert(
-        'Invalid mobile number',
-        'Enter a valid 10-digit Indian mobile number.'
-      );
+    if (!MOBILE_RE.test(number)) {
+      setPhoneError('Enter a valid 10-digit mobile number.');
       return;
     }
-
     try {
       setAuthLoading(true);
+      setPhoneError('');
       await sendOTP(number);
-
       setOtpStep(true);
       setOtp('');
       setOtpError('');
       setOtpCountdown(60);
     } catch (error: any) {
-      Alert.alert(
-        'Unable to send OTP',
-        readableApiError(error, 'Please try again.')
-      );
+      const message = readableApiError(error, "We couldn't send the OTP. Please try again.");
+      if (otpStep) setOtpError(message);
+      else setPhoneError(message);
     } finally {
       setAuthLoading(false);
     }
@@ -633,39 +955,24 @@ export default function Passengers({ navigation, route }: any) {
       shakeOtp();
       return;
     }
-
     try {
       setAuthLoading(true);
       setOtpError('');
-
       const result = await verifyOTP(mobile.trim(), otp);
-
-      await saveTokens({
-        access_token: result.access_token,
-        refresh_token: result.refresh_token,
-      });
-
+      await saveTokens({ access_token: result.access_token, refresh_token: result.refresh_token });
+      sessionCache.authed = true;
       setIsAuthenticated(true);
       setLoginVisible(false);
       setOtpStep(false);
       setOtp('');
-
-      await refreshSavedPassengers();
+      await loadAccount();
     } catch (error: any) {
-      const status =
-        error?.status ??
-        error?.statusCode ??
-        error?.response?.status;
-
+      const status = error?.status ?? error?.statusCode ?? error?.response?.status;
       setOtpError(
         status === 401
           ? 'Invalid or expired OTP. Please try again.'
-          : readableApiError(
-              error,
-              'Verification failed. Please try again.'
-            )
+          : readableApiError(error, 'Verification failed. Please try again.')
       );
-
       setOtp('');
       shakeOtp();
     } finally {
@@ -673,221 +980,50 @@ export default function Passengers({ navigation, route }: any) {
     }
   }
 
-  function isLadiesSeat(seat: any): boolean {
-    const value = seat?.ladies_Seat;
+  /* ---- seat assignment ---- */
 
-    return (
-      value === true ||
-      value === 1 ||
-      ['true', '1', 'yes', 'y'].includes(
-        String(value).trim().toLowerCase()
-      )
-    );
-  }
+  const passengerBySeat = useMemo(() => {
+    const map = new Map<number, Passenger>();
+    passengers.forEach(p => map.set(p.seatIndex, p));
+    return map;
+  }, [passengers]);
 
-  function isFemalePassenger(gender: string): boolean {
-    return ['female', 'f', 'woman'].includes(
-      String(gender).trim().toLowerCase()
-    );
-  }
-
-  function showLadiesSeatError() {
-    if (Platform.OS !== 'web') {
-      Vibration.vibrate(250);
-    }
-
-    Alert.alert(
-      'Ladies-only seat',
-      'This seat is reserved for female passengers. Please select a female passenger or choose another seat.',
-      [{ text: 'Got it' }]
-    );
-  }
-
-  function nextCompatibleSeat(
-    gender: string,
-    current: Passenger[] = passengers
-  ) {
-    const occupied = new Set(current.map(p => p.seatIndex));
+  function nextCompatibleSeat(gender: string): number {
     const female = isFemalePassenger(gender);
-
     return selectedSeats.findIndex((seat, index) => {
-      if (occupied.has(index)) return false;
+      if (passengerBySeat.has(index)) return false;
       if (isLadiesSeat(seat) && !female) return false;
       return true;
     });
   }
 
-  function canAssignPassenger(
-    gender: string,
-    current: Passenger[] = passengers
-  ) {
-    return nextCompatibleSeat(gender, current) >= 0;
-  }
-
-  function beginEditPassenger(saved: SavedPassenger) {
-    setEditingPassengerId(saved.passenger_id);
-    setEditDraft({
-      name: saved.name || '',
-      age: String(saved.age ?? ''),
-      gender: saved.gender || '',
-    });
-  }
-
-  function updateEditDraft(
-    field: 'name' | 'age' | 'gender',
-    value: string
-  ) {
-    setEditDraft(current => ({
-      ...current,
-      [field]: value,
-    }));
-  }
-
-  async function savePassengerEdit(saved: SavedPassenger) {
-    const name = editDraft.name.trim();
-    const age = Number(editDraft.age);
-
-    if (!name || !editDraft.age || !editDraft.gender) {
-      Alert.alert(
-        'Passenger details required',
-        'Enter name, age and gender.'
-      );
-      return;
-    }
-
-    if (!Number.isInteger(age) || age < 1 || age > 100) {
-      Alert.alert('Invalid age', 'Enter an age between 1 and 100.');
-      return;
-    }
-
-    try {
-      setUpdatingPassenger(true);
-
-      await request(
-        `/api/v1/users/passengers/${saved.passenger_id}`,
-        {
-          method: 'PUT',
-          body: JSON.stringify({
-            name,
-            age,
-            gender: editDraft.gender,
-          }),
-        }
-      );
-
-      setSavedPassengers(current =>
-        current.map(item =>
-          item.passenger_id === saved.passenger_id
-            ? {
-                ...item,
-                name,
-                age,
-                gender: editDraft.gender,
-              }
-            : item
-        )
-      );
-
-      setPassengers(current =>
-        current
-          .map(item => {
-            if (item.passengerId !== saved.passenger_id) {
-              return item;
-            }
-
-            if (
-              isLadiesSeat(selectedSeats[item.seatIndex]) &&
-              !isFemalePassenger(editDraft.gender)
-            ) {
-              return null;
-            }
-
-            return {
-              ...item,
-              name,
-              age: String(age),
-              gender: editDraft.gender,
-            };
-          })
-          .filter(Boolean) as Passenger[]
-      );
-
-      setEditingPassengerId(null);
-    } catch (error: any) {
-      Alert.alert(
-        'Unable to update passenger',
-        readableApiError(error, 'Please try again.')
-      );
-    } finally {
-      setUpdatingPassenger(false);
-    }
-  }
-
-  async function deleteSavedPassenger(saved: SavedPassenger) {
-    try {
-      setDeletingPassengerId(saved.passenger_id);
-
-      await request(
-        `/api/v1/users/passengers/${saved.passenger_id}`,
-        {
-          method: 'DELETE',
-        }
-      );
-
-      setSavedPassengers(current =>
-        current.filter(
-          item => item.passenger_id !== saved.passenger_id
-        )
-      );
-
-      setPassengers(current =>
-        current.filter(
-          item => item.passengerId !== saved.passenger_id
-        )
-      );
-
-      if (editingPassengerId === saved.passenger_id) {
-        setEditingPassengerId(null);
-      }
-    } catch (error: any) {
-      Alert.alert(
-        'Unable to delete passenger',
-        readableApiError(error, 'Please try again.')
-      );
-    } finally {
-      setDeletingPassengerId(null);
-    }
-  }
-
   function toggleSavedPassenger(saved: SavedPassenger) {
-    const existingIndex = passengers.findIndex(
-      p => p.passengerId === saved.passenger_id
-    );
-
-    if (existingIndex >= 0) {
-      setPassengers(current =>
-        current.filter(p => p.passengerId !== saved.passenger_id)
-      );
+    if (passengers.some(p => p.passengerId === saved.passenger_id)) {
+      setPassengers(current => current.filter(p => p.passengerId !== saved.passenger_id));
       return;
     }
 
-    const seatIndex = nextCompatibleSeat(saved.gender);
+    let seatIndex = nextCompatibleSeat(saved.gender);
 
+    // Seats are full: swap with the most recently added passenger instead of refusing.
     if (seatIndex < 0) {
-      if (!isFemalePassenger(saved.gender)) {
-        showLadiesSeatError();
-      } else {
-        Alert.alert(
-          'No seats available',
-          'There are no unassigned seats available for this passenger.'
-        );
+      const female = isFemalePassenger(saved.gender);
+      const replaced = [...passengers]
+        .reverse()
+        .find(p => female || !isLadiesSeat(selectedSeats[p.seatIndex]));
+      if (!replaced) {
+        if (Platform.OS !== 'web') Vibration.vibrate(250);
+        showToast('The remaining seats are reserved for female passengers.');
+        return;
       }
-      return;
+      seatIndex = replaced.seatIndex;
     }
 
     setPassengers(current => [
-      ...current,
+      ...current.filter(p => p.seatIndex !== seatIndex),
       {
+        title: saved.title,
+        dob: saved.date_of_birth,
         name: saved.name,
         age: String(saved.age ?? ''),
         gender: saved.gender,
@@ -897,674 +1033,563 @@ export default function Passengers({ navigation, route }: any) {
     ]);
   }
 
-  async function saveNewPassenger() {
-    const p = draftPassenger;
+  const openAdd = useCallback((seatIndex: number | null) => {
+    setAddTarget(seatIndex);
+    setShowAdd(true);
+  }, []);
 
-    if (!p.name.trim() || !p.age || !p.gender) {
-      Alert.alert(
-        'Passenger details required',
-        'Enter name, age and gender.'
-      );
-      return;
+  const removeFromSeat = useCallback((seatIndex: number) => {
+    setPassengers(current => current.filter(p => p.seatIndex !== seatIndex));
+  }, []);
+
+  /** Returns null on success, or a short message to show in the sheet. */
+  async function addPassenger(form: Form, saveForLater: boolean): Promise<string | null> {
+    const problem = validateForm(form);
+    if (problem) return problem;
+    const body = toApiBody(form);
+
+    let seatIndex: number;
+    if (addTarget !== null) {
+      if (isLadiesSeat(selectedSeats[addTarget]) && !isFemalePassenger(form.gender)) {
+        return 'This seat is reserved for female passengers.';
+      }
+      seatIndex = addTarget;
+    } else {
+      seatIndex = nextCompatibleSeat(form.gender);
+      if (seatIndex < 0) {
+        return passengers.length >= selectedSeats.length
+          ? 'All seats already have a passenger. Tap a seat above to replace one.'
+          : 'The remaining seats are ladies-only. Tap a seat to assign this passenger.';
+      }
     }
 
-    const age = Number(p.age);
+    let passengerId: string | undefined;
 
-    if (!Number.isInteger(age) || age < 1 || age > 100) {
-      Alert.alert('Invalid age', 'Enter an age between 1 and 100.');
-      return;
+    if (isAuthenticated && saveForLater) {
+      try {
+        setSavingPassenger(true);
+        await request('/api/v1/users/passengers', { method: 'POST', body: JSON.stringify(body) });
+        const list = await refreshSavedPassengers();
+        passengerId = list.find(
+          item =>
+            item.name?.trim().toLowerCase() === body.name.toLowerCase() &&
+            Number(item.age) === body.age &&
+            item.gender?.toLowerCase() === body.gender.toLowerCase()
+        )?.passenger_id;
+      } catch (error: any) {
+        return readableApiError(error, 'Unable to save passenger. Please try again.');
+      } finally {
+        setSavingPassenger(false);
+      }
     }
 
-    if (!isAuthenticated) {
-      Alert.alert(
-        'Sign in required',
-        'Sign in before saving a passenger.',
-        [
-          { text: 'Cancel', style: 'cancel' },
-          { text: 'Sign in', onPress: handleSignIn },
-        ]
-      );
-      return;
-    }
+    setPassengers(current => [
+      ...current.filter(p => p.seatIndex !== seatIndex),
+      {
+        title: body.title,
+        dob: body.date_of_birth,
+        name: body.name,
+        age: String(body.age),
+        gender: body.gender,
+        passengerId,
+        seatIndex,
+      },
+    ]);
+    setShowAdd(false);
+    return null;
+  }
+
+  async function updateSavedPassenger(form: Form): Promise<string | null> {
+    if (!editingPassenger) return null;
+    const problem = validateForm(form);
+    if (problem) return problem;
+    const body = toApiBody(form);
 
     try {
-      setSavingPassenger(true);
-
-      // Save the passenger independently of seat availability.
-      await request('/api/v1/users/passengers', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: p.name.trim(),
-          age,
-          gender: p.gender,
-        }),
+      setEditSaving(true);
+      await request(`/api/v1/users/passengers/${editingPassenger.passenger_id}`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
       });
-
-      const list = await refreshSavedPassengers();
-
-      const match = list.find(
-        item =>
-          item.name?.trim().toLowerCase() ===
-            p.name.trim().toLowerCase() &&
-          Number(item.age) === age &&
-          item.gender?.toLowerCase() === p.gender.toLowerCase()
+      await refreshSavedPassengers();
+      setPassengers(current =>
+        current.map(p =>
+          p.passengerId === editingPassenger.passenger_id
+            ? { ...p, title: body.title, dob: body.date_of_birth, name: body.name, age: String(body.age), gender: body.gender }
+            : p
+        )
       );
-
-      setDraftPassenger({
-        name: '',
-        age: '',
-        gender: '',
-        seatIndex: -1,
-      });
-
-      setShowAddPassenger(false);
-
-      if (!match) {
-        Alert.alert(
-          'Passenger saved',
-          'Passenger was saved, but could not be selected automatically. You can select them from the saved passenger list.'
-        );
-        return;
-      }
-
-      const seatIndex = nextCompatibleSeat(match.gender);
-
-      if (seatIndex < 0) {
-        Alert.alert(
-          'Passenger saved',
-          isFemalePassenger(match.gender)
-            ? 'Passenger saved successfully. No unassigned seat is available.'
-            : 'Passenger saved successfully, but the remaining seats are ladies-only. Select another seat to assign this passenger.'
-        );
-        return;
-      }
-
-      setPassengers(current => [
-        ...current,
-        {
-          name: match.name,
-          age: String(match.age),
-          gender: match.gender,
-          passengerId: match.passenger_id,
-          seatIndex,
-        },
-      ]);
-
-      Alert.alert(
-        'Passenger saved',
-        `${match.name} has been saved and assigned seat ${seatNames[seatIndex]}.`
-      );
+      setEditingPassenger(null);
+      return null;
     } catch (error: any) {
-      Alert.alert(
-        'Unable to save passenger',
-        readableApiError(error, 'Please try again.')
-      );
+      return readableApiError(error, 'Unable to update passenger. Please try again.');
     } finally {
-      setSavingPassenger(false);
+      setEditSaving(false);
     }
   }
 
-  function validateAndContinue() {
+  async function deleteSavedPassenger(): Promise<string | null> {
+    if (!editingPassenger) return null;
+    const id = editingPassenger.passenger_id;
+    try {
+      setEditDeleting(true);
+      await request(`/api/v1/users/passengers/${id}`, { method: 'DELETE' });
+      setSavedPassengers(current => {
+        const next = current.filter(p => p.passenger_id !== id);
+        sessionCache.saved = next;
+        return next;
+      });
+      setPassengers(current => current.filter(p => p.passengerId !== id));
+      setEditingPassenger(null);
+      return null;
+    } catch (error: any) {
+      return readableApiError(error, "Couldn't delete this passenger. Please try again.");
+    } finally {
+      setEditDeleting(false);
+    }
+  }
+
+  /* ---- continue ---- */
+
+  const mobileValid = MOBILE_RE.test(mobile.trim());
+  const emailValid = EMAIL_RE.test(email.trim()); // email is required
+
+  async function validateAndContinue() {
     if (!selectedSeats.length) {
-      Alert.alert(
-        'No seats selected',
-        'Please go back and select seats.'
-      );
+      showToast('No seats selected. Please go back and choose seats.');
       return;
     }
 
     if (passengers.length !== selectedSeats.length) {
-      Alert.alert(
-        'Passenger details incomplete',
-        `Select or add passengers for all ${selectedSeats.length} seats. ${selectedSeats.length - passengers.length} seat(s) remain unassigned.`
-      );
+      const remaining = selectedSeats.length - passengers.length;
+      showToast(`Add ${remaining} more passenger${remaining > 1 ? 's' : ''} to continue.`);
       return;
     }
 
     for (const passenger of passengers) {
-      if (
-        isLadiesSeat(selectedSeats[passenger.seatIndex]) &&
-        passenger.gender.toLowerCase() !== 'female'
-      ) {
-        Alert.alert(
-          'Ladies seat restriction',
-          'A ladies-only seat can only be assigned to a female passenger.'
-        );
+      if (isLadiesSeat(selectedSeats[passenger.seatIndex]) && !isFemalePassenger(passenger.gender)) {
+        showToast('Ladies-only seats need a female passenger.');
         return;
       }
     }
 
-    if (!/^[6-9]\d{9}$/.test(mobile.trim())) {
-      Alert.alert(
-        'Invalid mobile number',
-        'Please enter a valid 10-digit Indian mobile number.'
-      );
+    if (!mobileValid || !emailValid) {
+      setSubmitted(true);
+      showToast(!mobileValid ? 'Please enter a valid mobile number.' : 'Please enter your email address.');
+      setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 50);
       return;
     }
 
+    // Keep the account's contact details in sync (never blocks the booking).
     if (
-      email.trim() &&
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      isAuthenticated &&
+      (mobile.trim() !== savedContact.current.mobile || email.trim() !== savedContact.current.email)
     ) {
-      Alert.alert('Invalid email', 'Please enter a valid email address.');
-      return;
+      try {
+        setSavingContact(true);
+        await request('/api/v1/users/contact-details', {
+          method: 'PUT',
+          body: JSON.stringify({
+            mobile_number: mobile.trim(),
+            email: email.trim(),
+          }),
+        });
+        savedContact.current = { mobile: mobile.trim(), email: email.trim() };
+      } catch (error) {
+        console.warn('[StableBus] Could not update contact details', error);
+      } finally {
+        if (mounted.current) setSavingContact(false);
+      }
     }
 
-    const orderedPassengers = [...passengers].sort(
-      (a, b) => a.seatIndex - b.seatIndex
-    );
+    const orderedPassengers = [...passengers].sort((a, b) => a.seatIndex - b.seatIndex);
 
     const passengerPayload = orderedPassengers.map(passenger => ({
+      title: passenger.title || (isFemalePassenger(passenger.gender) ? 'Ms' : 'Mr'),
       name: passenger.name.trim(),
+      ...(passenger.dob ? { date_of_birth: passenger.dob } : {}),
       age: Number(passenger.age),
       gender: passenger.gender,
       seat: seatNames[passenger.seatIndex],
       seatKey: selectedSeats[passenger.seatIndex]?.seat_Key,
-      ...(passenger.passengerId
-        ? { passenger_id: passenger.passengerId }
-        : {}),
+      ...(passenger.passengerId ? { passenger_id: passenger.passengerId } : {}),
     }));
 
-    const bookingDetails = {
-      ...params,
+    const contact = { mobile: mobile.trim(), email: email.trim() };
+
+    // Hand everything to checkout (expo-router params are strings). `totalFare` includes taxes;
+    // checkout is where the payable amount is shown.
+    const forward: Record<string, string> = {};
+    for (const [key, value] of Object.entries(routeParams)) {
+      forward[key] = Array.isArray(value) ? (value[0] ?? '') : String(value ?? '');
+    }
+
+    console.log('[StableBus] Passenger details validated:', {
       passengers: passengerPayload,
-      contact: {
-        mobile: mobile.trim(),
-        email: email.trim() || null,
-      },
-      selectedSeats,
+      contact,
+      selectedSeats: seatNames,
       selectedBoardingPoint: boarding,
       selectedDroppingPoint: dropping,
       totalFare,
-    };
-
-    navigation.setParams({
-      passengers: passengerPayload,
-      contact: bookingDetails.contact,
     });
 
-    Alert.alert(
-      'Passenger details completed',
-      'Passenger and contact details are ready for the next step.'
-    );
-
-    console.log('[StableBus] Passenger details validated:', {
-      ...bookingDetails,
-      selectedSeats: seatNames,
+    router.push({
+      pathname: CHECKOUT_ROUTE as any,
+      params: {
+        ...forward,
+        passengers: JSON.stringify(passengerPayload),
+        contact: JSON.stringify(contact),
+        selectedBoardingPoint: JSON.stringify(boarding ?? {}),
+        selectedDroppingPoint: JSON.stringify(dropping ?? {}),
+        totalFare: String(totalFare),
+        baseFare: String(baseFare),
+      },
     });
   }
 
-  const busName =
-    bus.operator_Name || bus.travel_Name || 'Selected bus';
-
-  const departureTime = bus.departure_Time || '';
-  const arrivalTime = bus.arrival_Time || '';
+  const sheetOpen = showAdd || !!editingPassenger || loginVisible;
+  const focusContact = () => setTimeout(() => scrollRef.current?.scrollToEnd({ animated: true }), 250);
+  const busName = bus.operator_Name || bus.travel_Name || 'Selected bus';
+  const from = str(routeParams.from) || 'Departure';
+  const to = str(routeParams.to) || 'Destination';
+  const dateLabel = formatDate(str(routeParams.date));
+  const remaining = selectedSeats.length - passengers.length;
+  const boardingTime = getPointTime(boarding, 'boarding');
+  const droppingTime = getPointTime(dropping, 'dropping');
 
   return (
-    <SafeAreaView style={styles.root}>
-      <StatusBar
-        barStyle="dark-content"
-        backgroundColor={C.bg}
-      />
+    <View ref={rootRef} collapsable={false} onLayout={measureRoot} style={styles.root}>
+      <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
-      <KeyboardAvoidingView
-        style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
-        <View style={[styles.header, isWide && styles.wide]}>
-          <Pressable
-            onPress={() => navigation.goBack()}
-            style={styles.backButton}
-          >
+      <View style={{ flex: 1, paddingBottom: sheetOpen ? 0 : keyboardOverlap }}>
+        <View style={[styles.header, isWide && styles.wide, { paddingTop: 10 + insets.top }]}>
+          <Pressable onPress={() => router.back()} style={styles.backButton}>
             <Ionicons name="arrow-back" size={21} color={C.ink} />
           </Pressable>
-
           <View style={styles.headerText}>
             <Text style={styles.headerTitle}>Passenger details</Text>
-            <Text style={styles.headerSubtitle}>
-              Enter details for each selected seat
+            <Text style={styles.headerSubtitle} numberOfLines={1}>
+              {[`${from} → ${to}`, dateLabel].filter(Boolean).join(' · ')}
             </Text>
-          </View>
-
-          <View style={styles.stepBadge}>
-            <Text style={styles.stepText}>3 of 4</Text>
           </View>
         </View>
 
         <ScrollView
-          style={styles.scroll}
-          contentContainerStyle={[
-            styles.content,
-            isWide && styles.wide,
-          ]}
+          ref={scrollRef}
+          style={{ flex: 1 }}
+          contentContainerStyle={[styles.content, isWide && styles.wide]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
-          <View style={styles.tripCard}>
-            <View style={styles.tripTop}>
+          {/* Ticket */}
+          <View style={styles.ticket}>
+            <View style={styles.ticketTop}>
               <View style={styles.busIcon}>
-                <Ionicons
-                  name="bus-outline"
-                  size={22}
-                  color={C.burgundy}
-                />
+                <Ionicons name="bus-outline" size={21} color={C.burgundy} />
               </View>
-
-              <View style={{ flex: 1 }}>
-                <Text style={styles.busName}>{busName}</Text>
-                <Text style={styles.busType}>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.busName} numberOfLines={1}>{busName}</Text>
+                <Text style={styles.busType} numberOfLines={1}>
                   {bus.bus_Type || bus.seat_Layout || 'Bus'}
                 </Text>
               </View>
+              {!!dateLabel && (
+                <View style={styles.datePill}>
+                  <Text style={styles.datePillText}>{dateLabel}</Text>
+                </View>
+              )}
             </View>
 
             <View style={styles.routeRow}>
               <View style={styles.routeStop}>
-                <Text style={styles.routeTime}>
-                  {departureTime || '--'}
-                </Text>
-                <Text style={styles.routeCity}>
-                  {params.from || 'Departure'}
-                </Text>
+                <Text style={styles.routeTime}>{formatClock(String(bus.departure_Time || '')) || '--'}</Text>
+                <Text style={styles.routeCity} numberOfLines={1}>{from}</Text>
               </View>
 
               <View style={styles.routeMiddle}>
                 <View style={styles.routeDot} />
                 <View style={styles.routeDash} />
-                <Ionicons
-                  name="bus-outline"
-                  size={17}
-                  color={C.burgundy}
-                />
+                <Ionicons name="bus-outline" size={16} color={C.burgundy} />
                 <View style={styles.routeDash} />
                 <View style={styles.routeDot} />
               </View>
 
               <View style={[styles.routeStop, { alignItems: 'flex-end' }]}>
-                <Text style={styles.routeTime}>
-                  {arrivalTime || '--'}
-                </Text>
-                <Text style={styles.routeCity}>
-                  {params.to || 'Destination'}
-                </Text>
+                <Text style={styles.routeTime}>{formatClock(String(bus.arrival_Time || '')) || '--'}</Text>
+                <Text style={styles.routeCity} numberOfLines={1}>{to}</Text>
               </View>
             </View>
 
-            <View style={styles.tripDivider} />
+            {/* tear line */}
+            <View style={styles.tear}>
+              <View style={[styles.notch, { left: -10 }]} />
+              <View style={styles.tearLine} />
+              <View style={[styles.notch, { right: -10 }]} />
+            </View>
 
-            <View style={styles.tripMeta}>
-              <View style={styles.metaItem}>
-                <Text style={styles.metaLabel}>Journey date</Text>
-                <Text style={styles.metaValue}>
-                  {params.date || 'Selected date'}
-                </Text>
+            <View style={styles.ticketBottom}>
+              <View style={styles.ticketCol}>
+                <View style={styles.ticketLabelRow}>
+                  <Ionicons name="location-outline" size={14} color={C.burgundy} />
+                  <Text style={styles.metaLabel}>Boarding</Text>
+                </View>
+                <Text style={styles.metaValue} numberOfLines={2}>{getPointName(boarding, 'boarding')}</Text>
+                {!!boardingTime && <Text style={styles.metaTime}>{boardingTime}</Text>}
               </View>
 
-              <View style={styles.metaItem}>
-                <Text style={styles.metaLabel}>Selected seats</Text>
-                <Text style={styles.metaValue}>
-                  {seatNames.join(', ') || 'None'}
-                </Text>
+              <View style={styles.ticketCol}>
+                <View style={styles.ticketLabelRow}>
+                  <Ionicons name="flag-outline" size={14} color={C.burgundy} />
+                  <Text style={styles.metaLabel}>Dropping</Text>
+                </View>
+                <Text style={styles.metaValue} numberOfLines={2}>{getPointName(dropping, 'dropping')}</Text>
+                {!!droppingTime && <Text style={styles.metaTime}>{droppingTime}</Text>}
               </View>
             </View>
 
-            <View style={styles.pointSummary}>
-              <View style={styles.pointSummaryItem}>
-                <Ionicons
-                  name="location-outline"
-                  size={16}
-                  color={C.burgundy}
-                />
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.pointSummaryLabel}>Boarding</Text>
-                  <Text style={styles.pointSummaryName}>
-                    {getPointName(boarding, 'boarding')}
-                  </Text>
-                  {!!getPointTime(boarding, 'boarding') && (
-                    <Text style={styles.pointSummaryTime}>
-                      {formatTime(getPointTime(boarding, 'boarding'))}
-                    </Text>
-                  )}
-                </View>
-              </View>
-
-              <View style={styles.pointSummaryItem}>
-                <Ionicons
-                  name="flag-outline"
-                  size={16}
-                  color={C.burgundy}
-                />
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.pointSummaryLabel}>Dropping</Text>
-                  <Text style={styles.pointSummaryName}>
-                    {getPointName(dropping, 'dropping')}
-                  </Text>
-                  {!!getPointTime(dropping, 'dropping') && (
-                    <Text style={styles.pointSummaryTime}>
-                      {formatTime(getPointTime(dropping, 'dropping'))}
-                    </Text>
-                  )}
-                </View>
+            <View style={styles.seatsStrip}>
+              <Text style={styles.metaLabel}>Seats</Text>
+              <View style={styles.seatTags}>
+                {seatNames.map(name => (
+                  <View key={name} style={styles.seatTag}>
+                    <Text style={styles.seatTagText}>{name}</Text>
+                  </View>
+                ))}
               </View>
             </View>
           </View>
 
-          <View style={styles.headingBlock}>
-            <Text style={styles.heading}>Passenger information</Text>
-            <Text style={styles.subheading}>
-              Select saved passengers or add new passengers.
+          {/* Passengers, one row per seat */}
+          <View style={styles.sectionHeading}>
+            <Text style={styles.sectionTitle}>Passengers</Text>
+            <Text style={styles.sectionMeta}>
+              {passengers.length} of {selectedSeats.length}
             </Text>
           </View>
 
-          <View style={styles.signInCard}>
-            <View style={styles.signInIcon}>
-              <Ionicons
-                name="shield-checkmark-outline"
-                size={21}
-                color={C.burgundy}
-              />
-            </View>
-
-            <View style={styles.signInContent}>
-              <Text style={styles.signInTitle}>
-                {isAuthenticated
-                  ? 'You are signed in'
-                  : 'Sign in to access saved passengers'}
-              </Text>
-
-              <Text style={styles.signInDescription}>
-                {isAuthenticated
-                  ? `${savedPassengers.length} saved passengers available.`
-                  : 'Access your bookings and saved passengers anytime.'}
-              </Text>
-
-              {!isAuthenticated && (
-                <Pressable
-                  onPress={handleSignIn}
-                  style={styles.signInLink}
-                >
-                  <Text style={styles.signInLinkText}>Sign in</Text>
-                  <Ionicons
-                    name="arrow-forward"
-                    size={14}
-                    color={C.burgundy}
-                  />
-                </Pressable>
-              )}
-            </View>
+          <View style={styles.card}>
+            {selectedSeats.map((seat, index) => (
+              <View key={`${seatNames[index]}-${index}`}>
+                {index > 0 && <View style={styles.divider} />}
+                <SeatRow
+                  seatName={seatNames[index]}
+                  ladies={isLadiesSeat(seat)}
+                  passenger={passengerBySeat.get(index)}
+                  onAdd={() => openAdd(index)}
+                  onRemove={() => removeFromSeat(index)}
+                />
+              </View>
+            ))}
+            {!selectedSeats.length && (
+              <Text style={styles.emptyText}>No seats selected. Please go back and select seats.</Text>
+            )}
           </View>
 
-          {isAuthenticated && (
-            <View style={styles.savedListCard}>
-              <Text style={styles.savedListTitle}>Saved passengers</Text>
-              <Text style={styles.savedListSubtitle}>
-                Select passengers to assign them to available seats.
-              </Text>
-
-              {savedPassengers.length === 0 ? (
-                <Text style={styles.emptySavedText}>
-                  No saved passengers yet. Add one below.
-                </Text>
-              ) : (
-                savedPassengers.map(saved => {
-                  const assigned = passengers.find(
-                    p => p.passengerId === saved.passenger_id
-                  );
-
-                  const selected = !!assigned;
-
-                  const noCompatibleSeat =
-                    !selected && !canAssignPassenger(saved.gender);
-
-                  return (
-                    <SavedPassengerRow
-                      key={saved.passenger_id}
-                      passenger={saved}
-                      selected={selected}
-                      seatName={
-                        assigned
-                          ? seatNames[assigned.seatIndex]
-                          : undefined
-                      }
-                      disabled={noCompatibleSeat}
-                      editing={editingPassengerId === saved.passenger_id}
-                      editValue={editDraft}
-                      onToggle={() => toggleSavedPassenger(saved)}
-                      onEdit={() => beginEditPassenger(saved)}
-                      onDelete={() => deleteSavedPassenger(saved)}
-                      onEditChange={updateEditDraft}
-                      onSaveEdit={() => savePassengerEdit(saved)}
-                      onCancelEdit={() => setEditingPassengerId(null)}
-                      savingEdit={updatingPassenger}
-                    />
-                  );
-                })
-              )}
-            </View>
+          {/* Saved passengers / sign in */}
+          {isAuthenticated ? (
+            savedPassengers.length === 0 && accountError ? (
+              <Pressable onPress={loadAccount} style={styles.signInRow}>
+                <Ionicons name="refresh-outline" size={20} color={C.burgundy} />
+                <Text style={styles.signInText}>Couldn't load saved passengers. Tap to retry</Text>
+              </Pressable>
+            ) : savedPassengers.length > 0 && (
+              <>
+                <View style={styles.sectionHeading}>
+                  <Text style={styles.sectionTitle}>Saved passengers</Text>
+                </View>
+                <View style={styles.card}>
+                  {savedPassengers.map((saved, index) => {
+                    const assigned = passengers.find(p => p.passengerId === saved.passenger_id);
+                    return (
+                      <View key={saved.passenger_id}>
+                        {index > 0 && <View style={styles.divider} />}
+                        <SavedRow
+                          passenger={saved}
+                          selected={!!assigned}
+                          seatName={assigned ? seatNames[assigned.seatIndex] : undefined}
+                          onToggle={() => toggleSavedPassenger(saved)}
+                          onEdit={() => setEditingPassenger(saved)}
+                        />
+                      </View>
+                    );
+                  })}
+                </View>
+              </>
+            )
+          ) : (
+            <Pressable onPress={handleSignIn} style={styles.signInRow}>
+              <Ionicons name="person-circle-outline" size={22} color={C.burgundy} />
+              <Text style={styles.signInText}>Sign in to use saved passengers</Text>
+              <Ionicons name="chevron-forward" size={18} color={C.muted} />
+            </Pressable>
           )}
 
-          <Pressable
-            onPress={() => setShowAddPassenger(v => !v)}
-            style={styles.addPassengerButton}
-          >
-            <Ionicons
-              name={showAddPassenger ? 'close' : 'add-circle-outline'}
-              size={18}
-              color={C.burgundy}
-            />
-            <Text style={styles.addPassengerButtonText}>
-              {showAddPassenger ? 'Close passenger form' : 'Add passenger'}
-            </Text>
+          <Pressable onPress={() => openAdd(null)} style={styles.addButton}>
+            <Ionicons name="add" size={20} color={C.burgundy} />
+            <Text style={styles.addButtonText}>Add passenger</Text>
           </Pressable>
 
-          {showAddPassenger && (
-            <PassengerForm
-              value={draftPassenger}
-              onChange={updateDraft}
-              onSave={saveNewPassenger}
-              onCancel={() => setShowAddPassenger(false)}
-              saving={savingPassenger}
-            />
-          )}
-
-          <View style={styles.contactCard}>
-            <View style={styles.contactHeading}>
-              <View style={styles.contactIcon}>
-                <Ionicons
-                  name="call-outline"
-                  size={19}
-                  color={C.burgundy}
-                />
-              </View>
-
-              <View style={{ flex: 1 }}>
-                <Text style={styles.contactTitle}>Contact details</Text>
-                <Text style={styles.contactSubtitle}>
-                  Booking updates will be sent here
-                </Text>
-              </View>
-            </View>
-
-            <View style={styles.field}>
-              <Text style={styles.label}>
-                Mobile number <Text style={styles.required}>*</Text>
-              </Text>
-
-              <View style={styles.phoneInput}>
-                <Text style={styles.countryCode}>+91</Text>
-                <View style={styles.phoneDivider} />
-                <TextInput
-                  value={mobile}
-                  onChangeText={value =>
-                    setMobile(value.replace(/[^0-9]/g, '').slice(0, 10))
-                  }
-                  placeholder="10-digit mobile number"
-                  placeholderTextColor="#A99D95"
-                  keyboardType="phone-pad"
-                  maxLength={10}
-                  style={styles.phoneTextInput}
-                />
-              </View>
-            </View>
-
-            <View style={styles.field}>
-              <Text style={styles.label}>Email address</Text>
-              <TextInput
-                value={email}
-                onChangeText={setEmail}
-                placeholder="you@example.com"
-                placeholderTextColor="#A99D95"
-                keyboardType="email-address"
-                autoCapitalize="none"
-                autoCorrect={false}
-                style={styles.input}
-              />
-              <Text style={styles.optionalText}>Optional</Text>
-            </View>
-          </View>
-
-          <View style={styles.notice}>
-            <Ionicons
-              name="shield-checkmark-outline"
-              size={19}
-              color={C.green}
-            />
-            <Text style={styles.noticeText}>
-              Check passenger names and ages carefully before proceeding.
+          {/* Contact */}
+          <View style={styles.sectionHeading}>
+            <Text style={styles.sectionTitle}>Contact</Text>
+            <Text style={styles.sectionMeta}>
+              {isAuthenticated ? 'Saved to your account' : 'Booking updates are sent here'}
             </Text>
           </View>
+
+          <View style={styles.card}>
+            <Text style={styles.label}>Mobile number</Text>
+            <View style={[styles.phoneInput, submitted && !mobileValid && styles.inputError]}>
+              <Text style={styles.countryCode}>+91</Text>
+              <View style={styles.phoneDivider} />
+              <TextInput
+                value={mobile}
+                onChangeText={v => setMobile(v.replace(/[^0-9]/g, '').slice(0, 10))}
+                placeholder="10-digit mobile number"
+                placeholderTextColor={C.placeholder}
+                keyboardType="phone-pad"
+                maxLength={10}
+                onFocus={focusContact}
+                style={styles.phoneTextInput}
+              />
+            </View>
+            {submitted && !mobileValid && (
+              <Text style={styles.errorText}>Enter a valid 10-digit mobile number.</Text>
+            )}
+
+            <Text style={[styles.label, { marginTop: 14 }]}>
+              Email
+            </Text>
+            <TextInput
+              value={email}
+              onChangeText={setEmail}
+              placeholder="you@example.com"
+              placeholderTextColor={C.placeholder}
+              keyboardType="email-address"
+              autoCapitalize="none"
+              autoCorrect={false}
+              onFocus={focusContact}
+              style={[styles.input, submitted && !emailValid && styles.inputError]}
+            />
+            {submitted && !emailValid && (
+              <Text style={styles.errorText}>
+                {email.trim() ? 'Enter a valid email address.' : 'Enter your email address.'}
+              </Text>
+            )}
+          </View>
+
+          <Text style={styles.note}>Please check names and ages carefully before continuing.</Text>
         </ScrollView>
 
-        <View style={styles.bottomBar}>
-          <View style={styles.fareInfo}>
-            <Text style={styles.fareLabel}>Total seat fare</Text>
-            <Text style={styles.fareValue}>{formatFare(totalFare)}</Text>
-            <Text style={styles.fareSeats}>
-              {selectedSeats.length}{' '}
-              {selectedSeats.length === 1 ? 'seat' : 'seats'}
+        <View
+          style={[
+            styles.bottomBar,
+            isWide && styles.wide,
+            { paddingBottom: sheetOpen || keyboardTop == null ? 12 + insets.bottom : 12 },
+          ]}
+        >
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.fareLabel} numberOfLines={1}>
+              {remaining > 0
+                ? `Add ${remaining} more passenger${remaining > 1 ? 's' : ''}`
+                : `${selectedSeats.length} seat${selectedSeats.length === 1 ? '' : 's'} · all set`}
             </Text>
+            <Text style={styles.fareValue}>{formatFare(baseFare)}</Text>
           </View>
 
           <Pressable
             onPress={validateAndContinue}
-            style={styles.continueButton}
+            disabled={savingContact}
+            style={[styles.continueButton, savingContact && styles.buttonDisabled]}
           >
-            <Text style={styles.continueText}>Continue</Text>
-            <Ionicons
-              name="arrow-forward"
-              size={18}
-              color={C.white}
-            />
+            {savingContact ? (
+              <ActivityIndicator color={C.white} />
+            ) : (
+              <>
+                <Text style={styles.continueText}>Continue</Text>
+                <Ionicons name="arrow-forward" size={18} color={C.white} />
+              </>
+            )}
           </Pressable>
         </View>
-      </KeyboardAvoidingView>
+      </View>
 
-      <Modal
-        visible={loginVisible}
-        transparent
-        animationType="slide"
-        statusBarTranslucent
-        onRequestClose={() => setLoginVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <Pressable
-            style={styles.modalBackdrop}
-            onPress={() => setLoginVisible(false)}
-          />
+      <AddPassengerSheet
+        visible={showAdd}
+        seatName={addTarget !== null ? seatNames[addTarget] : undefined}
+        authenticated={isAuthenticated}
+        saving={savingPassenger}
+        onClose={() => setShowAdd(false)}
+        onSubmit={addPassenger}
+      />
 
-          <KeyboardAvoidingView
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-            style={styles.sheetKeyboard}
-          >
-            <View style={styles.loginSheet}>
-              <View style={styles.sheetHandle} />
+      <EditPassengerSheet
+        visible={!!editingPassenger}
+        passenger={editingPassenger}
+        saving={editSaving}
+        deleting={editDeleting}
+        onClose={() => setEditingPassenger(null)}
+        onSave={updateSavedPassenger}
+        onDelete={deleteSavedPassenger}
+      />
+
+      {/* Sign in */}
+      <BottomSheet visible={loginVisible} onClose={() => setLoginVisible(false)}>
+        <View>
 
               <View style={styles.sheetHeader}>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.sheetTitle}>
-                    {otpStep ? 'Verify your number' : 'Sign in to StableBus'}
-                  </Text>
-
+                  <Text style={styles.sheetTitle}>{otpStep ? 'Verify your number' : 'Sign in'}</Text>
                   <Text style={styles.sheetSubtitle}>
-                    {otpStep
-                      ? `Enter the OTP sent to +91 ${mobile}`
-                      : 'Access your bookings and saved passengers'}
+                    {otpStep ? `Enter the OTP sent to +91 ${mobile}` : 'Use your saved passengers and bookings'}
                   </Text>
                 </View>
-
-                <Pressable
-                  onPress={() => setLoginVisible(false)}
-                  style={styles.sheetClose}
-                >
-                  <Ionicons name="close" size={21} color={C.ink} />
+                <Pressable onPress={() => setLoginVisible(false)} style={styles.iconButton} hitSlop={6}>
+                  <Ionicons name="close" size={22} color={C.ink} />
                 </Pressable>
               </View>
 
               {!otpStep ? (
                 <>
-                  <Text style={styles.sheetLabel}>Mobile number</Text>
-
-                  <View style={styles.sheetPhoneInput}>
+                  <Text style={styles.label}>Mobile number</Text>
+                  <View style={styles.phoneInput}>
                     <Text style={styles.countryCode}>+91</Text>
                     <View style={styles.phoneDivider} />
-
                     <TextInput
                       value={mobile}
-                      onChangeText={value =>
-                        setMobile(value.replace(/[^0-9]/g, '').slice(0, 10))
-                      }
+                      onChangeText={v => setMobile(v.replace(/[^0-9]/g, '').slice(0, 10))}
                       placeholder="10-digit mobile number"
-                      placeholderTextColor="#A99D95"
+                      placeholderTextColor={C.placeholder}
                       keyboardType="phone-pad"
                       maxLength={10}
                       autoFocus
-                      style={styles.sheetPhoneText}
+                      style={styles.phoneTextInput}
                     />
                   </View>
+                  {!!phoneError && <Text style={styles.errorText}>{phoneError}</Text>}
 
                   <Pressable
                     onPress={handleSendOTP}
                     disabled={authLoading}
-                    style={[
-                      styles.sheetPrimaryButton,
-                      authLoading && styles.buttonDisabled,
-                    ]}
+                    style={[styles.primaryButton, authLoading && styles.buttonDisabled]}
                   >
-                    {authLoading ? (
-                      <ActivityIndicator color={C.white} />
-                    ) : (
-                      <Text style={styles.sheetPrimaryText}>Continue</Text>
-                    )}
+                    {authLoading ? <ActivityIndicator color={C.white} /> : <Text style={styles.primaryText}>Send OTP</Text>}
                   </Pressable>
                 </>
               ) : (
                 <>
-                  <Text style={styles.sheetLabel}>6-digit OTP</Text>
-
-                  <Pressable
-                    onPress={() => otpInputRef.current?.focus()}
-                    style={{ width: '100%' }}
-                  >
-                    <Animated.View
-                      style={[
-                        styles.otpBoxesRow,
-                        { transform: [{ translateX: otpShake }] },
-                      ]}
-                    >
+                  <Pressable onPress={() => otpInputRef.current?.focus()} style={{ width: '100%' }}>
+                    <Animated.View style={[styles.otpRow, { transform: [{ translateX: otpShake }] }]}>
                       {Array.from({ length: 6 }).map((_, index) => (
                         <View
                           key={index}
                           style={[
                             styles.otpBox,
-                            otp.length === index &&
-                              !otpError &&
-                              styles.otpBoxActive,
+                            otp.length === index && !otpError && styles.otpBoxActive,
                             !!otpError && styles.otpBoxError,
                           ]}
                         >
-                          <Text style={styles.otpDigit}>
-                            {otp[index] || ''}
-                          </Text>
+                          <Text style={styles.otpDigit}>{otp[index] || ''}</Text>
                         </View>
                       ))}
                     </Animated.View>
@@ -1572,8 +1597,8 @@ export default function Passengers({ navigation, route }: any) {
                     <TextInput
                       ref={otpInputRef}
                       value={otp}
-                      onChangeText={value => {
-                        setOtp(value.replace(/[^0-9]/g, '').slice(0, 6));
+                      onChangeText={v => {
+                        setOtp(v.replace(/[^0-9]/g, '').slice(0, 6));
                         setOtpError('');
                       }}
                       keyboardType="number-pad"
@@ -1582,611 +1607,325 @@ export default function Passengers({ navigation, route }: any) {
                       caretHidden
                       textContentType="oneTimeCode"
                       autoComplete="sms-otp"
-                      style={styles.hiddenOtpInput}
+                      style={styles.hiddenInput}
                     />
                   </Pressable>
 
-                  {!!otpError && (
-                    <Text style={styles.otpErrorText}>{otpError}</Text>
-                  )}
+                  {!!otpError && <Text style={styles.errorText}>{otpError}</Text>}
 
                   <Pressable
                     onPress={handleVerifyOTP}
                     disabled={authLoading}
-                    style={[
-                      styles.sheetPrimaryButton,
-                      authLoading && styles.buttonDisabled,
-                    ]}
+                    style={[styles.primaryButton, authLoading && styles.buttonDisabled]}
                   >
-                    {authLoading ? (
-                      <ActivityIndicator color={C.white} />
-                    ) : (
-                      <Text style={styles.sheetPrimaryText}>
-                        Verify & sign in
-                      </Text>
-                    )}
+                    {authLoading ? <ActivityIndicator color={C.white} /> : <Text style={styles.primaryText}>Verify & sign in</Text>}
                   </Pressable>
 
                   <View style={styles.otpActions}>
                     <Pressable
+                      hitSlop={8}
                       onPress={() => {
                         setOtpStep(false);
                         setOtp('');
                         setOtpError('');
                       }}
                     >
-                      <Text style={styles.sheetTextAction}>
-                        Change number
-                      </Text>
+                      <Text style={styles.linkText}>Change number</Text>
                     </Pressable>
 
-                    <Pressable
-                      disabled={otpCountdown > 0 || authLoading}
-                      onPress={handleSendOTP}
-                    >
-                      <Text
-                        style={[
-                          styles.sheetTextAction,
-                          otpCountdown > 0 && styles.disabledAction,
-                        ]}
-                      >
-                        {otpCountdown > 0
-                          ? `Resend OTP in ${otpCountdown}s`
-                          : 'Resend OTP'}
+                    <Pressable hitSlop={8} disabled={otpCountdown > 0 || authLoading} onPress={handleSendOTP}>
+                      <Text style={[styles.linkText, otpCountdown > 0 && { color: C.muted }]}>
+                        {otpCountdown > 0 ? `Resend in ${otpCountdown}s` : 'Resend OTP'}
                       </Text>
                     </Pressable>
                   </View>
                 </>
               )}
-
-              <Text style={styles.sheetFootnote}>
-                By continuing, you agree to receive booking-related updates from StableBus.
-              </Text>
-            </View>
-          </KeyboardAvoidingView>
         </View>
-      </Modal>
-    </SafeAreaView>
+      </BottomSheet>
+
+      {!!toast && (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.toastWrap,
+            {
+              top: insets.top + 10,
+              opacity: toastAnim,
+              transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-12, 0] }) }],
+            },
+          ]}
+        >
+          <View style={styles.toast}>
+            <View style={styles.toastIcon}>
+              <Ionicons name="information" size={14} color={C.white} />
+            </View>
+            <Text style={styles.toastText}>{toast}</Text>
+          </View>
+        </Animated.View>
+      )}
+    </View>
   );
 }
 
+/* =====================================================
+   Styles: quiet type, light borders, 44px+ touch targets
+===================================================== */
+
 const styles = StyleSheet.create({
-  root: {
-    flex: 1,
-    backgroundColor: C.bg,
-  },
+  root: { flex: 1, backgroundColor: C.bg },
+  wide: { width: '100%', maxWidth: 760, alignSelf: 'center' },
+
   header: {
-    minHeight: 76,
-    paddingHorizontal: 18,
-    paddingVertical: 12,
+    minHeight: 68,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     flexDirection: 'row',
     alignItems: 'center',
     borderBottomWidth: 1,
     borderBottomColor: C.border,
-  },
-  wide: {
-    width: '100%',
-    maxWidth: 760,
-    alignSelf: 'center',
+    backgroundColor: C.paper,
   },
   backButton: {
-    width: 42,
-    height: 42,
-    borderRadius: 14,
-    backgroundColor: C.paper,
-    borderWidth: 1,
-    borderColor: C.border,
+    width: 44,
+    height: 44,
+    borderRadius: 13,
+    backgroundColor: C.bg,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  headerText: {
-    flex: 1,
-    marginLeft: 13,
-  },
-  headerTitle: {
-    color: C.ink,
-    fontSize: 18,
-    fontWeight: '700',
-  },
-  headerSubtitle: {
-    color: C.muted,
-    fontSize: 12,
-    marginTop: 3,
-  },
-  stepBadge: {
-    paddingHorizontal: 11,
-    paddingVertical: 7,
-    borderRadius: 20,
-    backgroundColor: C.burgundyLight,
-  },
-  stepText: {
-    color: C.burgundy,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  scroll: {
-    flex: 1,
-  },
-  content: {
-    padding: 16,
-    paddingBottom: 28,
-  },
-  tripCard: {
+  headerText: { flex: 1, marginLeft: 12 },
+  headerTitle: { color: C.ink, fontSize: 17, fontWeight: '600' },
+  headerSubtitle: { color: C.muted, fontSize: 13, marginTop: 3 },
+
+  content: { padding: 14, paddingBottom: 28 },
+
+  card: {
     backgroundColor: C.paper,
-    borderRadius: 19,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: C.border,
-    padding: 16,
-    marginBottom: 23,
+    paddingHorizontal: 14,
+    paddingVertical: 6,
   },
-  tripTop: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  divider: { height: 1, backgroundColor: C.border },
+
+  ticket: {
+    backgroundColor: C.paper,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 14,
+    shadowColor: '#783D4A',
+    shadowOpacity: 0.07,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 2,
   },
+  ticketTop: { flexDirection: 'row', alignItems: 'center', gap: 11 },
   busIcon: {
-    width: 43,
-    height: 43,
+    width: 42,
+    height: 42,
     borderRadius: 13,
     backgroundColor: C.burgundyLight,
     alignItems: 'center',
     justifyContent: 'center',
-    marginRight: 11,
   },
-  busName: {
-    color: C.ink,
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  busType: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 4,
-  },
-  routeRow: {
-    flexDirection: 'row',
+  busName: { color: C.ink, fontSize: 15, fontWeight: '600' },
+  busType: { color: C.muted, fontSize: 12, marginTop: 3 },
+  datePill: {
+    paddingHorizontal: 10,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: C.bg,
     alignItems: 'center',
-    marginTop: 21,
+    justifyContent: 'center',
   },
-  routeStop: {
-    flex: 1,
-  },
-  routeTime: {
-    color: C.ink,
-    fontSize: 16,
-    fontWeight: '800',
-  },
-  routeCity: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 5,
-  },
+  datePillText: { color: C.burgundy, fontSize: 12, fontWeight: '600' },
+
+  routeRow: { flexDirection: 'row', alignItems: 'center', marginTop: 20 },
+  routeStop: { flex: 1 },
+  routeTime: { color: C.ink, fontSize: 18, fontWeight: '700' },
+  routeCity: { color: C.muted, fontSize: 13, marginTop: 4 },
   routeMiddle: {
     flex: 1.1,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingHorizontal: 7,
+    paddingHorizontal: 6,
   },
-  routeDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-    backgroundColor: C.burgundy,
+  routeDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: C.burgundy },
+  routeDash: { flex: 1, height: 1, backgroundColor: C.border, marginHorizontal: 3 },
+
+  tear: { height: 22, marginTop: 16, marginHorizontal: -16, justifyContent: 'center' },
+  tearLine: {
+    marginHorizontal: 16,
+    borderTopWidth: 1.5,
+    borderStyle: 'dashed',
+    borderColor: '#DCCFC4',
   },
-  routeDash: {
-    flex: 1,
-    height: 1,
-    backgroundColor: C.border,
-  },
-  tripDivider: {
-    height: 1,
-    backgroundColor: C.border,
-    marginVertical: 15,
-  },
-  tripMeta: {
-    flexDirection: 'row',
-  },
-  metaItem: {
-    flex: 1,
-  },
-  metaLabel: {
-    color: C.muted,
-    fontSize: 10,
-  },
-  metaValue: {
-    color: C.ink,
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 5,
-  },
-  pointSummary: {
-    borderTopWidth: 1,
-    borderTopColor: C.border,
-    marginTop: 15,
-    paddingTop: 14,
-    gap: 13,
-  },
-  pointSummaryItem: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: 9,
-  },
-  pointSummaryLabel: {
-    color: C.muted,
-    fontSize: 10,
-  },
-  pointSummaryName: {
-    color: C.ink,
-    fontSize: 12,
-    fontWeight: '700',
-    marginTop: 3,
-  },
-  pointSummaryTime: {
-    color: C.burgundy,
-    fontSize: 11,
-    marginTop: 3,
-  },
-  headingBlock: {
-    marginBottom: 14,
-  },
-  heading: {
-    color: C.ink,
-    fontSize: 18,
-    fontWeight: '800',
-  },
-  subheading: {
-    color: C.muted,
-    fontSize: 12,
-    marginTop: 5,
-    lineHeight: 18,
-  },
-  signInCard: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    backgroundColor: C.paper,
+  notch: {
+    position: 'absolute',
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: C.bg,
     borderWidth: 1,
     borderColor: C.border,
-    borderRadius: 16,
-    padding: 15,
-    marginBottom: 15,
+    top: 1,
   },
-  signInIcon: {
-    width: 38,
-    height: 38,
-    borderRadius: 12,
+
+  ticketBottom: { flexDirection: 'row', gap: 14, marginTop: 6 },
+  ticketCol: { flex: 1, minWidth: 0 },
+  ticketLabelRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  metaLabel: { color: C.muted, fontSize: 12 },
+  metaValue: { color: C.ink, fontSize: 14, fontWeight: '600', marginTop: 5 },
+  metaTime: { color: C.burgundy, fontSize: 13, marginTop: 3 },
+
+  seatsStrip: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  seatTags: { flex: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  seatTag: {
+    minWidth: 34,
+    height: 28,
+    paddingHorizontal: 9,
+    borderRadius: 8,
     backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seatTagText: { color: C.burgundy, fontSize: 13, fontWeight: '600' },
+
+  sectionHeading: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    marginTop: 22,
+    marginBottom: 10,
+    paddingHorizontal: 2,
+  },
+  sectionTitle: { color: C.ink, fontSize: 16, fontWeight: '600' },
+  sectionMeta: { color: C.muted, fontSize: 13 },
+
+  seatRow: { minHeight: 64, flexDirection: 'row', alignItems: 'center', paddingVertical: 8 },
+  seatChip: {
+    minWidth: 44,
+    height: 44,
+    paddingHorizontal: 8,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.bg,
     alignItems: 'center',
     justifyContent: 'center',
     marginRight: 12,
   },
-  signInContent: {
-    flex: 1,
-  },
-  signInTitle: {
-    color: C.ink,
-    fontSize: 13,
-    fontWeight: '700',
-    lineHeight: 19,
-  },
-  signInDescription: {
-    color: C.muted,
-    fontSize: 11,
-    lineHeight: 17,
-    marginTop: 5,
-  },
-  signInLink: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    alignSelf: 'flex-start',
-    gap: 5,
-    marginTop: 10,
-    paddingVertical: 2,
-  },
-  signInLinkText: {
-    color: C.burgundy,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  savedListCard: {
-    backgroundColor: C.paper,
-    borderWidth: 1,
-    borderColor: C.border,
-    borderRadius: 16,
-    padding: 14,
-    marginBottom: 12,
-  },
-  savedListTitle: {
-    color: C.ink,
-    fontSize: 14,
-    fontWeight: '800',
-  },
-  savedListSubtitle: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 4,
-    marginBottom: 10,
-  },
-  emptySavedText: {
-    color: C.muted,
-    fontSize: 11,
-    paddingVertical: 10,
-  },
-  savedRowWrap: {
-    borderTopWidth: 1,
-    borderTopColor: C.border,
-    paddingVertical: 5,
-    paddingHorizontal: 4,
-    borderRadius: 10,
-  },
-  savedRowWrapSelected: {
-    borderWidth: 1,
-    borderColor: C.green,
-    backgroundColor: '#F5FAF6',
-    marginVertical: 3,
-  },
-  savedRowWrapDisabled: {
-    opacity: 0.48,
-  },
-  savedRow: {
-    minHeight: 48,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 5,
-  },
-  savedRowSelect: {
-    flex: 1,
-    minWidth: 0,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 9,
-    paddingVertical: 5,
-  },
-  rowAction: {
-    width: 27,
-    height: 34,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  disabledSavedText: {
-    color: '#9B928D',
-  },
-  checkboxDisabled: {
-    backgroundColor: '#F0ECE8',
-    borderColor: '#D9D1CB',
-  },
-  inlineEditPanel: {
-    paddingTop: 9,
-    paddingBottom: 8,
-    paddingHorizontal: 2,
-    gap: 8,
-  },
-  inlineEditInput: {
-    height: 39,
-    borderRadius: 9,
-    borderWidth: 1,
-    borderColor: C.border,
-    backgroundColor: C.white,
-    paddingHorizontal: 10,
-    color: C.ink,
-    fontSize: 12,
-  },
-  inlineAgeInput: {
-    width: 92,
-  },
-  inlineGenderRow: {
-    flexDirection: 'row',
-    gap: 7,
-  },
-  inlineGenderOption: {
-    minHeight: 34,
-  },
-  inlineEditActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 8,
-    marginTop: 2,
-  },
+  seatChipFilled: { backgroundColor: C.burgundyLight, borderColor: C.burgundyLight },
+  seatChipText: { color: C.muted, fontSize: 14, fontWeight: '600' },
+  seatChipTextFilled: { color: C.burgundy },
+  seatInfo: { flex: 1, minWidth: 0 },
+  seatPassenger: { color: C.ink, fontSize: 15, fontWeight: '500' },
+  seatEmpty: { color: C.burgundy, fontSize: 15 },
+  seatMeta: { color: C.muted, fontSize: 13, marginTop: 3 },
+
+  savedRow: { minHeight: 60, flexDirection: 'row', alignItems: 'center', paddingVertical: 8, gap: 12 },
+  savedName: { color: C.ink, fontSize: 15, fontWeight: '500' },
+  savedMeta: { color: C.muted, fontSize: 13, marginTop: 3 },
+  assignedSeat: { color: C.burgundy, fontSize: 13 },
   checkbox: {
-    width: 21,
-    height: 21,
-    borderWidth: 1.4,
-    borderColor: C.border,
+    width: 22,
+    height: 22,
+    borderWidth: 1.5,
+    borderColor: '#CFC3B9',
     borderRadius: 6,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  checkboxSelected: {
-    backgroundColor: C.burgundy,
-    borderColor: C.burgundy,
-  },
-  savedAvatar: {
-    width: 34,
-    height: 34,
-    borderRadius: 11,
-    backgroundColor: C.burgundyLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  savedAvatarText: {
-    color: C.burgundy,
-    fontWeight: '800',
-    fontSize: 13,
-  },
-  savedInfo: {
-    flex: 1,
-  },
-  savedName: {
-    color: C.ink,
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  savedMeta: {
-    color: C.muted,
-    fontSize: 10,
-    marginTop: 3,
-  },
-  assignedSeat: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    backgroundColor: C.burgundyLight,
-    borderRadius: 8,
-    paddingHorizontal: 8,
-    paddingVertical: 5,
-  },
-  assignedSeatText: {
-    color: C.green,
-    fontSize: 10,
-    fontWeight: '700',
-  },
-  addPassengerButton: {
-    minHeight: 43,
-    borderWidth: 1,
-    borderStyle: 'dashed',
-    borderColor: C.burgundy,
-    borderRadius: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 7,
-    marginBottom: 12,
-    backgroundColor: C.burgundyLight,
-  },
-  addPassengerButtonText: {
-    color: C.burgundy,
-    fontSize: 12,
-    fontWeight: '800',
-  },
-  passengerCard: {
-    backgroundColor: C.paper,
-    borderWidth: 1,
-    borderColor: C.border,
-    borderRadius: 14,
-    padding: 14,
-    marginBottom: 12,
-  },
-  passengerTitle: {
-    color: C.ink,
-    fontSize: 14,
-    fontWeight: '800',
-    marginBottom: 13,
-  },
-  field: {
-    marginBottom: 12,
-  },
-  label: {
-    color: C.ink,
-    fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 6,
-  },
-  required: {
-    color: C.error,
-  },
-  input: {
+  checkboxSelected: { backgroundColor: C.burgundy, borderColor: C.burgundy },
+
+  iconButton: {
+    width: 44,
     height: 44,
-    borderRadius: 11,
-    borderWidth: 1,
-    borderColor: C.border,
-    backgroundColor: C.input,
-    paddingHorizontal: 12,
-    color: C.ink,
-    fontSize: 13,
-    outlineStyle: 'none',
-    outlineWidth: 0,
-  } as any,
-  genderRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  genderOption: {
-    flex: 1,
-    minHeight: 39,
-    flexDirection: 'row',
+    borderRadius: 12,
     alignItems: 'center',
     justifyContent: 'center',
+  },
+
+  signInRow: {
+    marginTop: 14,
+    minHeight: 52,
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: C.border,
-    borderRadius: 11,
-    backgroundColor: C.white,
+    backgroundColor: C.paper,
   },
-  genderOptionSelected: {
-    borderColor: C.burgundy,
-    backgroundColor: C.burgundyLight,
-  },
-  genderText: {
-    color: C.muted,
-    fontSize: 11,
-    fontWeight: '600',
-  },
-  genderTextSelected: {
-    color: C.burgundy,
-    fontWeight: '700',
-  },
-  formActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    gap: 9,
-    marginTop: 8,
-  },
-  cancelPassengerButton: {
-    paddingHorizontal: 14,
-    paddingVertical: 11,
-    borderRadius: 10,
-    backgroundColor: C.bg,
-  },
-  cancelPassengerText: {
-    color: C.muted,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  savePassengerButton: {
+  signInText: { flex: 1, color: C.ink, fontSize: 14 },
+
+  addButton: {
+    marginTop: 12,
+    height: 50,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.paper,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
     gap: 6,
-    paddingHorizontal: 13,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: C.burgundy,
   },
-  savePassengerButtonText: {
-    color: C.white,
-    fontSize: 11,
-    fontWeight: '700',
-  },
-  contactCard: {
-    backgroundColor: C.paper,
+  addButtonText: { color: C.burgundy, fontSize: 15, fontWeight: '500' },
+
+  emptyText: { color: C.muted, fontSize: 14, paddingVertical: 16 },
+  note: { color: C.muted, fontSize: 13, textAlign: 'center', marginTop: 18 },
+
+  /* inputs */
+  label: { color: C.muted, fontSize: 13, marginBottom: 6, marginTop: 4 },
+  optional: { color: C.placeholder },
+  input: {
+    height: 48,
     borderWidth: 1,
     borderColor: C.border,
-    borderRadius: 18,
-    padding: 16,
-    marginTop: 3,
-  },
-  contactHeading: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 18,
-  },
-  contactIcon: {
-    width: 38,
-    height: 38,
     borderRadius: 12,
-    backgroundColor: C.burgundyLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 10,
-  },
-  contactTitle: {
+    paddingHorizontal: 14,
+    backgroundColor: C.white,
     color: C.ink,
-    fontSize: 14,
-    fontWeight: '700',
+    fontSize: 16,
   },
-  contactSubtitle: {
-    color: C.muted,
-    fontSize: 11,
-    marginTop: 3,
+  inputError: { borderColor: C.error },
+  errorText: { color: C.error, fontSize: 13, marginTop: 8 },
+  row: { flexDirection: 'row', gap: 12, marginTop: 10 },
+
+  segmented: {
+    height: 48,
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 12,
+    backgroundColor: C.white,
+    padding: 3,
+    gap: 3,
   },
+  segment: { flex: 1, borderRadius: 9, alignItems: 'center', justifyContent: 'center' },
+  segmentActive: { backgroundColor: C.burgundyLight },
+  segmentText: { color: C.muted, fontSize: 14 },
+  segmentTextActive: { color: C.burgundy, fontWeight: '600' },
+
+  checkRow: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 48, marginTop: 6 },
+  checkRowText: { color: C.ink, fontSize: 14 },
+
   phoneInput: {
     height: 48,
     flexDirection: 'row',
@@ -2194,248 +1933,123 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: C.border,
     borderRadius: 12,
-    backgroundColor: C.input,
-    paddingHorizontal: 13,
+    backgroundColor: C.white,
+    paddingHorizontal: 14,
   },
-  countryCode: {
-    color: C.ink,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  phoneDivider: {
-    height: 23,
-    width: 1,
-    backgroundColor: C.border,
-    marginHorizontal: 12,
-  },
-  phoneTextInput: {
-    flex: 1,
-    height: 48,
-    color: C.ink,
-    fontSize: 13,
-    outlineStyle: 'none',
-    outlineWidth: 0,
-  } as any,
-  optionalText: {
-    color: C.muted,
-    fontSize: 10,
-    marginTop: 5,
-  },
-  notice: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 9,
-    padding: 13,
-    borderRadius: 13,
-    backgroundColor: '#EDF4EE',
-    marginTop: 15,
-  },
-  noticeText: {
-    flex: 1,
-    color: C.ink,
-    fontSize: 11,
-    lineHeight: 16,
-  },
+  countryCode: { color: C.ink, fontSize: 16 },
+  phoneDivider: { width: 1, height: 22, backgroundColor: C.border, marginHorizontal: 12 },
+  phoneTextInput: { flex: 1, color: C.ink, fontSize: 16, paddingVertical: 0 },
+
+  /* bottom bar */
   bottomBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 18,
-    paddingVertical: 13,
-    paddingBottom: 16,
+    gap: 14,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 14,
     backgroundColor: C.paper,
     borderTopWidth: 1,
     borderTopColor: C.border,
   },
-  fareInfo: {
-    flex: 1,
-  },
-  fareLabel: {
-    color: C.muted,
-    fontSize: 11,
-  },
-  fareValue: {
-    color: C.ink,
-    fontSize: 19,
-    fontWeight: '800',
-    marginTop: 3,
-  },
-  fareSeats: {
-    color: C.muted,
-    fontSize: 10,
-    marginTop: 2,
-  },
+  fareLabel: { color: C.muted, fontSize: 13 },
+  fareValue: { color: C.ink, fontSize: 19, fontWeight: '700', marginTop: 3 },
   continueButton: {
-    minWidth: 150,
-    height: 49,
-    borderRadius: 14,
+    height: 50,
+    paddingHorizontal: 24,
+    borderRadius: 13,
     backgroundColor: C.burgundy,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 9,
-    paddingHorizontal: 20,
+    gap: 8,
   },
-  modalOverlay: {
-    flex: 1,
-    justifyContent: 'flex-end',
-    backgroundColor: 'rgba(35, 25, 23, 0.32)',
-  },
-  modalBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  sheetKeyboard: {
-    justifyContent: 'flex-end',
-  },
-  loginSheet: {
-    minHeight: 350,
-    maxHeight: '58%',
+  continueText: { color: C.white, fontSize: 15, fontWeight: '600' },
+
+  /* sheets */
+  overlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(35, 25, 23, 0.36)' },
+  sheet: {
     backgroundColor: C.paper,
-    borderTopLeftRadius: 25,
-    borderTopRightRadius: 25,
-    paddingHorizontal: 22,
-    paddingTop: 12,
-    paddingBottom: Platform.OS === 'ios' ? 30 : 22,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 18,
+    paddingTop: 10,
+    paddingBottom: Platform.OS === 'ios' ? 30 : 20,
   },
-  sheetHandle: {
+  handle: {
     width: 38,
     height: 4,
     borderRadius: 3,
     backgroundColor: C.border,
     alignSelf: 'center',
-    marginBottom: 20,
+    marginBottom: 12,
   },
-  sheetHeader: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    marginBottom: 25,
-  },
-  sheetTitle: {
-    color: C.ink,
-    fontSize: 19,
-    fontWeight: '800',
-  },
-  sheetSubtitle: {
-    color: C.muted,
-    fontSize: 12,
-    marginTop: 6,
-  },
-  sheetClose: {
-    width: 34,
-    height: 34,
-    borderRadius: 11,
-    backgroundColor: C.bg,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  sheetLabel: {
-    color: C.ink,
-    fontSize: 12,
-    fontWeight: '700',
-    marginBottom: 9,
-  },
-  sheetPhoneInput: {
-    height: 52,
-    borderWidth: 1,
-    borderColor: C.border,
-    borderRadius: 13,
+  sheetScroll: { flexGrow: 0, flexShrink: 1 },
+
+  toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center', zIndex: 50, elevation: 50 },
+  toast: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 10,
+    maxWidth: 420,
     paddingHorizontal: 14,
-    backgroundColor: C.white,
+    paddingVertical: 11,
+    borderRadius: 18,
+    backgroundColor: 'rgba(56, 43, 40, 0.95)',
   },
-  sheetPhoneText: {
-    flex: 1,
-    height: 52,
-    color: C.ink,
-    fontSize: 15,
-    outlineStyle: 'none',
-    outlineWidth: 0,
-  } as any,
-  otpBoxesRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 7,
-    width: '100%',
+  toastIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: C.rose,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  otpBox: {
-    flex: 1,
-    height: 51,
+  toastText: { flexShrink: 1, color: C.white, fontSize: 14 },
+  titleRow: { flexDirection: 'row', gap: 8 },
+  titleChip: {
+    minWidth: 60,
+    height: 44,
+    paddingHorizontal: 16,
+    borderRadius: 12,
     borderWidth: 1,
     borderColor: C.border,
-    borderRadius: 10,
     backgroundColor: C.white,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  otpBoxActive: {
-    borderColor: C.burgundy,
-    borderWidth: 1.5,
-    backgroundColor: C.burgundyLight,
-  },
-  otpBoxError: {
-    borderColor: C.error,
-    backgroundColor: '#FFF1F0',
-    borderWidth: 1.5,
-  },
-  otpDigit: {
-    color: C.ink,
-    fontSize: 21,
-    fontWeight: '700',
-  },
-  hiddenOtpInput: {
-    position: 'absolute',
-    width: 1,
-    height: 1,
-    opacity: 0,
-    left: 0,
-    top: 0,
-  },
-  otpErrorText: {
-    color: C.error,
-    fontSize: 11,
-    fontWeight: '600',
-    marginTop: 7,
-  },
-  sheetPrimaryButton: {
-    height: 51,
-    borderRadius: 14,
+  titleChipActive: { backgroundColor: C.burgundyLight, borderColor: C.burgundyLight },
+  titleChipText: { color: C.muted, fontSize: 14 },
+  titleChipTextActive: { color: C.burgundy, fontWeight: '600' },
+  sheetHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 12 },
+  sheetTitle: { color: C.ink, fontSize: 18, fontWeight: '600' },
+  sheetSubtitle: { color: C.muted, fontSize: 13, marginTop: 3 },
+  primaryButton: {
+    height: 52,
+    borderRadius: 13,
     backgroundColor: C.burgundy,
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 18,
   },
-  buttonDisabled: {
-    opacity: 0.65,
+  primaryText: { color: C.white, fontSize: 15, fontWeight: '600' },
+  buttonDisabled: { opacity: 0.6 },
+
+  otpRow: { flexDirection: 'row', gap: 8, marginTop: 4 },
+  otpBox: {
+    flex: 1,
+    height: 52,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.white,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  sheetPrimaryText: {
-    color: C.white,
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  otpActions: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginTop: 18,
-  },
-  sheetTextAction: {
-    color: C.burgundy,
-    fontSize: 12,
-    fontWeight: '700',
-  },
-  disabledAction: {
-    color: C.muted,
-  },
-  sheetFootnote: {
-    color: C.muted,
-    fontSize: 10,
-    lineHeight: 15,
-    marginTop: 22,
-    textAlign: 'center',
-  },
-  continueText: {
-    color: C.white,
-    fontSize: 14,
-    fontWeight: '700',
-  },
+  otpBoxActive: { borderColor: C.burgundy },
+  otpBoxError: { borderColor: C.error },
+  otpDigit: { color: C.ink, fontSize: 20, fontWeight: '600' },
+  hiddenInput: { position: 'absolute', opacity: 0, width: 1, height: 1 },
+  otpActions: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 16 },
+  linkText: { color: C.burgundy, fontSize: 14, paddingVertical: 4 },
 });
