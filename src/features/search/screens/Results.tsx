@@ -2,7 +2,6 @@ import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from '
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import {
   ActivityIndicator,
-  Alert,
   Animated,
   FlatList,
   Keyboard,
@@ -587,7 +586,10 @@ const FilterSheet = memo(function FilterSheet({
 }) {
   const insets = useSafeAreaInsets();
   const { height: windowHeight } = useWindowDimensions();
-  const keyboardHeight = useKeyboardHeight();
+  const backdropRef = useRef<View>(null);
+  const keyboardTop = useKeyboardTop();
+  const { overlap, frame, measure } = useKeyboardOverlap(backdropRef, keyboardTop);
+  const availableHeight = frame.h > 0 ? frame.h : windowHeight;
   const scrollRef = useRef<ScrollView>(null);
   const operatorY = useRef(0);
   const [draft, setDraft] = useState<FilterState>(applied);
@@ -616,7 +618,7 @@ const FilterSheet = memo(function FilterSheet({
 
   return (
     <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
-      <View style={s.modalBackdrop}>
+      <View ref={backdropRef} collapsable={false} onLayout={measure} style={s.modalBackdrop}>
         <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
 
         <View
@@ -625,8 +627,8 @@ const FilterSheet = memo(function FilterSheet({
             !isMobile && s.filterSheetWide,
             {
               // Lift the whole sheet above the keyboard and shrink it to the space that is left.
-              marginBottom: keyboardHeight || (isMobile ? 0 : 20),
-              maxHeight: Math.max(280, windowHeight - keyboardHeight - insets.top - 12),
+              marginBottom: overlap || (isMobile ? 0 : 20),
+              maxHeight: Math.max(280, availableHeight - overlap - insets.top - 12),
             },
           ]}
         >
@@ -677,7 +679,7 @@ const FilterSheet = memo(function FilterSheet({
             )}
           </ScrollView>
 
-          <View style={[s.filterFooter, { paddingBottom: keyboardHeight ? 12 : 16 + insets.bottom }]}>
+          <View style={[s.filterFooter, { paddingBottom: keyboardTop != null ? 12 : 16 + insets.bottom }]}>
             <Pressable style={s.clearButton} onPress={() => setDraft(emptyFilters)}>
               <Text style={s.clearButtonText}>Clear all</Text>
             </Pressable>
@@ -691,24 +693,45 @@ const FilterSheet = memo(function FilterSheet({
   );
 });
 
-/** Moves bottom sheets above the keyboard (Android edge-to-edge does not resize the window). */
-function useKeyboardHeight(): number {
-  const [height, setHeight] = useState(0);
+/** Top edge of the keyboard in screen coordinates (null while it is hidden). */
+function useKeyboardTop(): number | null {
+  const [top, setTop] = useState<number | null>(null);
   useEffect(() => {
     const show = Keyboard.addListener(
       Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
-      e => setHeight(e.endCoordinates?.height ?? 0)
+      e => setTop(e.endCoordinates?.screenY ?? null)
     );
     const hide = Keyboard.addListener(
       Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
-      () => setHeight(0)
+      () => setTop(null)
     );
     return () => {
       show.remove();
       hide.remove();
     };
   }, []);
-  return height;
+  return top;
+}
+
+/**
+ * How much of a full-height container's bottom edge the keyboard actually covers.
+ * Measured, not assumed: if Android already shrank the window for the keyboard the overlap is 0,
+ * so nothing is lifted twice.
+ */
+function useKeyboardOverlap(ref: React.RefObject<View | null>, keyboardTop: number | null) {
+  const [frame, setFrame] = useState({ y: 0, h: 0 });
+  const measure = useCallback(() => {
+    ref.current?.measureInWindow((_x, y, _w, h) => {
+      setFrame(f => (Math.abs(f.y - y) < 1 && Math.abs(f.h - h) < 1 ? f : { y, h }));
+    });
+  }, [ref]);
+  useEffect(() => {
+    measure();
+    const t = setTimeout(measure, 150);
+    return () => clearTimeout(t);
+  }, [keyboardTop, measure]);
+  const overlap = keyboardTop == null ? 0 : Math.max(0, Math.round(frame.y + frame.h - keyboardTop));
+  return { overlap, frame, measure };
 }
 
 /** Calm full-screen loader: a title, one line of context and a thin progress bar. No illustration. */
@@ -800,6 +823,8 @@ export default function Results() {
     return new Date(initial.getFullYear(), initial.getMonth(), 1);
   });
   const [searchingDate, setSearchingDate] = useState(false);
+  // Shown inside the date sheet (a toast would sit behind this modal).
+  const [dateError, setDateError] = useState('');
 
   const todayKey = dateKey(new Date());
   const maxDate = new Date(
@@ -825,6 +850,7 @@ export default function Results() {
     const current = journeyDate ? new Date(`${journeyDate}T00:00:00`) : new Date();
     setSelectedDate(journeyDate || todayKey);
     setCalendarMonth(new Date(current.getFullYear(), current.getMonth(), 1));
+    setDateError('');
     setShowDatePicker(true);
   };
 
@@ -834,20 +860,19 @@ export default function Results() {
 
   const selectDate = (value: string) => {
     if (value < todayKey || value > maxDateKey) return;
+    setDateError('');
     setSelectedDate(value);
   };
 
   const searchForSelectedDate = async () => {
     if (!fromCityId || !toCityId) {
-      const message = 'City IDs are missing. Please go back to Home and search again.';
-      Platform.OS === 'web'
-        ? window.alert(message)
-        : Alert.alert('Unable to search', message);
+      setDateError('Something is missing from this search. Please go back to Home and search again.');
       return;
     }
     if (!selectedDate) return;
 
     setSearchingDate(true);
+    setDateError('');
     try {
       const [year, month, day] = selectedDate.split('-');
       const travel_date = `${month}/${day}/${year}`;
@@ -870,10 +895,7 @@ export default function Results() {
       setAppliedFilters(emptyFilters);
       setShowSort(false);
     } catch (error: any) {
-      const message = error?.message || 'Please try again.';
-      Platform.OS === 'web'
-        ? window.alert(`Search failed: ${message}`)
-        : Alert.alert('Search failed', message);
+      setDateError(error?.message || "We couldn't search buses just now. Please try again.");
     } finally {
       setSearchingDate(false);
     }
@@ -1278,6 +1300,13 @@ export default function Results() {
                 {selectedDate ? formatJourneyDate(selectedDate) : 'Select a date'}
               </Text>
             </View>
+
+            {!!dateError && (
+              <View style={s.dateErrorRow}>
+                <Ionicons name="information-circle-outline" size={16} color={C.burgundy} />
+                <Text style={s.dateErrorText}>{dateError}</Text>
+              </View>
+            )}
 
             <Pressable
               style={[
@@ -1709,6 +1738,8 @@ const s = StyleSheet.create({
     marginTop: 15,
   },
   selectedDateText: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
+  dateErrorRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginTop: 12, paddingHorizontal: 2 },
+  dateErrorText: { flex: 1, color: C.burgundy, fontSize: 13, lineHeight: 19 },
   searchDateButton: {
     height: 52,
     borderRadius: 11,

@@ -426,7 +426,8 @@ function validateForm(f: Form): string | null {
   const age = Number(f.age);
   if (!Number.isInteger(age) || age < 1 || age > 100) return 'Enter an age between 1 and 100.';
   if (!f.gender) return 'Select a gender.';
-  if (f.dob && !isValidDob(f.dob)) return 'Enter date of birth as DD/MM/YYYY.';
+  if (!f.dob.trim()) return 'Enter date of birth as DD/MM/YYYY.';
+  if (!isValidDob(f.dob)) return 'Enter a valid date of birth as DD/MM/YYYY.';
   return null;
 }
 
@@ -436,7 +437,7 @@ function toApiBody(f: Form) {
   return {
     title: f.title || (isFemalePassenger(f.gender) ? 'Ms' : 'Mr'),
     name: f.name.trim(),
-    ...(dob ? { date_of_birth: dob } : {}),
+    date_of_birth: dob,
     age: Number(f.age),
     gender: f.gender,
   };
@@ -506,7 +507,7 @@ const PassengerFields = memo(function PassengerFields({
       </View>
 
       <Text style={[styles.label, { marginTop: 12 }]}>
-        Date of birth <Text style={styles.optional}>(optional)</Text>
+        Date of birth
       </Text>
       <TextInput
         value={form.dob}
@@ -903,16 +904,48 @@ export default function Passengers() {
   }
 
   function readableApiError(error: any, fallback: string) {
+    // FastAPI validation errors (422) arrive as detail: [{ loc: ['body', 'field'], msg: '...' }].
+    const FIELD_LABELS: Record<string, string> = {
+      title: 'Title',
+      name: 'Name',
+      date_of_birth: 'Date of birth',
+      age: 'Age',
+      gender: 'Gender',
+      mobile_number: 'Mobile number',
+      email: 'Email',
+    };
+    const describe = (detail: any): string | null => {
+      if (!Array.isArray(detail) || !detail.length) return null;
+      console.warn('[Passengers] validation detail:', JSON.stringify(detail));
+      return detail
+        .slice(0, 2)
+        .map((item: any) => {
+          const field = Array.isArray(item?.loc) ? String(item.loc[item.loc.length - 1]) : '';
+          const label = FIELD_LABELS[field] || field;
+          const msg = String(item?.msg || 'is not valid').replace(/^Value error, /i, '');
+          return label ? `${label}: ${msg}` : msg;
+        })
+        .join('. ');
+    };
+
+    const fromBody = describe(error?.body?.detail);
+    if (fromBody) return fromBody;
+
     const raw = error?.message ?? error?.detail ?? fallback;
     if (typeof raw !== 'string') return fallback;
-    const jsonStart = raw.indexOf('{');
-    if (jsonStart >= 0) {
+
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
       try {
-        const parsed = JSON.parse(raw.slice(jsonStart));
-        return parsed?.message || parsed?.detail || fallback;
+        const parsed = JSON.parse(trimmed);
+        const listed = describe(Array.isArray(parsed) ? parsed : parsed?.detail);
+        if (listed) return listed;
+        if (typeof parsed?.message === 'string') return parsed.message;
+        if (typeof parsed?.detail === 'string') return parsed.detail;
       } catch {
-        return fallback;
+        /* fall through */
       }
+      return fallback;
     }
     return raw || fallback;
   }

@@ -1,3 +1,4 @@
+
 {
   "expo": {
     "name": "StableBus",
@@ -5,19 +6,29 @@
     "scheme": "stablebus",
     "version": "1.0.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "dark",
+    "userInterfaceStyle": "light",
+
+    "icon": "src/assets/scenic/icon_ticket.png",
+
     "plugins": [
       "expo-router",
       "expo-secure-store",
       "expo-asset",
       "expo-image"
     ],
+
     "android": {
-      "package": "com.stablebus.app"
+      "package": "com.stablebus.app",
+      "adaptiveIcon": {
+        "foregroundImage": "src/assets/scenic/icon_ticket.png",
+        "backgroundColor": "#F8F4ED"
+      }
     },
+
     "ios": {
       "bundleIdentifier": "com.stablebus.app"
     },
+
     "extra": {
       "router": {
         "asyncRoutes": {

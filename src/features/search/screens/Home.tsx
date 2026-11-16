@@ -1,10 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
   Animated,
+  BackHandler,
+  Image,
+  Keyboard,
+  Linking,
   Modal,
   Platform,
+  FlatList,
   Pressable,
   ScrollView,
   StatusBar,
@@ -15,11 +19,15 @@ import {
   useWindowDimensions,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { Image as ExpoImage } from 'expo-image';
+import Svg, { Defs, LinearGradient as SvgLinearGradient, Rect, Stop } from 'react-native-svg';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { sendOTP, verifyOTP } from '@/features/auth/api';
+import { saveTokens, getTokens, clearTokens } from '@/features/auth/tokenStorage';
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
 import { searchApi } from '@/features/search/api';
 import type { City } from '@/types/api';
-import BusLoader from '@/features/search/screens/Busloader';
 import { setSearchResponse } from '@/features/search/resultsCache';
 
 const C = {
@@ -91,6 +99,975 @@ const cityIcon = (name: string): keyof typeof Ionicons.glyphMap => {
   return 'location-outline';
 };
 
+/* ------------------------------------------------------------------ */
+/* Photos: copy the files from scenic_images.zip into assets/scenic/.  */
+/* ------------------------------------------------------------------ */
+const IMAGES = {
+  sunset: require('@/assets/scenic/sunset.jpg'),
+  tirupati: require('@/assets/scenic/tirupati.jpg'),
+  kerala: require('@/assets/scenic/kerala.jpg'),
+  ghats: require('@/assets/scenic/ghats.jpg'),
+  andhra: require('@/assets/scenic/andhra.jpg'),
+  scenicBg: require('@/assets/scenic/scenic_bg.jpg'),
+  hero: require('@/assets/scenic/hero_bg.jpg'),
+  icon: require('@/assets/scenic/icon_ticket.png'),
+  nightLake: require('@/assets/scenic/night_lake.jpg'), // profile menu header only
+  sketchReveal: require('@/assets/scenic/sketch_reveal.webp'), // loading animation 1 (draws itself)
+  sketchBridge: require('@/assets/scenic/sketch_bridge.webp'), // loading animation 2
+};
+
+// Scenes that softly fade in and out while buses are being searched.
+// The loading sketches play one after the other (1, 2, 1, 2, ...) while buses are being searched.
+const SKETCH_ASPECT = 473 / 840; // height / width of the animation files
+const SKETCH_SWITCH_MS = 9500; // each sketch draws itself in ~9 s, rests a moment, then the next one takes over
+const SKETCH_BLEND_MS = 700;
+const LOAD_SKETCHES = [IMAGES.sketchReveal, IMAGES.sketchBridge];
+
+// Replace with your real pages.
+const TERMS_URL = 'https://stablebus.in/terms';
+const PRIVACY_URL = 'https://stablebus.in/privacy';
+
+// Scenic cards: the app looks the cities up by name in the city list from the API.
+// If a name is not in your list the card shows a calm "not available" message.
+const SCENIC_ROUTES = [
+  { key: 'tirupati', title: 'Bengaluru → Tirupati', caption: 'Temple hills at sunrise', from: ['Bengaluru', 'Bangalore'], to: ['Tirupati'], image: IMAGES.tirupati },
+  { key: 'kerala', title: 'Bengaluru → Kerala', caption: 'Backwaters and palm-lined roads', from: ['Bengaluru', 'Bangalore'], to: ['Kochi', 'Cochin', 'Ernakulam', 'Kerala'], image: IMAGES.kerala },
+  { key: 'ghats', title: 'Bengaluru → Goa', caption: 'Misty ghats and waterfalls', from: ['Bengaluru', 'Bangalore'], to: ['Goa', 'Panaji', 'Panjim', 'Madgaon', 'Margao'], image: IMAGES.ghats },
+  { key: 'andhra', title: 'Hyderabad → Vijayawada', caption: 'Green fields, golden hours', from: ['Hyderabad'], to: ['Vijayawada'], image: IMAGES.andhra },
+];
+
+// OFFERS: add, edit or remove entries. Leave the list empty to hide the Offers block.
+// code      -> optional; tapping the card copies it
+// route     -> optional; tapping the card opens this page
+// These three are SAMPLE entries so you can see the layout: replace them with your real offers.
+const OFFERS: { key: string; title: string; caption: string; code?: string; icon: keyof typeof Ionicons.glyphMap; route?: string }[] = [
+  { key: 'first', title: 'Your first trip', caption: 'A small thank-you on your first booking', code: 'WELCOME', icon: 'gift-outline' },
+  { key: 'weekend', title: 'Weekend getaways', caption: 'Plan ahead and travel lighter', code: 'WEEKEND', icon: 'sunny-outline' },
+  { key: 'friends', title: 'Travelling together', caption: 'Book more seats, enjoy the journey', icon: 'people-outline' },
+];
+
+const FOOTER_LINKS: { key: string; label: string; url?: string }[] = [
+  { key: 'help', label: 'Help & support' },
+  { key: 'terms', label: 'Terms', url: TERMS_URL },
+  { key: 'privacy', label: 'Privacy', url: PRIVACY_URL },
+];
+
+const POPULAR_ROUTES: [string, string][] = [
+  ['Bengaluru', 'Hyderabad'],
+  ['Bengaluru', 'Chennai'],
+  ['Hyderabad', 'Vijayawada'],
+  ['Bengaluru', 'Tirupati'],
+  ['Hyderabad', 'Bengaluru'],
+  ['Vijayawada', 'Hyderabad'],
+];
+
+// Drawer: add the route of each page when it exists, e.g. bookings: '/bookings'.
+// Items without a route show a calm "coming soon" message.
+const DRAWER_ITEMS: { key: string; label: string; icon: keyof typeof Ionicons.glyphMap; route?: string }[] = [
+  { key: 'bookings', label: 'Bookings', icon: 'ticket-outline', route: undefined },
+  { key: 'rewards', label: 'Rewards', icon: 'gift-outline', route: undefined },
+  { key: 'personal', label: 'Personal information', icon: 'person-outline', route: undefined },
+  { key: 'passengers', label: 'Passengers', icon: 'people-outline', route: undefined },
+  { key: 'rate', label: 'Rate app', icon: 'star-outline', route: undefined },
+  { key: 'help', label: 'Help', icon: 'help-circle-outline', route: undefined },
+  { key: 'settings', label: 'Account settings', icon: 'settings-outline', route: undefined },
+  { key: 'notifications', label: 'Notifications', icon: 'notifications-outline', route: undefined },
+];
+
+const MOBILE_RE = /^[6-9]\d{9}$/;
+// Soft fade at the bottom of the welcome photo (no hard black band).
+const SCRIM = [0, 0.03, 0.08, 0.16, 0.28, 0.42, 0.56, 0.68, 0.78, 0.84];
+const SCENIC_ON_HOME = 3;
+const OFFER_W = 268;
+
+// Page colour as rgb, used for the soft fades where photos melt into the page.
+const PAGE_RGB = '248,244,237';
+
+// The welcome screen is shown once per app open; "Skip" keeps it away until the app is reopened.
+let welcomeDismissed = false;
+
+function findCity(cities: City[], names: string[]): City | undefined {
+  const lower = names.map(n => n.toLowerCase());
+  return (
+    cities.find(c => lower.includes(c.cityName.toLowerCase())) ||
+    cities.find(c => lower.some(n => c.cityName.toLowerCase().includes(n)))
+  );
+}
+
+function relativeDay(value: string): string {
+  const target = new Date(`${value}T00:00:00`);
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const diff = Math.round((target.getTime() - start.getTime()) / 86400000);
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Tomorrow';
+  if (diff > 1) return `In ${diff} days`;
+  return '';
+}
+
+/* ---------------- City picker (own component: typing never re-renders the whole Home page) ---------------- */
+const CityRow = React.memo(function CityRow({ city, onPick }: { city: City; onPick: (city: City) => void }) {
+  return (
+    <Pressable style={s.cityOption} onPress={() => onPick(city)}>
+      <View style={s.optionIcon}>
+        <Ionicons name="location-outline" size={17} color={C.burgundy} />
+      </View>
+      <Text style={s.optionName}>{city.cityName}</Text>
+      <Ionicons name="chevron-forward" size={16} color={C.muted} />
+    </Pressable>
+  );
+});
+
+const CityPickerModal = React.memo(function CityPickerModal({
+  field,
+  cities,
+  loading,
+  topInset,
+  bottomInset,
+  onPick,
+  onClose,
+}: {
+  field: CityField | null;
+  cities: City[];
+  loading: boolean;
+  topInset: number;
+  bottomInset: number;
+  onPick: (city: City) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const [ready, setReady] = useState(false);
+  const inputRef = useRef<TextInput>(null);
+
+  // Start empty on every open; open the keyboard only after the slide-in has finished.
+  useEffect(() => {
+    if (!field) {
+      setQuery('');
+      setReady(false);
+    }
+  }, [field]);
+
+  const filtered = useMemo(() => {
+    const value = query.trim().toLowerCase();
+    const list = value ? cities.filter(c => c.cityName.toLowerCase().includes(value)) : cities;
+    return list.slice(0, 100);
+  }, [cities, query]);
+
+  const renderItem = useCallback(({ item }: { item: City }) => <CityRow city={item} onPick={onPick} />, [onPick]);
+  const keyExtractor = useCallback((c: City) => `${c.cityID}-${c.cityName}`, []);
+
+  return (
+    <Modal
+      visible={!!field}
+      animationType="fade"
+      presentationStyle="fullScreen"
+      statusBarTranslucent
+      onRequestClose={onClose}
+      onShow={() => {
+        setReady(true);
+        setTimeout(() => inputRef.current?.focus(), 120);
+      }}
+    >
+      <View style={[s.fullScreenPicker, { paddingTop: topInset + 10, paddingBottom: bottomInset }]}>
+        <View style={s.fullScreenPickerHeader}>
+          <Pressable style={s.closeButton} onPress={onClose}>
+            <Ionicons name="arrow-back" size={20} color={C.ink} />
+          </Pressable>
+          <View style={s.pickerTitleWrap}>
+            <Text style={s.modalTitle}>Select {field === 'from' ? 'departure' : 'destination'} city</Text>
+            <Text style={s.modalSubtitle}>Choose your travel city</Text>
+          </View>
+        </View>
+        <View style={s.searchInputWrap}>
+          <Ionicons name="search-outline" size={18} color={C.muted} />
+          <TextInput
+            ref={inputRef}
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search city"
+            placeholderTextColor="#A99B94"
+            style={s.searchInput}
+            returnKeyType="search"
+          />
+          {!!query && (
+            <Pressable onPress={() => setQuery('')} hitSlop={10}>
+              <Ionicons name="close-circle" size={18} color={C.muted} />
+            </Pressable>
+          )}
+        </View>
+        {loading ? (
+          <View style={s.pickerLoading}>
+            <ActivityIndicator color={C.burgundy} size="large" />
+            <Text style={s.pickerLoadingText}>Loading cities…</Text>
+          </View>
+        ) : (
+          <FlatList
+            data={ready ? filtered : filtered.slice(0, 12)}
+            renderItem={renderItem}
+            keyExtractor={keyExtractor}
+            keyboardShouldPersistTaps="always"
+            keyboardDismissMode="on-drag"
+            style={s.cityList}
+            contentContainerStyle={s.fullScreenCityList}
+            initialNumToRender={12}
+            maxToRenderPerBatch={12}
+            windowSize={5}
+            removeClippedSubviews
+            ListEmptyComponent={<Text style={s.emptyText}>No cities found.</Text>}
+          />
+        )}
+      </View>
+    </Modal>
+  );
+});
+
+/** Runs a read-only request again once if the connection was cancelled or timed out. */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e: any) {
+    if (e?.isCancelled || e?.isTimeout || /cancel|abort|interrupted|taking longer/i.test(String(e?.message))) {
+      await new Promise(resolve => setTimeout(resolve, 700));
+      return fn();
+    }
+    throw e;
+  }
+}
+
+function friendlyError(error: any, fallback: string): string {
+  const raw = error?.message;
+  if (typeof raw !== 'string' || !raw.trim()) return fallback;
+  if (raw.trim().startsWith('{') || raw.trim().startsWith('[')) return fallback;
+  return raw;
+}
+
+/** Top edge of the keyboard in screen coordinates (null while it is hidden). */
+function useKeyboardTop(): number | null {
+  const [top, setTop] = useState<number | null>(null);
+  useEffect(() => {
+    const show = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow',
+      e => setTop(e.endCoordinates?.screenY ?? null)
+    );
+    const hide = Keyboard.addListener(
+      Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide',
+      () => setTop(null)
+    );
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+  return top;
+}
+
+/** How much of a full-screen container the keyboard really covers (0 if Android already resized). */
+function useKeyboardOverlap(ref: React.RefObject<View | null>, keyboardTop: number | null) {
+  const [frame, setFrame] = useState({ y: 0, h: 0 });
+  const measure = useCallback(() => {
+    ref.current?.measureInWindow((_x, y, _w, h) => {
+      setFrame(f => (Math.abs(f.y - y) < 1 && Math.abs(f.h - h) < 1 ? f : { y, h }));
+    });
+  }, [ref]);
+  useEffect(() => {
+    measure();
+    const t = setTimeout(measure, 150);
+    return () => clearTimeout(t);
+  }, [keyboardTop, measure]);
+  const overlap = keyboardTop == null ? 0 : Math.max(0, Math.round(frame.y + frame.h - keyboardTop));
+  return { overlap, measure };
+}
+
+/** Cover-fit photo with a focus point, so the bus stays in view on tall phone screens. */
+function FocusImage({
+  source,
+  aspect,
+  focusX,
+  width,
+  height,
+}: {
+  source: any;
+  aspect: number;
+  focusX: number;
+  width: number;
+  height: number;
+}) {
+  let w = height * aspect;
+  let h = height;
+  if (w < width) {
+    w = width;
+    h = width / aspect;
+  }
+  const left = -Math.min(Math.max(focusX * w - width / 2, 0), Math.max(w - width, 0));
+  const top = -(h - height) / 2;
+  return (
+    <View style={{ width, height, overflow: 'hidden' }}>
+      <Image source={source} style={{ width: w, height: h, marginLeft: left, marginTop: top }} resizeMode="cover" />
+    </View>
+  );
+}
+
+function openLink(url: string) {
+  Linking.openURL(url).catch(() => undefined);
+}
+
+/**
+ * Smooth fade from the page colour (at the edge) to transparent.
+ * Built from overlapping layers (no hard stripes, no seams) so it works without a gradient library.
+ */
+function EdgeFade({
+  edge,
+  height,
+  rgb = PAGE_RGB,
+}: {
+  edge: 'top' | 'bottom';
+  height: number;
+  rgb?: string;
+}) {
+  // One SVG gradient instead of dozens of stacked translucent views (much lighter to draw).
+  const id = `edgefade-${edge}-${rgb.replace(/,/g, '-')}`;
+  const stops = useMemo(() => {
+    const smooth = (t: number) => t * t * (3 - 2 * t);
+    const n = 10;
+    const list: { offset: number; opacity: number }[] = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      // the solid edge is at offset 0 for the top fade and at offset 1 for the bottom fade
+      list.push({ offset: t, opacity: edge === 'top' ? 1 - smooth(t) : smooth(t) });
+    }
+    return list;
+  }, [edge]);
+  return (
+    <View
+      pointerEvents="none"
+      style={{ position: 'absolute', left: 0, right: 0, [edge]: 0, height }}
+    >
+      <Svg width="100%" height="100%">
+        <Defs>
+          <SvgLinearGradient id={id} x1="0" y1="0" x2="0" y2="1">
+            {stops.map(st => (
+              <Stop key={st.offset} offset={st.offset} stopColor={`rgb(${rgb})`} stopOpacity={st.opacity} />
+            ))}
+          </SvgLinearGradient>
+        </Defs>
+        <Rect x="0" y="0" width="100%" height="100%" fill={`url(#${id})`} />
+      </Svg>
+    </View>
+  );
+}
+
+/**
+ * Loading sketches: each one draws itself line by line and fills with colour. They play in order and repeat.
+ * Shown whole (nothing cropped), centred, with the top and bottom melting into the page.
+ */
+function SketchLoader({ width }: { width: number }) {
+  const height = Math.round(width * SKETCH_ASPECT);
+  const [layers, setLayers] = useState<{ id: number; index: number }[]>([{ id: 0, index: 0 }]);
+  const fades = useRef<Record<number, Animated.Value>>({ 0: new Animated.Value(1) }).current;
+  const started = useRef<Record<number, boolean>>({});
+  const timers = useRef<ReturnType<typeof setTimeout>[]>([]);
+  const nextId = useRef(1);
+  const alive = useRef(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      timers.current.forEach(clearTimeout);
+    };
+  }, []);
+
+  const handleLoaded = useCallback(
+    (id: number, index: number) => {
+      if (started.current[id] || !alive.current) return;
+      started.current[id] = true;
+
+      // blend this sketch in over the previous one, then drop the older layers
+      if (id > 0) {
+        Animated.timing(fades[id], { toValue: 1, duration: SKETCH_BLEND_MS, useNativeDriver: true }).start(() => {
+          if (alive.current) setLayers(prev => prev.filter(l => l.id >= id));
+        });
+      }
+
+      // after this one has drawn itself, bring in the next one
+      timers.current.push(
+        setTimeout(() => {
+          if (!alive.current) return;
+          const newId = nextId.current++;
+          fades[newId] = new Animated.Value(0);
+          setLayers(prev => [...prev, { id: newId, index: (index + 1) % LOAD_SKETCHES.length }]);
+        }, SKETCH_SWITCH_MS)
+      );
+    },
+    [fades]
+  );
+
+  return (
+    <View style={{ width, height, backgroundColor: C.bg }}>
+      {layers.map(layer => (
+        <Animated.View
+          key={layer.id}
+          style={{ position: 'absolute', left: 0, top: 0, width, height, opacity: fades[layer.id] }}
+        >
+          <ExpoImage
+            source={LOAD_SKETCHES[layer.index]}
+            style={{ width, height }}
+            contentFit="contain"
+            cachePolicy="memory-disk"
+            transition={0}
+            onLoad={() => handleLoaded(layer.id, layer.index)}
+          />
+        </Animated.View>
+      ))}
+      <EdgeFade edge="top" height={Math.round(height * 0.14)} />
+      <EdgeFade edge="bottom" height={Math.round(height * 0.18)} />
+    </View>
+  );
+}
+
+/* ---------------- Scenic card: photo on top, a short calm label underneath ---------------- */
+
+function ScenicCard({ route, onPress }: { route: (typeof SCENIC_ROUTES)[number]; onPress: () => void }) {
+  return (
+    <Pressable
+      style={s.scenicCard}
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`Search buses ${route.title}`}
+    >
+      <Image source={route.image} style={s.scenicPhoto} resizeMode="cover" />
+      <View style={s.scenicBar}>
+        <Text style={s.scenicBarText} numberOfLines={1}>{route.title}</Text>
+      </View>
+    </Pressable>
+  );
+}
+
+/** A card that rises and fades in calmly as it scrolls into view. */
+function RiseIn({
+  scrollY,
+  top,
+  viewport,
+  children,
+}: {
+  scrollY: Animated.Value;
+  top: number; // distance of the card from the top of the scroll content
+  viewport: number;
+  children: React.ReactNode;
+}) {
+  const from = top - viewport;
+  const opacity = scrollY.interpolate({
+    inputRange: [from + viewport * 0.04, from + viewport * 0.38],
+    outputRange: [0, 1],
+    extrapolate: 'clamp',
+  });
+  const translateY = scrollY.interpolate({
+    inputRange: [from + viewport * 0.04, from + viewport * 0.46],
+    outputRange: [56, 0],
+    extrapolate: 'clamp',
+  });
+  const scale = scrollY.interpolate({
+    inputRange: [from + viewport * 0.04, from + viewport * 0.46],
+    outputRange: [0.965, 1],
+    extrapolate: 'clamp',
+  });
+  return <Animated.View style={{ opacity, transform: [{ translateY }, { scale }] }}>{children}</Animated.View>;
+}
+
+/**
+ * Scenic section: a full-width photo backdrop that moves slower than the page (parallax),
+ * glass cards that rise in as you scroll, and soft fades so it melts into the page above and below.
+ */
+function ScenicSection({
+  scrollY,
+  viewport,
+  routes,
+  onPick,
+  onExplore,
+}: {
+  scrollY: Animated.Value;
+  viewport: number;
+  routes: typeof SCENIC_ROUTES;
+  onPick: (route: (typeof SCENIC_ROUTES)[number]) => void;
+  onExplore: () => void;
+}) {
+  const [box, setBox] = useState({ y: 0, h: 900 });
+  const [listY, setListY] = useState(0);
+  const [cardY, setCardY] = useState<Record<string, number>>({});
+  const RANGE = 80;
+
+  const bgShift = scrollY.interpolate({
+    inputRange: [box.y - viewport, box.y + box.h],
+    outputRange: [-RANGE, RANGE],
+    extrapolate: 'clamp',
+  });
+
+  return (
+    <View
+      style={s.scenicSection}
+      onLayout={e => setBox({ y: e.nativeEvent.layout.y, h: e.nativeEvent.layout.height })}
+    >
+      {/* backdrop (taller than the section so it can drift) */}
+      <Animated.Image
+        source={IMAGES.scenicBg}
+        resizeMode="cover"
+        style={[
+          s.scenicBg,
+          { top: -RANGE, height: box.h + RANGE * 2, transform: [{ translateY: bgShift }] },
+        ]}
+      />
+
+      {/* soft fades into the page */}
+      <EdgeFade edge="top" height={150} />
+      <EdgeFade edge="bottom" height={190} />
+
+      <View style={s.scenicInner}>
+        <View style={s.scenicHeading}>
+          <Text style={s.sectionTitle}>Scenic journeys</Text>
+          <Text style={s.sectionSubtitle}>Beautiful roads, one tap away</Text>
+        </View>
+
+        <View onLayout={e => setListY(e.nativeEvent.layout.y)}>
+          {routes.map(route => (
+            <View
+              key={route.key}
+              onLayout={e => {
+                const y = e.nativeEvent.layout.y;
+                setCardY(prev => (prev[route.key] === y ? prev : { ...prev, [route.key]: y }));
+              }}
+            >
+              <RiseIn scrollY={scrollY} top={box.y + listY + (cardY[route.key] ?? 0)} viewport={viewport}>
+                <ScenicCard route={route} onPress={() => onPick(route)} />
+              </RiseIn>
+            </View>
+          ))}
+        </View>
+
+        <Pressable style={s.exploreButton} onPress={onExplore} android_ripple={{ color: C.burgundyLight }}>
+          <Text style={s.exploreText}>Explore all scenic routes</Text>
+          <Ionicons name="arrow-forward" size={16} color={C.burgundy} />
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+/* ---------------- Offers + footer (melts in from the page, sits on a soft tint) ---------------- */
+
+function OffersFooter({
+  bottomInset,
+  onCopy,
+  onOffer,
+  onHelp,
+}: {
+  bottomInset: number;
+  onCopy: (code: string) => void;
+  onOffer: (offer: (typeof OFFERS)[number]) => void;
+  onHelp: () => void;
+}) {
+  return (
+    <View style={s.footer}>
+      <EdgeFade edge="top" height={120} />
+
+      <View style={[s.footerInner, { paddingBottom: bottomInset + 26 }]}>
+        {OFFERS.length > 0 && (
+          <>
+            <View style={s.offersHeading}>
+              <Text style={s.sectionTitle}>Offers for you</Text>
+              <Text style={s.sectionSubtitle}>Small things that make travel nicer</Text>
+            </View>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={s.slider}
+              contentContainerStyle={s.sliderContent}
+              snapToInterval={OFFER_W + 12}
+              decelerationRate="fast"
+            >
+              {OFFERS.map(offer => (
+                <Pressable
+                  key={offer.key}
+                  style={s.offerCard}
+                  onPress={() => (offer.code ? onCopy(offer.code) : onOffer(offer))}
+                  android_ripple={{ color: C.burgundyLight }}
+                >
+                  <View style={s.offerIcon}>
+                    <Ionicons name={offer.icon} size={20} color={C.burgundy} />
+                  </View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <Text style={s.offerTitle} numberOfLines={1}>{offer.title}</Text>
+                    <Text style={s.offerCaption} numberOfLines={2}>{offer.caption}</Text>
+                    {!!offer.code && (
+                      <View style={s.offerCode}>
+                        <Text style={s.offerCodeText}>{offer.code}</Text>
+                        <Ionicons name="copy-outline" size={12} color={C.burgundy} />
+                      </View>
+                    )}
+                  </View>
+                </Pressable>
+              ))}
+            </ScrollView>
+          </>
+        )}
+
+        <View style={[s.footerBrand, OFFERS.length > 0 && { marginTop: 34 }]}>
+          <View style={s.brandMark}>
+            <Ionicons name="bus-outline" size={19} color={C.white} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={s.footerBrandText}>stable<Text style={s.brandAccent}>bus</Text></Text>
+            <Text style={s.footerTagline}>Calm journeys, every time.</Text>
+          </View>
+        </View>
+
+        <View style={s.footerLinks}>
+          {FOOTER_LINKS.map(link => (
+            <Pressable
+              key={link.key}
+              hitSlop={8}
+              onPress={() => (link.url ? openLink(link.url) : onHelp())}
+            >
+              <Text style={s.footerLink}>{link.label}</Text>
+            </Pressable>
+          ))}
+        </View>
+
+        <Text style={s.footerCopy}>© {new Date().getFullYear()} StableBus. Safe travels.</Text>
+      </View>
+    </View>
+  );
+}
+
+/* ---------------- Welcome / login ---------------- */
+
+function WelcomeLogin({
+  visible,
+  onSkip,
+  onLoggedIn,
+}: {
+  visible: boolean;
+  onSkip: () => void;
+  onLoggedIn: () => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const { width, height } = useWindowDimensions();
+  const rootRef = useRef<View>(null);
+  const keyboardTop = useKeyboardTop();
+  const { overlap, measure } = useKeyboardOverlap(rootRef, keyboardTop);
+
+  const [mobile, setMobile] = useState('');
+  const [otp, setOtp] = useState('');
+  const [step, setStep] = useState<'phone' | 'otp'>('phone');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [countdown, setCountdown] = useState(0);
+
+  useEffect(() => {
+    if (countdown <= 0) return;
+    const t = setTimeout(() => setCountdown(c => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [countdown]);
+
+  useEffect(() => {
+    if (!visible) {
+      setStep('phone');
+      setOtp('');
+      setError('');
+    }
+  }, [visible]);
+
+  const [box, setBox] = useState({ w: width, h: height });
+  const phoneValid = MOBILE_RE.test(mobile);
+
+  async function send() {
+    if (busy) return;
+    if (!phoneValid) {
+      setError('Enter a valid 10-digit mobile number.');
+      return;
+    }
+    try {
+      setBusy(true);
+      setError('');
+      await sendOTP(mobile);
+      setStep('otp');
+      setOtp('');
+      setCountdown(45);
+    } catch (e: any) {
+      setError(friendlyError(e, "We couldn't send the OTP. Please try again."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function verify() {
+    if (busy) return;
+    if (!/^\d{6}$/.test(otp)) {
+      setError('Enter the 6-digit code.');
+      return;
+    }
+    try {
+      setBusy(true);
+      setError('');
+      const result = await verifyOTP(mobile, otp);
+      await saveTokens({ access_token: result.access_token, refresh_token: result.refresh_token });
+      onLoggedIn();
+    } catch (e: any) {
+      setOtp('');
+      setError(
+        e?.status === 401
+          ? 'That code is invalid or has expired. Please try again.'
+          : friendlyError(e, 'Verification failed. Please try again.')
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="fade"
+      statusBarTranslucent
+      navigationBarTranslucent
+      onRequestClose={onSkip}
+    >
+      <View
+        ref={rootRef}
+        collapsable={false}
+        style={s.welcomeRoot}
+        onLayout={e => {
+          measure();
+          const { width: w, height: h } = e.nativeEvent.layout;
+          setBox(b => (b.w === w && b.h === h ? b : { w, h }));
+        }}
+      >
+        {/* The photo fills the whole screen */}
+        <View style={StyleSheet.absoluteFill}>
+          <FocusImage source={IMAGES.sunset} aspect={1200 / 675} focusX={0.3} width={box.w} height={box.h} />
+        </View>
+
+        {/* Soft fade for readability, only where the form sits */}
+        <View style={s.scrim} pointerEvents="none">
+          {SCRIM.map((alpha, i) => (
+            <View key={i} style={{ flex: 1, backgroundColor: `rgba(28,16,16,${alpha})` }} />
+          ))}
+        </View>
+
+        <View style={[s.welcomeTop, { paddingTop: insets.top + 10 }]}>
+          <View style={s.welcomeBrand}>
+            <Image source={IMAGES.icon} style={s.brandIcon} resizeMode="contain" />
+            <Text style={s.welcomeBrandText}>stablebus</Text>
+          </View>
+          <Pressable onPress={onSkip} hitSlop={10} style={s.skipButton} accessibilityRole="button">
+            <Text style={s.skipText}>Skip</Text>
+          </Pressable>
+        </View>
+
+        <View
+          style={[
+            s.welcomeForm,
+            { bottom: overlap, paddingBottom: (overlap > 0 ? 0 : insets.bottom) + 20 },
+          ]}
+        >
+          <Text style={s.welcomeTitle}>{step === 'phone' ? 'Welcome aboard' : 'Enter the code'}</Text>
+          <Text style={s.welcomeSubtitle}>
+            {step === 'phone'
+              ? 'Log in to keep your passengers and trips in one place.'
+              : `We sent a 6-digit code to +91 ${mobile}.`}
+          </Text>
+
+          {step === 'phone' ? (
+            <View style={s.inputRow}>
+              <Text style={s.inputPrefix}>+91</Text>
+              <TextInput
+                value={mobile}
+                onChangeText={t => {
+                  setMobile(t.replace(/\D/g, '').slice(0, 10));
+                  if (error) setError('');
+                }}
+                placeholder="Mobile number"
+                placeholderTextColor="#A99B94"
+                keyboardType="number-pad"
+                maxLength={10}
+                style={s.inputField}
+                returnKeyType="done"
+                onSubmitEditing={send}
+              />
+            </View>
+          ) : (
+            <View style={s.inputRow}>
+              <TextInput
+                value={otp}
+                onChangeText={t => {
+                  setOtp(t.replace(/\D/g, '').slice(0, 6));
+                  if (error) setError('');
+                }}
+                placeholder="• • • • • •"
+                placeholderTextColor="#C9BDB6"
+                keyboardType="number-pad"
+                maxLength={6}
+                autoComplete="sms-otp"
+                textContentType="oneTimeCode"
+                style={[s.inputField, s.otpField]}
+                returnKeyType="done"
+                onSubmitEditing={verify}
+              />
+            </View>
+          )}
+
+          {!!error && <Text style={s.welcomeError}>{error}</Text>}
+
+          <Pressable
+            style={[s.welcomeButton, (busy || (step === 'phone' ? !phoneValid : otp.length !== 6)) && s.welcomeButtonOff]}
+            onPress={step === 'phone' ? send : verify}
+            disabled={busy}
+          >
+            {busy ? (
+              <ActivityIndicator color={C.white} />
+            ) : (
+              <Text style={s.welcomeButtonText}>{step === 'phone' ? 'Continue' : 'Verify and continue'}</Text>
+            )}
+          </Pressable>
+
+          {step === 'otp' && (
+            <View style={s.otpLinks}>
+              <Pressable onPress={() => { setStep('phone'); setOtp(''); setError(''); }} hitSlop={8}>
+                <Text style={s.welcomeLink}>Change number</Text>
+              </Pressable>
+              <Pressable onPress={send} disabled={countdown > 0 || busy} hitSlop={8}>
+                <Text style={[s.welcomeLink, countdown > 0 && { opacity: 0.6 }]}>
+                  {countdown > 0 ? `Resend in ${countdown}s` : 'Resend code'}
+                </Text>
+              </Pressable>
+            </View>
+          )}
+
+          <Text style={s.termsOnPhoto}>
+            By continuing you agree to our{' '}
+            <Text style={s.termsOnPhotoLink} onPress={() => openLink(TERMS_URL)}>Terms &amp; Conditions</Text>
+            {' '}and{' '}
+            <Text style={s.termsOnPhotoLink} onPress={() => openLink(PRIVACY_URL)}>Privacy Policy</Text>.
+          </Text>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+/* ---------------- Profile drawer (full screen, slides in from the left) ---------------- */
+
+function ProfileDrawer({
+  visible,
+  authed,
+  onClose,
+  onLogin,
+  onLogout,
+  onItem,
+}: {
+  visible: boolean;
+  authed: boolean;
+  onClose: () => void;
+  onLogin: () => void;
+  onLogout: () => void;
+  onItem: (item: (typeof DRAWER_ITEMS)[number]) => void;
+}) {
+  const insets = useSafeAreaInsets();
+  const { width } = useWindowDimensions();
+  const slide = useRef(new Animated.Value(-width)).current;
+  const [rendered, setRendered] = useState(false);
+
+  useEffect(() => {
+    if (!visible) return;
+    setRendered(true);
+    slide.setValue(-width);
+    Animated.timing(slide, { toValue: 0, duration: 260, useNativeDriver: true }).start();
+  }, [visible, slide, width]);
+
+  const close = useCallback(
+    (after?: () => void) => {
+      Animated.timing(slide, { toValue: -width, duration: 220, useNativeDriver: true }).start(() => {
+        setRendered(false);
+        onClose();
+        after?.();
+      });
+    },
+    [slide, width, onClose]
+  );
+
+  return (
+    <Modal visible={rendered} transparent animationType="none" statusBarTranslucent navigationBarTranslucent onRequestClose={() => close()}>
+      <Animated.View style={[s.drawer, { transform: [{ translateX: slide }] }]}>
+        {/* moonlit header photo, melts into the page */}
+        <View style={{ height: insets.top + 190 }}>
+          <FocusImage
+            source={IMAGES.nightLake}
+            aspect={1000 / 563}
+            focusX={0.42}
+            width={width}
+            height={insets.top + 190}
+          />
+          <EdgeFade edge="bottom" height={84} />
+          <Pressable
+            onPress={() => close()}
+            style={[s.drawerClose, { top: insets.top + 10 }]}
+            accessibilityRole="button"
+            accessibilityLabel="Close menu"
+          >
+            <Ionicons name="close" size={20} color="#fff" />
+          </Pressable>
+        </View>
+
+        <View style={s.drawerWho}>
+          <View style={s.drawerAvatar}>
+            <Ionicons name="person-outline" size={26} color={C.burgundy} />
+          </View>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={s.drawerHello}>{authed ? 'Welcome back' : 'Hello, traveller'}</Text>
+            {authed ? (
+              <Text style={s.drawerSub}>Your trips and details</Text>
+            ) : (
+              <Pressable onPress={() => close(onLogin)} hitSlop={8}>
+                <Text style={s.linkText}>Log in or sign up</Text>
+              </Pressable>
+            )}
+          </View>
+        </View>
+
+        <ScrollView contentContainerStyle={s.drawerList} showsVerticalScrollIndicator={false}>
+          {DRAWER_ITEMS.map((item, index) => (
+            <Pressable
+              key={item.key}
+              style={[s.drawerRow, index > 0 && s.drawerRowBorder]}
+              onPress={() => close(() => onItem(item))}
+              android_ripple={{ color: C.burgundyLight }}
+            >
+              <View style={s.drawerIcon}>
+                <Ionicons name={item.icon} size={19} color={C.burgundy} />
+              </View>
+              <Text style={s.drawerLabel}>{item.label}</Text>
+              <Ionicons name="chevron-forward" size={17} color={C.muted} />
+            </Pressable>
+          ))}
+        </ScrollView>
+
+        <View style={[s.drawerFooter, { paddingBottom: insets.bottom + 16 }]}>
+          {authed && (
+            <Pressable style={s.logoutRow} onPress={() => close(onLogout)}>
+              <Ionicons name="log-out-outline" size={19} color={C.muted} />
+              <Text style={s.logoutText}>Log out</Text>
+            </Pressable>
+          )}
+          <Text style={s.drawerLegal}>
+            <Text style={s.termsLink} onPress={() => openLink(TERMS_URL)}>Terms &amp; Conditions</Text>
+            {'   ·   '}
+            <Text style={s.termsLink} onPress={() => openLink(PRIVACY_URL)}>Privacy Policy</Text>
+          </Text>
+        </View>
+      </Animated.View>
+    </Modal>
+  );
+}
+
 export default function Home() {
   const router = useRouter();
   const { width } = useWindowDimensions();
@@ -102,18 +1079,106 @@ export default function Home() {
   const [journeyDate, setJourneyDate] = useState(dateKey(new Date()));
 
   const [picker, setPicker] = useState<CityField | null>(null);
-  const [query, setQuery] = useState('');
   const [calendarVisible, setCalendarVisible] = useState(false);
 
   const [loadingCities, setLoadingCities] = useState(true);
   const [searching, setSearching] = useState(false);
   const [cityError, setCityError] = useState('');
   const [preferencesLoaded, setPreferencesLoaded] = useState(false);
-  const [routeFeedback, setRouteFeedback] = useState('');
   const [searchMessage, setSearchMessage] = useState('');
   const progress = useRef(new Animated.Value(0)).current;
   const searchingRef = useRef(false);
   const loaderWidth = Math.min(width - 50, 520);
+  const insets = useSafeAreaInsets();
+
+  const [authed, setAuthed] = useState(false);
+  const [welcomeVisible, setWelcomeVisible] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [scenicOpen, setScenicOpen] = useState(false);
+  const scrollY = useRef(new Animated.Value(0)).current;
+  const { height: viewportHeight } = useWindowDimensions();
+
+  // Calm, non-blocking message (replaces Alert boxes).
+  const [toast, setToast] = useState<string | null>(null);
+  const toastAnim = useRef(new Animated.Value(0)).current;
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback(
+    (message: string) => {
+      setToast(message);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      Animated.timing(toastAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+      toastTimer.current = setTimeout(() => {
+        Animated.timing(toastAnim, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => setToast(null));
+      }, 3000);
+    },
+    [toastAnim]
+  );
+  useEffect(
+    () => () => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    },
+    []
+  );
+
+  // First open: not logged in -> show the welcome screen (once per app open).
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const tokens = await getTokens();
+        if (!alive) return;
+        setAuthed(!!tokens);
+        if (!tokens && !welcomeDismissed) setWelcomeVisible(true);
+      } catch {
+        if (alive && !welcomeDismissed) setWelcomeVisible(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const skipWelcome = () => {
+    welcomeDismissed = true;
+    setWelcomeVisible(false);
+  };
+
+  const handleLoggedIn = () => {
+    welcomeDismissed = true;
+    setAuthed(true);
+    setWelcomeVisible(false);
+    showToast('You are logged in.');
+  };
+
+  const handleLogout = async () => {
+    try {
+      await clearTokens();
+    } catch {
+      /* ignore */
+    }
+    setAuthed(false);
+    showToast('You have been logged out.');
+  };
+
+  const copyOffer = async (code: string) => {
+    try {
+      // expo-clipboard is optional: without it the code is simply shown in the message.
+      const Clipboard = require('expo-clipboard');
+      await Clipboard.setStringAsync(code);
+      showToast(`Code ${code} copied.`);
+    } catch {
+      showToast(`Your code: ${code}`);
+    }
+  };
+
+  const handleOffer = (offer: (typeof OFFERS)[number]) => {
+    if (offer.route) router.push(offer.route as any);
+  };
+
+  const handleDrawerItem = (item: (typeof DRAWER_ITEMS)[number]) => {
+    if (item.route) router.push(item.route as any);
+    else showToast(`${item.label} is coming soon.`);
+  };
 
   useEffect(() => {
     searchingRef.current = searching;
@@ -177,7 +1242,7 @@ export default function Home() {
         setLoadingCities(true);
         setCityError('');
 
-        const response = await searchApi.cities();
+        const response = await withRetry(() => searchApi.cities());
         const cityList = Array.isArray(response?.cityDetails)
           ? response.cityDetails
           : [];
@@ -228,16 +1293,6 @@ export default function Home() {
       journeyDate,
     });
   }, [from, to, journeyDate, preferencesLoaded]);
-
-  const filteredCities = useMemo(() => {
-    const value = query.trim().toLowerCase();
-
-    return cities
-      .filter((city) =>
-        city.cityName.toLowerCase().includes(value)
-      )
-      .slice(0, 100);
-  }, [cities, query]);
 
   const quickDates = useMemo(
     () =>
@@ -297,13 +1352,11 @@ export default function Home() {
 
   const openPicker = (field: CityField) => {
     if (picker) return;
-    setQuery('');
     setPicker(field);
   };
 
   const closePicker = () => {
     setPicker(null);
-    setQuery('');
   };
 
   const selectCity = (city: City) => {
@@ -318,22 +1371,25 @@ export default function Home() {
     closePicker();
   };
 
+  const selectCityRef = useRef(selectCity);
+  selectCityRef.current = selectCity;
+  const onPickCity = useCallback((city: City) => selectCityRef.current(city), []);
+
   const swapCities = () => {
     setFrom(to);
     setTo(from);
   };
 
   const choosePopularRoute = (fromName: string, toName: string) => {
-    const departure = cities.find(c => c.cityName.toLowerCase() === fromName.toLowerCase());
-    const destination = cities.find(c => c.cityName.toLowerCase() === toName.toLowerCase());
+    const departure = findCity(cities, [fromName]);
+    const destination = findCity(cities, [toName]);
     if (!departure || !destination) {
-      Alert.alert('Route unavailable', 'This route is not currently available.');
+      showToast('This route is not available right now.');
       return;
     }
     setFrom(departure);
     setTo(destination);
-    setRouteFeedback(`${departure.cityName} → ${destination.cityName} selected`);
-    setTimeout(() => setRouteFeedback(''), 1800);
+    showToast(`${departure.cityName} → ${destination.cityName} selected`);
   };
 
   const openCalendar = () => {
@@ -361,80 +1417,95 @@ export default function Home() {
     );
   };
 
-  const searchBuses = async () => {
-  if (searching) return;
-  if (!from || !to) {
-    const message = 'Please select both departure and destination cities.';
-    Platform.OS === 'web'
-      ? window.alert(message)
-      : Alert.alert('Choose your route', message);
-    return;
-  }
+  const runSearch = async (fromCity: City, toCity: City) => {
+    if (searching) return;
 
-  if (String(from.cityID) === String(to.cityID)) {
-    const message = 'Departure and destination must be different.';
-    Platform.OS === 'web'
-      ? window.alert(message)
-      : Alert.alert('Invalid route', message);
-    return;
-  }
+    setSearchMessage(`${fromCity.cityName}  →  ${toCity.cityName}`);
+    setSearching(true);
 
-  setSearchMessage(`${from.cityName}  →  ${to.cityName}`);
-  setSearching(true);
+    try {
+      // Convert YYYY-MM-DD to MM/DD/YYYY
+      const [year, month, day] = journeyDate.split('-');
+      const travel_date = `${month}/${day}/${year}`;
 
-  try {
-    // Convert YYYY-MM-DD to MM/DD/YYYY
-    const [year, month, day] = journeyDate.split('-');
-    const travel_date = `${month}/${day}/${year}`;
+      const response = await withRetry(() =>
+        searchApi.buses({
+          from_city: String(fromCity.cityID),
+          to_city: String(toCity.cityID),
+          travel_date,
+        })
+      );
 
-    const response = await searchApi.buses({
-      from_city: String(from.cityID),
-      to_city: String(to.cityID),
-      travel_date,
-    });
+      // Hand the response over in memory, then open Results once the API has fully answered.
+      setSearchResponse(response);
+      router.push({
+        pathname: '/results',
+        params: {
+          from: fromCity.cityName,
+          to: toCity.cityName,
+          date: journeyDate,
+          fromCityId: String(fromCity.cityID),
+          toCityId: String(toCity.cityID),
+        },
+      });
+      // The loader stays until Home loses focus (see useFocusEffect); this is only a safety net.
+      setTimeout(() => setSearching(false), 30000);
+    } catch (error: any) {
+      setSearching(false);
+      showToast(`Search failed: ${error?.message || 'Please try again.'}`);
+    }
+  };
 
-    // Navigate only after the API has returned the complete response.
-    // Keep the loading overlay mounted while the Results route transitions in.
-    // Hand the response over in memory instead of stringifying it into a route param.
-    setSearchResponse(response);
-    router.push({
-      pathname: '/results',
-      params: {
-        from: from.cityName,
-        to: to.cityName,
-        date: journeyDate,
-        fromCityId: String(from.cityID),
-        toCityId: String(to.cityID),
-      },
-    });
-    // Do NOT hide the loader here. Results is still mounting, and hiding now
-    // briefly shows Home again. useFocusEffect above hides it once Home blurs.
-    // Safety net in case navigation never blurs Home:
-    setTimeout(() => setSearching(false), 30000);
-  } catch (error: any) {
-    const message = error?.message || 'Please try again.';
-    setSearching(false);
-    Platform.OS === 'web'
-      ? window.alert(`Search failed: ${message}`)
-      : Alert.alert('Search failed', message);
-  }
-};
+  const searchBuses = () => {
+    if (searching) return;
+    if (!from || !to) {
+      showToast('Please choose both departure and destination cities.');
+      return;
+    }
+    if (String(from.cityID) === String(to.cityID)) {
+      showToast('Departure and destination must be different.');
+      return;
+    }
+    runSearch(from, to);
+  };
+
+  // From the full-screen list: close it first, then search (two modals must not swap at the same moment).
+  const pickScenic = (route: (typeof SCENIC_ROUTES)[number]) => {
+    if (scenicOpen) {
+      setScenicOpen(false);
+      setTimeout(() => openScenicRoute(route), 350);
+    } else {
+      openScenicRoute(route);
+    }
+  };
+
+  const openScenicRoute = (route: (typeof SCENIC_ROUTES)[number]) => {
+    const fromCity = findCity(cities, route.from);
+    const toCity = findCity(cities, route.to);
+    if (!fromCity || !toCity) {
+      showToast('This route is not available right now.');
+      return;
+    }
+    setFrom(fromCity);
+    setTo(toCity);
+    runSearch(fromCity, toCity);
+  };
 
   return (
     <View style={s.root}>
       <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
 
-      <ScrollView
+      <Animated.ScrollView
         showsVerticalScrollIndicator={false}
         contentContainerStyle={s.scroll}
+        scrollEventThrottle={16}
+        onScroll={Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: true })}
       >
         {/* HEADER */}
-        <View style={s.header}>
+        <View style={[s.header, { paddingTop: insets.top }]}>
           <View style={[s.headerInner, !isMobile && s.wide]}>
             <View style={s.brandRow}>
-              <View style={s.brandMark}>
-                <Ionicons name="bus-outline" size={19} color={C.white} />
-              </View>
+              <Image source={IMAGES.icon} style={s.brandIcon} resizeMode="contain" />
               <Text style={s.brand}>
                 stable<Text style={s.brandAccent}>bus</Text>
               </Text>
@@ -447,34 +1518,29 @@ export default function Home() {
                   <Text style={s.helpText}>Help & support</Text>
                 </Pressable>
               )}
-              <Pressable style={s.profile}>
+              <Pressable
+                style={s.profile}
+                onPress={() => setDrawerOpen(true)}
+                accessibilityRole="button"
+                accessibilityLabel="Open menu"
+              >
                 <Ionicons name="person-outline" size={17} color={C.burgundy} />
               </Pressable>
             </View>
           </View>
         </View>
 
-        {/* QUIET HERO */}
-        <View style={[s.hero, isMobile && s.heroMobile]}>
-          <View style={[s.heroInner, !isMobile && s.wide]}>
-            <View style={s.heroCopy}>
-              <Text style={s.heroEyebrow}>TRAVEL, MADE SIMPLE</Text>
-              <Text style={[s.heroTitle, isMobile && s.heroTitleMobile]}>
-                Your journey starts here.
-              </Text>
-              <Text style={s.heroSubtitle}>
-                Find your bus. Pick your seat. Enjoy the journey.
-              </Text>
-            </View>
-
-            <View style={[s.heroArtwork, isMobile && s.heroArtworkMobile]}>
-              <Ionicons
-                name="bus-outline"
-                size={isMobile ? 54 : 76}
-                color="#F4E9E5"
-              />
-            </View>
-          </View>
+        {/* HERO PHOTO: blends into the page and into the booking card */}
+        <View style={{ height: isMobile ? 310 : 340, backgroundColor: C.bg }}>
+          <FocusImage
+            source={IMAGES.hero}
+            aspect={1672 / 941}
+            focusX={0.5}
+            width={width}
+            height={isMobile ? 310 : 340}
+          />
+          <EdgeFade edge="top" height={34} />
+          <EdgeFade edge="bottom" height={78} />
         </View>
 
         {/* BOOKING CARD */}
@@ -554,11 +1620,14 @@ export default function Home() {
             <View style={s.dateHeading}>
               <View>
                 <Text style={s.fieldLabel}>JOURNEY DATE</Text>
-                <Text style={s.dateHint}>
-                  {new Date(`${journeyDate}T00:00:00`).toLocaleDateString('en-IN', {
-                    weekday: 'short', day: 'numeric', month: 'short', year: 'numeric',
-                  })}
-                </Text>
+                <View style={s.dateSummary}>
+                  <Ionicons name="calendar" size={15} color={C.burgundy} />
+                  <Text style={s.dateSummaryText}>
+                    {new Date(`${journeyDate}T00:00:00`).toLocaleDateString('en-IN', {
+                      weekday: 'short', day: 'numeric', month: 'short', year: 'numeric',
+                    })}
+                  </Text>
+                </View>
               </View>
 
               <Pressable style={s.calendarButton} onPress={openCalendar}>
@@ -573,7 +1642,7 @@ export default function Home() {
               showsHorizontalScrollIndicator={false}
               contentContainerStyle={s.dateRow}
             >
-              {quickDates.map((value, index) => {
+              {(quickDates.includes(journeyDate) ? quickDates : [journeyDate, ...quickDates]).map(value => {
                 const date = dateInfo(value);
                 const active = journeyDate === value;
 
@@ -588,7 +1657,7 @@ export default function Home() {
                     ]}
                   >
                     <Text style={[s.dateMonth, active && s.dateActiveText]}>
-                      {index === 0 ? 'TODAY' : date.month.toUpperCase()}
+                      {value === todayKey ? 'TODAY' : date.month.toUpperCase()}
                     </Text>
                     <Text style={[s.dateNumber, active && s.dateActiveText]}>
                       {date.day}
@@ -615,151 +1684,96 @@ export default function Home() {
           </View>
         </View>
 
-        {/* POPULAR ROUTES */}
+        {/* POPULAR ROUTES: one calm row you can slide */}
         <View style={[s.popularSection, !isMobile && s.wide]}>
           <View style={s.sectionHeading}>
             <View>
               <Text style={s.sectionTitle}>Popular routes</Text>
-              <Text style={s.sectionSubtitle}>Choose a route to fill your search</Text>
-            </View>
-            <View style={s.popularTag}>
-              <Ionicons name="trending-up-outline" size={13} color={C.burgundy} />
-              <Text style={s.popularTagText}>Popular</Text>
+              <Text style={s.sectionSubtitle}>Tap a route to fill your search</Text>
             </View>
           </View>
           {loadingCities ? (
-            <ActivityIndicator color={C.burgundy} style={{ marginTop: 22 }} />
+            <ActivityIndicator color={C.burgundy} style={{ marginTop: 12 }} />
           ) : cityError ? (
             <View style={s.errorCard}>
               <Ionicons name="alert-circle-outline" size={19} color={C.burgundy} />
               <Text style={s.errorText}>{cityError}</Text>
             </View>
           ) : (
-            <View style={s.cityGrid}>
-              {[
-                ['Bengaluru', 'Hyderabad'],
-                ['Bengaluru', 'Chennai'],
-                ['Hyderabad', 'Vijayawada'],
-                ['Bengaluru', 'Tirupati'],
-                ['Hyderabad', 'Bengaluru'],
-                ['Vijayawada', 'Hyderabad'],
-              ].map(([departure, destination]) => (
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={s.slider}
+              contentContainerStyle={s.sliderContent}
+            >
+              {POPULAR_ROUTES.map(([departure, destination]) => (
                 <Pressable
                   key={`${departure}-${destination}`}
-                  style={[s.popularCard, isMobile && s.popularCardMobile]}
+                  style={s.routeChip}
                   onPress={() => choosePopularRoute(departure, destination)}
                   android_ripple={{ color: C.burgundyLight }}
                 >
-                  <View style={s.popularIcon}>
-                    <Ionicons name="bus-outline" size={19} color={C.burgundy} />
-                  </View>
-                  <View style={s.popularText}>
-                    <Text style={s.popularName}>{departure}</Text>
-                    <Text style={s.popularCaption}>to {destination}</Text>
-                  </View>
-                  <Ionicons name="arrow-forward-circle-outline" size={19} color={C.burgundy} />
+                  <Ionicons name="bus-outline" size={16} color={C.burgundy} />
+                  <Text style={s.routeChipText}>{departure}</Text>
+                  <Ionicons name="arrow-forward" size={13} color={C.muted} />
+                  <Text style={s.routeChipText}>{destination}</Text>
                 </Pressable>
               ))}
-            </View>
-          )}
-          {!!routeFeedback && (
-            <View style={s.routeFeedback}>
-              <Ionicons name="checkmark-circle" size={15} color="#47765B" />
-              <Text style={s.routeFeedbackText}>{routeFeedback}</Text>
-            </View>
-          )}
-        </View>
-
-      </ScrollView>
-
-      {/* FULL-SCREEN CITY PICKER */}
-      <Modal
-        visible={!!picker}
-        animationType="slide"
-        presentationStyle="fullScreen"
-        statusBarTranslucent
-        onRequestClose={closePicker}
-      >
-        <View style={s.fullScreenPicker}>
-          <View style={s.fullScreenPickerHeader}>
-            <Pressable style={s.closeButton} onPress={closePicker}>
-              <Ionicons name="arrow-back" size={20} color={C.ink} />
-            </Pressable>
-            <View style={s.pickerTitleWrap}>
-              <Text style={s.modalTitle}>
-                Select {picker === 'from' ? 'departure' : 'destination'} city
-              </Text>
-              <Text style={s.modalSubtitle}>Choose your travel city</Text>
-            </View>
-          </View>
-          <View style={s.searchInputWrap}>
-            <Ionicons name="search-outline" size={18} color={C.muted} />
-            <TextInput
-              value={query}
-              onChangeText={setQuery}
-              placeholder="Search city"
-              placeholderTextColor="#A99B94"
-              autoFocus
-              style={s.searchInput}
-              returnKeyType="search"
-            />
-            {!!query && (
-              <Pressable onPress={() => setQuery('')} hitSlop={10}>
-                <Ionicons name="close-circle" size={18} color={C.muted} />
-              </Pressable>
-            )}
-          </View>
-          {loadingCities ? (
-            <View style={s.pickerLoading}>
-              <ActivityIndicator color={C.burgundy} size="large" />
-              <Text style={s.pickerLoadingText}>Loading cities…</Text>
-            </View>
-          ) : (
-            <ScrollView
-              keyboardShouldPersistTaps="always"
-              keyboardDismissMode="on-drag"
-              style={s.cityList}
-              contentContainerStyle={s.fullScreenCityList}
-            >
-              {filteredCities.map(city => (
-                <Pressable
-                  key={`${city.cityID}-${city.cityName}`}
-                  style={s.cityOption}
-                  onPress={() => selectCity(city)}
-                  android_ripple={{ color: C.burgundyLight }}
-                >
-                  <View style={s.optionIcon}>
-                    <Ionicons name="location-outline" size={17} color={C.burgundy} />
-                  </View>
-                  <Text style={s.optionName}>{city.cityName}</Text>
-                  <Ionicons name="chevron-forward" size={16} color={C.muted} />
-                </Pressable>
-              ))}
-              {filteredCities.length === 0 && (
-                <Text style={s.emptyText}>No cities found.</Text>
-              )}
             </ScrollView>
           )}
         </View>
-      </Modal>
 
-      {/* TRUE FULL-SCREEN SEARCH LOADER: stays above the Home screen */}
+        {/* SCENIC JOURNEYS: part of the page, melts in and out */}
+        <ScenicSection
+          scrollY={scrollY}
+          viewport={viewportHeight}
+          routes={SCENIC_ROUTES.slice(0, SCENIC_ON_HOME)}
+          onPick={pickScenic}
+          onExplore={() => setScenicOpen(true)}
+        />
+
+        {/* OFFERS + FOOTER */}
+        <OffersFooter
+          bottomInset={insets.bottom}
+          onCopy={copyOffer}
+          onOffer={handleOffer}
+          onHelp={() => showToast('Help & support is coming soon.')}
+        />
+
+      </Animated.ScrollView>
+
+      {/* FULL-SCREEN CITY PICKER */}
+      <CityPickerModal
+        field={picker}
+        cities={cities}
+        loading={loadingCities}
+        topInset={insets.top}
+        bottomInset={insets.bottom}
+        onPick={onPickCity}
+        onClose={closePicker}
+      />
+
+      {/* FULL-SCREEN SEARCH LOADER: calm scenes that melt into the page */}
       <Modal
         visible={searching}
         animationType="fade"
         presentationStyle="fullScreen"
         statusBarTranslucent
+        navigationBarTranslucent
         onRequestClose={() => {}}
       >
-        <View style={s.searchLoadingScreen}>
-          <View style={s.loadingCenter}>
-            <BusLoader width={loaderWidth} />
-            <Text style={s.searchLoadingTitle}>Finding your buses</Text>
-            {!!searchMessage && (
-              <Text style={s.searchLoadingSubtitle}>{searchMessage}</Text>
-            )}
-            <View style={s.loadingProgressTrack}>
-              <Animated.View style={[s.loadingProgressFill, progressMotionStyle]} />
+        <View style={[s.searchLoadingScreen, { paddingHorizontal: 0 }]}>
+          <View style={{ width }}>
+            {/* the whole picture, uncropped, full width */}
+            <SketchLoader width={width} />
+            <View style={{ alignItems: 'center', paddingHorizontal: 25 }}>
+              <View style={s.loadingProgressTrack}>
+                <Animated.View style={[s.loadingProgressFill, progressMotionStyle]} />
+              </View>
+              <Text style={s.searchLoadingTitle}>Finding your buses</Text>
+              {!!searchMessage && (
+                <Text style={s.searchLoadingSubtitle}>{searchMessage}</Text>
+              )}
             </View>
           </View>
         </View>
@@ -876,13 +1890,76 @@ export default function Home() {
           </View>
         </View>
       </Modal>
+
+      {/* ALL SCENIC ROUTES */}
+      <Modal
+        visible={scenicOpen}
+        animationType="slide"
+        statusBarTranslucent
+        navigationBarTranslucent
+        onRequestClose={() => setScenicOpen(false)}
+      >
+        <View style={[s.scenicScreen, { paddingTop: insets.top + 10 }]}>
+          <Image source={IMAGES.scenicBg} style={StyleSheet.absoluteFill} resizeMode="cover" />
+          <View style={[StyleSheet.absoluteFill, { backgroundColor: `rgba(${PAGE_RGB},0.25)` }]} />
+          <View style={s.scenicScreenHeader}>
+            <Pressable style={s.closeButton} onPress={() => setScenicOpen(false)} accessibilityLabel="Close">
+              <Ionicons name="arrow-back" size={20} color={C.ink} />
+            </Pressable>
+            <View style={{ flex: 1 }}>
+              <Text style={s.modalTitle}>Scenic journeys</Text>
+              <Text style={s.modalSubtitle}>Tap a route to see buses for your date</Text>
+            </View>
+          </View>
+          <ScrollView
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={[s.scenicScreenList, { paddingBottom: insets.bottom + 24 }]}
+          >
+            {SCENIC_ROUTES.map(route => (
+              <ScenicCard key={route.key} route={route} onPress={() => pickScenic(route)} />
+            ))}
+          </ScrollView>
+        </View>
+      </Modal>
+
+      <ProfileDrawer
+        visible={drawerOpen}
+        authed={authed}
+        onClose={() => setDrawerOpen(false)}
+        onLogin={() => setWelcomeVisible(true)}
+        onLogout={handleLogout}
+        onItem={handleDrawerItem}
+      />
+
+      <WelcomeLogin visible={welcomeVisible} onSkip={skipWelcome} onLoggedIn={handleLoggedIn} />
+
+      {!!toast && (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            s.toastWrap,
+            {
+              top: insets.top + 10,
+              opacity: toastAnim,
+              transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-12, 0] }) }],
+            },
+          ]}
+        >
+          <View style={s.toast}>
+            <View style={s.toastIcon}>
+              <Ionicons name="information" size={14} color="#fff" />
+            </View>
+            <Text style={s.toastText}>{toast}</Text>
+          </View>
+        </Animated.View>
+      )}
     </View>
   );
 }
 
 const s = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
-  scroll: { paddingBottom: 30 },
+  scroll: { paddingBottom: 0 },
 
   wide: { maxWidth: 1080, width: '100%', alignSelf: 'center' },
 
@@ -896,6 +1973,7 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
   },
   brandRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  brandIcon: { width: 46, height: 26 },
   brandMark: {
     width: 31,
     height: 31,
@@ -982,7 +2060,7 @@ const s = StyleSheet.create({
   /* Booking card */
   bookingWrap: {
     paddingHorizontal: 20,
-    marginTop: -27,
+    marginTop: -42,
     zIndex: 2,
   },
   bookingCard: {
@@ -1122,6 +2200,19 @@ const s = StyleSheet.create({
     backgroundColor: C.burgundyLight,
     borderColor: '#DCC2C5',
   },
+  dateSummary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    marginTop: 7,
+    paddingLeft: 10,
+    paddingRight: 6,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: C.burgundyLight,
+    alignSelf: 'flex-start',
+  },
+  dateSummaryText: { color: C.burgundy, fontSize: 13, fontWeight: '600' },
   dateMonth: {
     fontSize: 8,
     fontWeight: '600',
@@ -1202,7 +2293,7 @@ const s = StyleSheet.create({
     borderRadius: 9,
     overflow: 'hidden',
     backgroundColor: '#E9DDD7',
-    marginTop: 22,
+    marginTop: 10,
   },
   loadingProgressFill: {
     width: '34%',
@@ -1427,4 +2518,280 @@ const s = StyleSheet.create({
     backgroundColor: C.burgundy,
   },
   doneText: { color: C.white, fontSize: 11, fontWeight: '600' },
+
+  /* Sliders */
+  slider: { marginHorizontal: -20 },
+  sliderContent: { paddingHorizontal: 20, gap: 12 },
+  routeChip: {
+    height: 44,
+    paddingHorizontal: 14,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.paper,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  routeChipText: { color: C.ink, fontSize: 13, fontWeight: '500' },
+
+  /* Scenic */
+  /* Offers + footer */
+  footer: { backgroundColor: '#EFE4DC' },
+  footerInner: {
+    width: '100%',
+    maxWidth: 680,
+    alignSelf: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 54,
+  },
+  offersHeading: { marginBottom: 14 },
+  offerCard: {
+    width: OFFER_W,
+    minHeight: 112,
+    borderRadius: 20,
+    padding: 14,
+    backgroundColor: 'rgba(255,254,252,0.82)',
+    flexDirection: 'row',
+    gap: 12,
+    shadowColor: '#783D4A',
+    shadowOpacity: 0.07,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 1,
+  },
+  offerIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 13,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  offerTitle: { color: C.ink, fontSize: 15, fontWeight: '600' },
+  offerCaption: { color: C.muted, fontSize: 12, lineHeight: 17, marginTop: 3 },
+  offerCode: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: 9,
+    paddingHorizontal: 10,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#C9A0A8',
+  },
+  offerCodeText: { color: C.burgundy, fontSize: 11, fontWeight: '600', letterSpacing: 0.8 },
+  footerBrand: { flexDirection: 'row', alignItems: 'center', gap: 10 },
+  footerBrandText: { color: C.ink, fontSize: 18, fontWeight: '700', letterSpacing: -0.4 },
+  footerTagline: { color: C.muted, fontSize: 12, marginTop: 2 },
+  footerLinks: { flexDirection: 'row', flexWrap: 'wrap', gap: 20, marginTop: 20 },
+  footerLink: { color: C.burgundy, fontSize: 13, fontWeight: '500' },
+  footerCopy: { color: C.muted, fontSize: 11, marginTop: 18 },
+
+  scenicSection: { marginTop: 18, overflow: 'hidden', backgroundColor: C.bg },
+  scenicBg: { position: 'absolute', left: 0, right: 0, width: '100%' },
+  scenicInner: {
+    width: '100%',
+    maxWidth: 680,
+    alignSelf: 'center',
+    paddingHorizontal: 16,
+    paddingTop: 56,
+    paddingBottom: 90,
+  },
+  scenicHeading: { paddingHorizontal: 6, marginBottom: 18 },
+  scenicCard: {
+    borderRadius: 24,
+    overflow: 'hidden',
+    marginBottom: 22,
+    backgroundColor: C.burgundy,
+    shadowColor: '#4B2430',
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 4,
+  },
+  scenicPhoto: { width: '100%', height: 214, backgroundColor: '#D9CFC6' },
+  scenicBar: {
+    height: 36,
+    paddingHorizontal: 16,
+    justifyContent: 'center',
+    backgroundColor: 'rgba(120, 61, 74, 0.96)',
+  },
+  scenicBarText: { color: '#fff', fontSize: 13, fontWeight: '500', letterSpacing: 0.2 },
+  exploreButton: {
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: 'rgba(255,255,255,0.62)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+    marginTop: 4,
+  },
+  exploreText: { color: C.burgundy, fontSize: 14, fontWeight: '600' },
+  scenicScreen: { flex: 1, backgroundColor: C.bg, overflow: 'hidden' },
+  scenicScreenHeader: {
+    paddingHorizontal: 20,
+    paddingBottom: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  scenicScreenList: { paddingHorizontal: 20, paddingTop: 4 },
+
+  /* Welcome / login */
+  welcomeRoot: { flex: 1, backgroundColor: '#2B1A1D' },
+  welcomeTop: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    paddingHorizontal: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  welcomeBrand: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  welcomeBrandText: { color: '#fff', fontSize: 19, fontWeight: '700', letterSpacing: -0.5, textShadowColor: 'rgba(0,0,0,0.3)', textShadowRadius: 6 },
+  skipButton: {
+    paddingHorizontal: 16,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(255,255,255,0.20)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  skipText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  scrim: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    bottom: 0,
+    height: '58%',
+  },
+  welcomeForm: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    paddingHorizontal: 24,
+  },
+  welcomeTitle: {
+    color: '#fff',
+    fontSize: 26,
+    fontWeight: '700',
+    letterSpacing: -0.4,
+    textShadowColor: 'rgba(0,0,0,0.25)',
+    textShadowRadius: 8,
+  },
+  welcomeSubtitle: {
+    color: 'rgba(255,255,255,0.9)',
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: 6,
+    marginBottom: 18,
+  },
+  inputRow: {
+    height: 52,
+    borderRadius: 14,
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    paddingHorizontal: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  inputPrefix: { color: C.ink, fontSize: 15, fontWeight: '600' },
+  inputField: { flex: 1, color: C.ink, fontSize: 16, paddingVertical: 0, height: 50 },
+  otpField: { textAlign: 'center', letterSpacing: 8, fontSize: 20, fontWeight: '600' },
+  welcomeError: { color: '#FFDAD4', fontSize: 13, marginTop: 10 },
+  welcomeButton: {
+    height: 52,
+    borderRadius: 14,
+    backgroundColor: C.burgundy,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 16,
+  },
+  welcomeButtonOff: { opacity: 0.6 },
+  welcomeButtonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
+  otpLinks: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 14 },
+  linkText: { color: C.burgundy, fontSize: 13, fontWeight: '600' },
+  welcomeLink: { color: '#fff', fontSize: 13, fontWeight: '600', textDecorationLine: 'underline' },
+  termsOnPhoto: { color: 'rgba(255,255,255,0.85)', fontSize: 12, lineHeight: 18, textAlign: 'center', marginTop: 16 },
+  termsOnPhotoLink: { color: '#fff', textDecorationLine: 'underline' },
+  termsText: { color: C.muted, fontSize: 12, lineHeight: 18, textAlign: 'center', marginTop: 16 },
+  termsLink: { color: C.burgundy, textDecorationLine: 'underline' },
+
+  /* Profile drawer */
+  drawer: { flex: 1, backgroundColor: C.bg },
+  drawerWho: {
+    marginTop: -40,
+    paddingHorizontal: 20,
+    paddingBottom: 6,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  drawerAvatar: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: C.burgundyLight,
+    borderWidth: 3,
+    borderColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  drawerHello: { color: C.ink, fontSize: 18, fontWeight: '600' },
+  drawerSub: { color: C.muted, fontSize: 13, marginTop: 3 },
+  drawerClose: {
+    position: 'absolute',
+    right: 16,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: 'rgba(28, 14, 20, 0.38)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  drawerList: { paddingHorizontal: 20, paddingTop: 8, paddingBottom: 12 },
+  drawerRow: { minHeight: 62, flexDirection: 'row', alignItems: 'center', gap: 14 },
+  drawerRowBorder: { borderTopWidth: 1, borderTopColor: C.border },
+  drawerIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  drawerLabel: { flex: 1, color: C.ink, fontSize: 16 },
+  drawerFooter: { paddingHorizontal: 20, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.paper },
+  logoutRow: { minHeight: 46, flexDirection: 'row', alignItems: 'center', gap: 12 },
+  logoutText: { color: C.muted, fontSize: 15 },
+  drawerLegal: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 8 },
+
+  /* Toast */
+  toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center', zIndex: 50, elevation: 50 },
+  toast: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    maxWidth: 420,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderRadius: 18,
+    backgroundColor: 'rgba(56, 43, 40, 0.95)',
+  },
+  toastIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#A65372',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toastText: { flexShrink: 1, color: '#fff', fontSize: 14 },
 });

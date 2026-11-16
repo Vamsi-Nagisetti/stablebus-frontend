@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
-  Alert,
+  Animated,
   BackHandler,
   Pressable,
   ScrollView,
+  Share,
   StatusBar,
   StyleSheet,
   Text,
@@ -12,6 +13,7 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { request } from '@/services/http';
 
 const C = {
@@ -19,6 +21,7 @@ const C = {
   paper: '#FFFEFC',
   ink: '#382B28',
   muted: '#887A73',
+  placeholder: '#B5A8A0',
   border: '#EAE0D7',
   burgundy: '#783D4A',
   burgundyDark: '#65313E',
@@ -28,6 +31,7 @@ const C = {
   amber: '#9A6A22',
   amberLight: '#F8F0E1',
   red: '#B8453F',
+  redLight: '#F9EAE8',
 };
 
 type Passenger = {
@@ -46,6 +50,8 @@ type ApiResponse = {
   transport_pnr?: string | null;
   message?: string;
 };
+
+const PHONE_RE = /(?:\+?91[\s-]*)?(?:\d[\s-]*){10,}/g;
 
 function parseJson(value: unknown): any {
   if (!value) return null;
@@ -69,55 +75,70 @@ function firstParam(params: Record<string, any>, keys: string[]): string {
 }
 
 function formatDate(value: string): string {
-  if (!value) return 'Date not available';
+  if (!value) return '';
   let date: Date;
-  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  date = match
-    ? new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]))
-    : new Date(value);
+  const iso = value.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    date = new Date(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3]));
+  } else if (value.includes('/')) {
+    const [m, d, y] = value.split('/');
+    date = new Date(Number(y), Number(m) - 1, Number(d));
+  } else {
+    date = new Date(value);
+  }
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleDateString('en-IN', {
-    weekday: 'short', day: '2-digit', month: 'short', year: 'numeric',
-  });
+  return date.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+function formatClock(value: string): string {
+  const v = String(value || '').trim();
+  if (!v) return '';
+  if (/am|pm/i.test(v)) return v.toUpperCase();
+  const match = v.match(/(\d{1,2}):(\d{2})/);
+  if (!match) return v;
+  const hours = Number(match[1]);
+  return `${String(hours % 12 || 12).padStart(2, '0')}:${match[2]} ${hours >= 12 ? 'PM' : 'AM'}`;
 }
 
 function formatMoney(value: string, currency = 'INR'): string {
   const amount = Number(value || 0);
-  if (!Number.isFinite(amount)) return `${currency} ${value || '—'}`;
-  try {
-    return new Intl.NumberFormat('en-IN', {
-      style: 'currency', currency, maximumFractionDigits: 2,
-    }).format(amount);
-  } catch {
-    return `₹${amount.toLocaleString('en-IN')}`;
-  }
+  if (!Number.isFinite(amount) || amount <= 0) return '';
+  if (currency === 'INR') return `₹${amount.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+  return `${currency} ${amount.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 }
 
-function pointName(point: any, fallback: string): string {
-  return String(
-    point?.boarding_Name || point?.dropping_Name || point?.point_Name ||
-    point?.boardingName || point?.droppingName || point?.pointName ||
-    point?.name || fallback
+function pointName(point: any, type: 'boarding' | 'dropping', fallback: string): string {
+  if (!point) return fallback;
+  const raw = String(
+    point?.[`${type}_Name`] ?? point?.[`${type}Name`] ?? point?.point_Name ?? point?.pointName ?? point?.name ?? ''
   );
+  const clean = raw
+    .split('^')[0]
+    .replace(/\([^)]*\)/g, '')
+    .replace(PHONE_RE, '')
+    .replace(/\s*[-,:;/&]+\s*$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return clean || fallback;
+}
+
+function pointTime(point: any, type: 'boarding' | 'dropping'): string {
+  if (!point) return '';
+  return formatClock(String(point?.[`${type}_Time`] ?? point?.time ?? ''));
 }
 
 export default function Tickets() {
   const router = useRouter();
   const params = useLocalSearchParams();
+  const insets = useSafeAreaInsets();
 
   const bus = useMemo(() => parseJson(params.bus) || {}, [params.bus]);
   const passengers = useMemo(
     () => (parseJson(params.passengers) || []) as Passenger[],
     [params.passengers]
   );
-  const boarding = useMemo(
-    () => parseJson(params.selectedBoardingPoint) || {},
-    [params.selectedBoardingPoint]
-  );
-  const dropping = useMemo(
-    () => parseJson(params.selectedDroppingPoint) || {},
-    [params.selectedDroppingPoint]
-  );
+  const boarding = useMemo(() => parseJson(params.selectedBoardingPoint) || {}, [params.selectedBoardingPoint]);
+  const dropping = useMemo(() => parseJson(params.selectedDroppingPoint) || {}, [params.selectedDroppingPoint]);
 
   const bookingId = firstParam(params, ['bookingId', 'booking_id']);
   const guestToken = firstParam(params, ['guestToken', 'guest_access_token']);
@@ -126,16 +147,37 @@ export default function Tickets() {
   const journeyDate = firstParam(params, ['date']);
   const amount = firstParam(params, ['totalFare', 'amount']);
   const currency = firstParam(params, ['currency']) || 'INR';
+
   const [bookingStatus, setBookingStatus] = useState(
     firstParam(params, ['bookingStatus', 'booking_status']).toUpperCase() || 'TICKETING_UNKNOWN'
   );
   const [pnr, setPnr] = useState(firstParam(params, ['transportPnr', 'transport_pnr']));
-  const [supplierRef, setSupplierRef] = useState(
-    firstParam(params, ['supplierRef', 'supplier_refno'])
-  );
+  const [supplierRef, setSupplierRef] = useState(firstParam(params, ['supplierRef', 'supplier_refno']));
   const [checking, setChecking] = useState(false);
 
-  // Ticket is the end of checkout: Android hardware back also goes Home.
+  // Calm, non-blocking message (replaces Alert boxes).
+  const [toast, setToast] = useState<string | null>(null);
+  const toastAnim = useRef(new Animated.Value(0)).current;
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useCallback(
+    (message: string) => {
+      setToast(message);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      Animated.timing(toastAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+      toastTimer.current = setTimeout(() => {
+        Animated.timing(toastAnim, { toValue: 0, duration: 220, useNativeDriver: true }).start(() => setToast(null));
+      }, 3200);
+    },
+    [toastAnim]
+  );
+  useEffect(
+    () => () => {
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+    },
+    []
+  );
+
+  // The ticket is the end of checkout: Android hardware back goes Home.
   useEffect(() => {
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
       router.replace('/' as any);
@@ -146,280 +188,565 @@ export default function Tickets() {
 
   const isConfirmed = bookingStatus === 'CONFIRMED';
   const isFailed = ['BOOKING_FAILED', 'CANCELLED'].includes(bookingStatus);
+  const tone = isConfirmed ? C.green : isFailed ? C.red : C.amber;
+  const toneLight = isConfirmed ? C.greenLight : isFailed ? C.redLight : C.amberLight;
+
   const busName = bus.operator_Name || bus.travel_Name || 'Bus operator';
   const busType = bus.bus_Type || bus.seat_Layout || 'Bus service';
-  const seats = passengers.map(p => p.seat).filter(Boolean);
-  const boardingName = pointName(boarding, 'Boarding point');
-  const droppingName = pointName(dropping, 'Dropping point');
+  const seats = passengers.map(p => p.seat).filter(Boolean) as string[];
+  const boardingName = pointName(boarding, 'boarding', 'Boarding point');
+  const droppingName = pointName(dropping, 'dropping', 'Dropping point');
+  const boardingTime = pointTime(boarding, 'boarding');
+  const droppingTime = pointTime(dropping, 'dropping');
+  const dateLabel = formatDate(journeyDate);
+  const paid = formatMoney(amount, currency);
+
+  const statusTitle = isConfirmed
+    ? 'Ticket confirmed'
+    : isFailed
+      ? 'Booking not confirmed'
+      : 'Payment received';
+  const statusText = isConfirmed
+    ? 'Have a safe and comfortable journey.'
+    : isFailed
+      ? 'Your ticket could not be confirmed. Please contact support before doing anything else.'
+      : 'We are waiting for the bus operator to confirm your ticket. Please do not pay again.';
 
   async function checkTicketStatus() {
     if (!bookingId || checking) return;
     setChecking(true);
     try {
-      const response = await request<ApiResponse>(
-        `/api/v1/bookings/${bookingId}/requery`,
-        {
-          method: 'POST',
-          headers: guestToken
-            ? { 'X-Guest-Access-Token': guestToken }
-            : undefined,
-        }
-      );
+      const response = await request<ApiResponse>(`/api/v1/bookings/${bookingId}/requery`, {
+        method: 'POST',
+        timeoutMs: 90000,
+        headers: guestToken ? { 'X-Guest-Access-Token': guestToken } : undefined,
+      });
       const nextStatus = String(response.booking_status || bookingStatus).toUpperCase();
       setBookingStatus(nextStatus);
       if (response.transport_pnr) setPnr(response.transport_pnr);
       if (response.supplier_refno) setSupplierRef(response.supplier_refno);
-      if (nextStatus !== 'CONFIRMED') {
-        Alert.alert(
-          'Confirmation is still pending',
-          response.message || 'Your payment is safe. The bus operator has not confirmed the ticket yet.'
-        );
+      if (nextStatus === 'CONFIRMED') {
+        showToast('Your ticket is confirmed.');
+      } else {
+        showToast(response.message || 'Still waiting for the operator. Your payment is safe.');
       }
     } catch (error: any) {
-      Alert.alert('Unable to check status', error?.message || 'Please try again shortly.');
+      showToast(error?.message || 'Could not check the status. Please try again shortly.');
     } finally {
       setChecking(false);
     }
   }
 
-  function copyValue(value: string, label: string) {
-    // Clipboard integration is intentionally not assumed; display the value for manual copying.
-    Alert.alert(label, value);
+  async function copyValue(value: string, label: string) {
+    try {
+      // expo-clipboard is optional: if it is not installed the value is simply shown in the toast.
+      const Clipboard = require('expo-clipboard');
+      await Clipboard.setStringAsync(value);
+      showToast(`${label} copied.`);
+    } catch {
+      showToast(`${label}: ${value}`);
+    }
   }
+
+  async function shareTicket() {
+    const lines = [
+      'StableBus ticket',
+      `${from || '—'} → ${to || '—'}${dateLabel ? ` · ${dateLabel}` : ''}`,
+      `Bus: ${busName}`,
+      boardingTime ? `Boarding: ${boardingName}, ${boardingTime}` : `Boarding: ${boardingName}`,
+      droppingTime ? `Dropping: ${droppingName}, ${droppingTime}` : `Dropping: ${droppingName}`,
+      `Seats: ${seats.join(', ') || '—'}`,
+      `Booking ID: ${bookingId || '—'}`,
+      `PNR: ${pnr || 'Pending'}`,
+      `Status: ${bookingStatus.split('_').join(' ')}`,
+    ];
+    try {
+      await Share.share({ message: lines.join('\n') });
+    } catch {
+      showToast('Could not open sharing.');
+    }
+  }
+
+  const goHome = () => router.replace('/' as any);
 
   return (
     <View style={styles.root}>
-      <StatusBar barStyle="dark-content" backgroundColor={C.bg} />
-      <View style={styles.header}>
-        <Pressable
-          onPress={() => router.replace('/' as any)}
-          style={styles.backButton}
-          accessibilityRole="button"
-          accessibilityLabel="Go to Home"
-        >
+      <StatusBar barStyle="dark-content" backgroundColor={C.paper} />
+
+      <View style={[styles.header, { paddingTop: 10 + insets.top }]}>
+        <Pressable onPress={goHome} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Go to Home">
           <Ionicons name="home-outline" size={20} color={C.ink} />
         </Pressable>
         <View style={{ flex: 1 }}>
           <Text style={styles.headerTitle}>Your ticket</Text>
-          <Text style={styles.headerSubtitle}>StableBus booking details</Text>
+          <Text style={styles.headerSubtitle}>StableBus booking</Text>
         </View>
-        <Ionicons name="bus-outline" size={23} color={C.burgundy} />
+        <Pressable onPress={shareTicket} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Share ticket">
+          <Ionicons name="share-social-outline" size={20} color={C.burgundy} />
+        </Pressable>
       </View>
 
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        <View style={styles.successArea}>
-          <View style={[styles.successIcon, !isConfirmed && styles.pendingIcon, isFailed && styles.failedIcon]}>
+      <ScrollView
+        contentContainerStyle={[styles.content, { paddingBottom: 24 + insets.bottom }]}
+        showsVerticalScrollIndicator={false}
+      >
+        {/* Status */}
+        <View style={styles.hero}>
+          <View style={[styles.heroIcon, { backgroundColor: toneLight }]}>
             <Ionicons
               name={isConfirmed ? 'checkmark' : isFailed ? 'close' : 'time-outline'}
-              size={35}
-              color={isConfirmed ? C.green : isFailed ? C.red : C.amber}
+              size={30}
+              color={tone}
             />
           </View>
-          <Text style={styles.successTitle}>
-            {isConfirmed ? 'Booking Confirmed!' : isFailed ? 'Booking not confirmed' : 'Payment Successful'}
-          </Text>
-          <Text style={styles.successSubtitle}>
-            {isConfirmed
-              ? 'Your bus ticket has been confirmed. Have a safe journey!'
-              : isFailed
-                ? 'Your ticket could not be confirmed. Please contact support before taking any further action.'
-                : 'Your payment is verified. We are waiting for the bus operator to confirm your ticket.'}
-          </Text>
-          <View style={[styles.statusPill, isConfirmed ? styles.confirmedPill : isFailed ? styles.failedPill : styles.pendingPill]}>
-            <View style={[styles.statusDot, { backgroundColor: isConfirmed ? C.green : isFailed ? C.red : C.amber }]} />
-            <Text style={[styles.statusText, { color: isConfirmed ? C.green : isFailed ? C.red : C.amber }]}>
-              {bookingStatus.replaceAll('_', ' ')}
-            </Text>
+          <Text style={styles.heroTitle}>{statusTitle}</Text>
+          <Text style={styles.heroText}>{statusText}</Text>
+          <View style={[styles.statusPill, { backgroundColor: toneLight }]}>
+            <View style={[styles.statusDot, { backgroundColor: tone }]} />
+            <Text style={[styles.statusLabel, { color: tone }]}>{bookingStatus.split('_').join(' ')}</Text>
           </View>
         </View>
 
-        <View style={styles.referenceCard}>
-          <View style={styles.referenceItem}>
-            <Text style={styles.referenceLabel}>BOOKING ID</Text>
-            <View style={styles.referenceValueRow}>
-              <Text style={styles.referenceValue} numberOfLines={1}>{bookingId || '—'}</Text>
-              {!!bookingId && <Pressable onPress={() => copyValue(bookingId, 'Booking ID')}><Ionicons name="copy-outline" size={17} color={C.burgundy} /></Pressable>}
-            </View>
-          </View>
-          <View style={styles.referenceDivider} />
-          <View style={styles.referenceItem}>
-            <Text style={styles.referenceLabel}>PNR</Text>
-            <View style={styles.referenceValueRow}>
-              <Text style={styles.pnrValue}>{pnr || 'Pending'}</Text>
-              {!!pnr && <Pressable onPress={() => copyValue(pnr, 'PNR')}><Ionicons name="copy-outline" size={17} color={C.burgundy} /></Pressable>}
-            </View>
-          </View>
-        </View>
-
-        <View style={styles.ticketCard}>
+        {/* Ticket (same look as the Passengers and Payments screens) */}
+        <View style={styles.ticket}>
           <View style={styles.ticketTop}>
-            <View style={styles.busIcon}><Ionicons name="bus" size={21} color={C.burgundy} /></View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.operatorName}>{busName}</Text>
-              <Text style={styles.operatorType}>{busType}</Text>
+            <View style={styles.busIcon}>
+              <Ionicons name="bus-outline" size={21} color={C.burgundy} />
             </View>
-            <Text style={styles.fare}>{formatMoney(amount, currency)}</Text>
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={styles.busName} numberOfLines={1}>{busName}</Text>
+              <Text style={styles.busType} numberOfLines={1}>{busType}</Text>
+            </View>
+            {!!dateLabel && (
+              <View style={styles.datePill}>
+                <Text style={styles.dateText}>{dateLabel}</Text>
+              </View>
+            )}
           </View>
-
-          <View style={styles.ticketDivider} />
 
           <View style={styles.routeRow}>
-            <View style={styles.routeCity}>
-              <Text style={styles.cityLabel}>FROM</Text>
-              <Text style={styles.cityName}>{from || 'Origin'}</Text>
+            <View style={styles.routeStop}>
+              <Text style={styles.routeTime}>{formatClock(String(bus.departure_Time || '')) || '--'}</Text>
+              <Text style={styles.routeCity} numberOfLines={1}>{from || 'Origin'}</Text>
             </View>
             <View style={styles.routeMiddle}>
-              <View style={styles.routeLine} />
-              <Ionicons name="bus-outline" size={19} color={C.burgundy} />
-              <View style={styles.routeLine} />
+              <View style={styles.routeDot} />
+              <View style={styles.routeDash} />
+              <Ionicons name="bus-outline" size={16} color={C.burgundy} />
+              <View style={styles.routeDash} />
+              <View style={styles.routeDot} />
             </View>
-            <View style={[styles.routeCity, { alignItems: 'flex-end' }]}>
-              <Text style={styles.cityLabel}>TO</Text>
-              <Text style={styles.cityName}>{to || 'Destination'}</Text>
-            </View>
-          </View>
-          <Text style={styles.journeyDate}>{formatDate(journeyDate)}</Text>
-
-          <View style={styles.ticketDivider} />
-
-          <View style={styles.pointRow}>
-            <View style={styles.pointIcon}><Ionicons name="location-outline" size={17} color={C.burgundy} /></View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.pointLabel}>BOARDING POINT</Text>
-              <Text style={styles.pointValue}>{boardingName}</Text>
-            </View>
-          </View>
-          <View style={styles.pointRow}>
-            <View style={styles.pointIcon}><Ionicons name="flag-outline" size={17} color={C.burgundy} /></View>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.pointLabel}>DROPPING POINT</Text>
-              <Text style={styles.pointValue}>{droppingName}</Text>
+            <View style={[styles.routeStop, { alignItems: 'flex-end' }]}>
+              <Text style={styles.routeTime}>{formatClock(String(bus.arrival_Time || '')) || '--'}</Text>
+              <Text style={styles.routeCity} numberOfLines={1}>{to || 'Destination'}</Text>
             </View>
           </View>
 
-          <View style={styles.ticketDivider} />
+          <View style={styles.tear}>
+            <View style={[styles.notch, { left: -10 }]} />
+            <View style={styles.tearLine} />
+            <View style={[styles.notch, { right: -10 }]} />
+          </View>
 
-          <View style={styles.seatFareRow}>
-            <View>
-              <Text style={styles.pointLabel}>SEATS</Text>
-              <Text style={styles.pointValue}>{seats.length ? seats.join(', ') : '—'}</Text>
+          <View style={styles.ticketBottom}>
+            <View style={styles.ticketCol}>
+              <View style={styles.labelRow}>
+                <Ionicons name="location-outline" size={14} color={C.burgundy} />
+                <Text style={styles.metaLabel}>Boarding</Text>
+              </View>
+              <Text style={styles.metaValue} numberOfLines={2}>{boardingName}</Text>
+              {!!boardingTime && <Text style={styles.metaTime}>{boardingTime}</Text>}
             </View>
-            <View style={{ alignItems: 'flex-end' }}>
-              <Text style={styles.pointLabel}>PASSENGERS</Text>
-              <Text style={styles.pointValue}>{passengers.length}</Text>
+            <View style={styles.ticketCol}>
+              <View style={styles.labelRow}>
+                <Ionicons name="flag-outline" size={14} color={C.burgundy} />
+                <Text style={styles.metaLabel}>Dropping</Text>
+              </View>
+              <Text style={styles.metaValue} numberOfLines={2}>{droppingName}</Text>
+              {!!droppingTime && <Text style={styles.metaTime}>{droppingTime}</Text>}
             </View>
           </View>
+
+          {seats.length > 0 && (
+            <View style={styles.seatsStrip}>
+              <Text style={styles.metaLabel}>Seats</Text>
+              <View style={styles.seatTags}>
+                {seats.map(name => (
+                  <View key={name} style={styles.seatTag}>
+                    <Text style={styles.seatTagText}>{name}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
+          )}
         </View>
 
-        <View style={styles.passengerSection}>
-          <Text style={styles.sectionTitle}>Passenger details</Text>
-          {passengers.map((passenger, index) => (
-            <View key={`${passenger.seat || 'seat'}-${index}`} style={styles.passengerCard}>
-              <View style={styles.passengerAvatar}><Ionicons name="person-outline" size={17} color={C.burgundy} /></View>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.passengerName}>{[passenger.title, passenger.name].filter(Boolean).join(' ') || `Passenger ${index + 1}`}</Text>
-                <Text style={styles.passengerMeta}>
-                  {passenger.ticket_number ? `Ticket: ${passenger.ticket_number}` : `${passenger.age ? `${passenger.age} years` : 'Passenger'} · ${passenger.gender || ''}`}
-                </Text>
+        {/* References */}
+        <View style={styles.card}>
+          <ReferenceRow
+            label="Booking ID"
+            value={bookingId || '—'}
+            onCopy={bookingId ? () => copyValue(bookingId, 'Booking ID') : undefined}
+          />
+          <View style={styles.divider} />
+          <ReferenceRow
+            label="Operator PNR"
+            value={pnr || 'Pending'}
+            strong
+            muted={!pnr}
+            onCopy={pnr ? () => copyValue(pnr, 'PNR') : undefined}
+          />
+          {!!supplierRef && (
+            <>
+              <View style={styles.divider} />
+              <ReferenceRow
+                label="Operator reference"
+                value={supplierRef}
+                onCopy={() => copyValue(supplierRef, 'Reference')}
+              />
+            </>
+          )}
+          {!!paid && (
+            <>
+              <View style={styles.divider} />
+              <View style={styles.refRow}>
+                <Text style={styles.refLabel}>Total paid</Text>
+                <Text style={styles.paid}>{paid}</Text>
               </View>
-              <View style={styles.seatBadge}><Text style={styles.seatBadgeText}>{passenger.seat || '—'}</Text></View>
+            </>
+          )}
+        </View>
+
+        {/* Passengers */}
+        <Text style={styles.sectionTitle}>Passengers</Text>
+        <View style={styles.card}>
+          {passengers.map((p, index) => (
+            <View key={`${p.seat || 'seat'}-${index}`}>
+              {index > 0 && <View style={styles.divider} />}
+              <View style={styles.passengerRow}>
+                <View style={styles.seatChip}>
+                  <Text style={styles.seatChipText}>{p.seat || '—'}</Text>
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={styles.passengerName} numberOfLines={1}>
+                    {[p.title, p.name].filter(Boolean).join(' ') || `Passenger ${index + 1}`}
+                  </Text>
+                  <Text style={styles.passengerMeta} numberOfLines={1}>
+                    {[p.age ? `${p.age} yrs` : '', p.gender || ''].filter(Boolean).join(' · ') || 'Passenger'}
+                    {p.ticket_number ? `  ·  Ticket ${p.ticket_number}` : ''}
+                  </Text>
+                </View>
+              </View>
             </View>
           ))}
         </View>
 
-        {!!supplierRef && (
-          <View style={styles.supplierCard}>
-            <Text style={styles.referenceLabel}>SUPPLIER REFERENCE</Text>
-            <Text style={styles.supplierValue}>{supplierRef}</Text>
+        {isConfirmed && (
+          <View style={styles.note}>
+            <Ionicons name="mail-outline" size={18} color={C.burgundy} />
+            <Text style={styles.noteText}>
+              A confirmation email has been sent to you. Arrive ahead of boarding time and carry a valid photo ID.
+            </Text>
           </View>
         )}
 
         {!isConfirmed && !isFailed && (
-          <View style={styles.pendingNotice}>
-            <Ionicons name="information-circle-outline" size={20} color={C.amber} />
-            <Text style={styles.pendingNoticeText}>
-              Please don't make another payment. Ticket confirmation is separate from payment verification.
+          <View style={[styles.note, { backgroundColor: C.amberLight }]}>
+            <Ionicons name="information-circle-outline" size={19} color={C.amber} />
+            <Text style={[styles.noteText, { color: '#76551F' }]}>
+              Ticket confirmation can take a little longer than payment. Tap “Check ticket status” in a minute.
             </Text>
           </View>
         )}
 
         <View style={styles.actions}>
           {!isConfirmed && !isFailed && (
-            <Pressable style={styles.checkButton} onPress={checkTicketStatus} disabled={checking}>
+            <Pressable
+              style={[styles.primaryButton, checking && { opacity: 0.8 }]}
+              onPress={checkTicketStatus}
+              disabled={checking}
+            >
               {checking ? <ActivityIndicator color="#fff" /> : <Ionicons name="refresh" size={18} color="#fff" />}
-              <Text style={styles.checkButtonText}>{checking ? 'Checking status…' : 'Check ticket status'}</Text>
+              <Text style={styles.primaryText}>{checking ? 'Checking status…' : 'Check ticket status'}</Text>
             </Pressable>
           )}
-          <Pressable style={styles.doneButton} onPress={() => router.replace('/' as any)}>
-            <Text style={styles.doneButtonText}>Done</Text>
-            <Ionicons name="arrow-forward" size={17} color="#fff" />
+          <Pressable style={isConfirmed ? styles.primaryButton : styles.secondaryButton} onPress={goHome}>
+            <Text style={isConfirmed ? styles.primaryText : styles.secondaryText}>Done</Text>
+            <Ionicons name="arrow-forward" size={17} color={isConfirmed ? '#fff' : C.burgundy} />
           </Pressable>
         </View>
       </ScrollView>
+
+      {!!toast && (
+        <Animated.View
+          pointerEvents="none"
+          style={[
+            styles.toastWrap,
+            {
+              top: insets.top + 10,
+              opacity: toastAnim,
+              transform: [{ translateY: toastAnim.interpolate({ inputRange: [0, 1], outputRange: [-12, 0] }) }],
+            },
+          ]}
+        >
+          <View style={styles.toast}>
+            <View style={styles.toastIcon}>
+              <Ionicons name="information" size={14} color="#fff" />
+            </View>
+            <Text style={styles.toastText}>{toast}</Text>
+          </View>
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
+function ReferenceRow({
+  label,
+  value,
+  onCopy,
+  strong,
+  muted,
+}: {
+  label: string;
+  value: string;
+  onCopy?: () => void;
+  strong?: boolean;
+  muted?: boolean;
+}) {
+  return (
+    <View style={styles.refRow}>
+      <Text style={styles.refLabel}>{label}</Text>
+      <View style={styles.refValueWrap}>
+        <Text
+          style={[styles.refValue, strong && styles.refStrong, muted && { color: C.placeholder, fontWeight: '500' }]}
+          numberOfLines={1}
+          selectable
+        >
+          {value}
+        </Text>
+        {!!onCopy && (
+          <Pressable onPress={onCopy} hitSlop={10} accessibilityRole="button" accessibilityLabel={`Copy ${label}`}>
+            <Ionicons name="copy-outline" size={17} color={C.burgundy} />
+          </Pressable>
+        )}
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
-  header: { minHeight: 66, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 18, borderBottomWidth: 1, borderBottomColor: C.border, gap: 13 },
-  backButton: { width: 40, height: 40, borderRadius: 14, backgroundColor: C.paper, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: C.border },
-  headerTitle: { fontSize: 18, fontWeight: '700', color: C.ink },
-  headerSubtitle: { fontSize: 12, color: C.muted, marginTop: 3 },
-  content: { padding: 18, paddingBottom: 35, width: '100%', maxWidth: 680, alignSelf: 'center' },
-  successArea: { alignItems: 'center', paddingTop: 20, paddingBottom: 22 },
-  successIcon: { width: 68, height: 68, borderRadius: 34, backgroundColor: C.greenLight, alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
-  pendingIcon: { backgroundColor: C.amberLight },
-  failedIcon: { backgroundColor: '#F9EAE8' },
-  successTitle: { color: C.ink, fontSize: 23, fontWeight: '800', textAlign: 'center' },
-  successSubtitle: { color: C.muted, fontSize: 12, lineHeight: 19, textAlign: 'center', marginTop: 7, maxWidth: 310 },
-  statusPill: { flexDirection: 'row', alignItems: 'center', gap: 7, borderRadius: 20, paddingHorizontal: 12, paddingVertical: 7, marginTop: 13 },
-  confirmedPill: { backgroundColor: C.greenLight },
-  pendingPill: { backgroundColor: C.amberLight },
-  failedPill: { backgroundColor: '#F9EAE8' },
+  header: {
+    minHeight: 68,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+    backgroundColor: C.paper,
+    gap: 12,
+  },
+  iconButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 13,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  headerTitle: { fontSize: 17, fontWeight: '600', color: C.ink },
+  headerSubtitle: { fontSize: 13, color: C.muted, marginTop: 3 },
+  content: { padding: 14, width: '100%', maxWidth: 680, alignSelf: 'center' },
+
+  hero: { alignItems: 'center', paddingTop: 14, paddingBottom: 20, paddingHorizontal: 12 },
+  heroIcon: { width: 62, height: 62, borderRadius: 31, alignItems: 'center', justifyContent: 'center' },
+  heroTitle: { color: C.ink, fontSize: 21, fontWeight: '700', marginTop: 14 },
+  heroText: { color: C.muted, fontSize: 14, lineHeight: 21, textAlign: 'center', marginTop: 6, maxWidth: 320 },
+  statusPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 7,
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    height: 30,
+    marginTop: 14,
+  },
   statusDot: { width: 7, height: 7, borderRadius: 4 },
-  statusText: { fontSize: 10, fontWeight: '800', letterSpacing: 0.4 },
-  referenceCard: { flexDirection: 'row', alignItems: 'center', backgroundColor: C.burgundyLight, borderRadius: 17, padding: 15, marginBottom: 15 },
-  referenceItem: { flex: 1, minWidth: 0 },
-  referenceDivider: { width: 1, height: 39, backgroundColor: '#DFCBCF', marginHorizontal: 13 },
-  referenceLabel: { color: C.muted, fontSize: 9, fontWeight: '800', letterSpacing: 1 },
-  referenceValueRow: { flexDirection: 'row', alignItems: 'center', gap: 7, marginTop: 7 },
-  referenceValue: { color: C.ink, fontSize: 11, fontWeight: '700', flex: 1 },
-  pnrValue: { color: C.burgundy, fontSize: 16, fontWeight: '800', flex: 1 },
-  ticketCard: { backgroundColor: C.paper, borderWidth: 1, borderColor: C.border, borderRadius: 20, padding: 16 },
+  statusLabel: { fontSize: 12, fontWeight: '700', letterSpacing: 0.4 },
+
+  ticket: {
+    backgroundColor: C.paper,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 14,
+    shadowColor: '#783D4A',
+    shadowOpacity: 0.07,
+    shadowRadius: 14,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 2,
+  },
   ticketTop: { flexDirection: 'row', alignItems: 'center', gap: 11 },
-  busIcon: { width: 42, height: 42, borderRadius: 14, backgroundColor: C.burgundyLight, alignItems: 'center', justifyContent: 'center' },
-  operatorName: { color: C.ink, fontSize: 13, fontWeight: '800' },
-  operatorType: { color: C.muted, fontSize: 10, marginTop: 4 },
-  fare: { color: C.burgundy, fontSize: 14, fontWeight: '800' },
-  ticketDivider: { height: 1, backgroundColor: C.border, marginVertical: 16 },
-  routeRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  routeCity: { flex: 1 },
-  cityLabel: { color: C.muted, fontSize: 9, fontWeight: '800', letterSpacing: 1 },
-  cityName: { color: C.ink, fontSize: 15, fontWeight: '800', marginTop: 5 },
-  routeMiddle: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5 },
-  routeLine: { flex: 1, height: 1, backgroundColor: '#D8C7C2' },
-  journeyDate: { color: C.muted, fontSize: 11, textAlign: 'center', marginTop: 12 },
-  pointRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 13 },
-  pointIcon: { width: 32, height: 32, borderRadius: 11, backgroundColor: C.burgundyLight, alignItems: 'center', justifyContent: 'center' },
-  pointLabel: { color: C.muted, fontSize: 9, fontWeight: '800', letterSpacing: 0.8 },
-  pointValue: { color: C.ink, fontSize: 12, fontWeight: '700', marginTop: 4 },
-  seatFareRow: { flexDirection: 'row', justifyContent: 'space-between' },
-  passengerSection: { marginTop: 22 },
-  sectionTitle: { color: C.ink, fontSize: 15, fontWeight: '800', marginBottom: 10 },
-  passengerCard: { flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: C.paper, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 12, marginBottom: 8 },
-  passengerAvatar: { width: 34, height: 34, borderRadius: 12, backgroundColor: C.burgundyLight, alignItems: 'center', justifyContent: 'center' },
-  passengerName: { color: C.ink, fontSize: 12, fontWeight: '700' },
-  passengerMeta: { color: C.muted, fontSize: 10, marginTop: 4 },
-  seatBadge: { backgroundColor: '#F1EEE8', paddingHorizontal: 10, paddingVertical: 7, borderRadius: 9 },
-  seatBadgeText: { color: C.ink, fontSize: 11, fontWeight: '800' },
-  supplierCard: { backgroundColor: C.paper, borderWidth: 1, borderColor: C.border, borderRadius: 14, padding: 14, marginTop: 10 },
-  supplierValue: { color: C.ink, fontSize: 13, fontWeight: '700', marginTop: 6 },
-  pendingNotice: { flexDirection: 'row', alignItems: 'flex-start', gap: 9, backgroundColor: C.amberLight, borderRadius: 13, padding: 13, marginTop: 17 },
-  pendingNoticeText: { flex: 1, color: '#76551F', fontSize: 11, lineHeight: 17 },
+  busIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 13,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  busName: { color: C.ink, fontSize: 15, fontWeight: '600' },
+  busType: { color: C.muted, fontSize: 12, marginTop: 3 },
+  datePill: {
+    paddingHorizontal: 10,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  dateText: { color: C.burgundy, fontSize: 12, fontWeight: '600' },
+  routeRow: { flexDirection: 'row', alignItems: 'center', marginTop: 20 },
+  routeStop: { flex: 1 },
+  routeTime: { color: C.ink, fontSize: 18, fontWeight: '700' },
+  routeCity: { color: C.muted, fontSize: 13, marginTop: 4 },
+  routeMiddle: {
+    flex: 1.1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 6,
+  },
+  routeDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: C.burgundy },
+  routeDash: { flex: 1, height: 1, backgroundColor: C.border, marginHorizontal: 3 },
+  tear: { height: 22, marginTop: 16, marginHorizontal: -16, justifyContent: 'center' },
+  tearLine: { marginHorizontal: 16, borderTopWidth: 1.5, borderStyle: 'dashed', borderColor: '#DCCFC4' },
+  notch: {
+    position: 'absolute',
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: C.bg,
+    borderWidth: 1,
+    borderColor: C.border,
+    top: 1,
+  },
+  ticketBottom: { flexDirection: 'row', gap: 14, marginTop: 6 },
+  ticketCol: { flex: 1, minWidth: 0 },
+  labelRow: { flexDirection: 'row', alignItems: 'center', gap: 5 },
+  metaLabel: { color: C.muted, fontSize: 12 },
+  metaValue: { color: C.ink, fontSize: 14, fontWeight: '600', marginTop: 5 },
+  metaTime: { color: C.burgundy, fontSize: 13, marginTop: 3 },
+  seatsStrip: {
+    marginTop: 14,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  seatTags: { flex: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
+  seatTag: {
+    minWidth: 34,
+    height: 28,
+    paddingHorizontal: 9,
+    borderRadius: 8,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seatTagText: { color: C.burgundy, fontSize: 13, fontWeight: '600' },
+
+  card: {
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 4,
+    marginTop: 14,
+  },
+  divider: { height: 1, backgroundColor: C.border },
+  refRow: { minHeight: 50, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
+  refLabel: { color: C.muted, fontSize: 13 },
+  refValueWrap: { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-end', gap: 9 },
+  refValue: { flexShrink: 1, color: C.ink, fontSize: 13, fontWeight: '500', textAlign: 'right' },
+  refStrong: { color: C.burgundy, fontSize: 16, fontWeight: '700' },
+  paid: { color: C.burgundy, fontSize: 16, fontWeight: '700' },
+
+  sectionTitle: { fontSize: 16, fontWeight: '600', color: C.ink, marginTop: 22, marginBottom: -4, paddingHorizontal: 2 },
+  passengerRow: { minHeight: 62, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 8 },
+  seatChip: {
+    minWidth: 44,
+    height: 44,
+    paddingHorizontal: 8,
+    borderRadius: 12,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  seatChipText: { color: C.burgundy, fontSize: 14, fontWeight: '600' },
+  passengerName: { fontSize: 15, fontWeight: '500', color: C.ink },
+  passengerMeta: { fontSize: 13, color: C.muted, marginTop: 3 },
+
+  note: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    backgroundColor: C.burgundyLight,
+    borderRadius: 14,
+    padding: 13,
+    marginTop: 16,
+  },
+  noteText: { flex: 1, color: C.burgundyDark, fontSize: 13, lineHeight: 19 },
+
   actions: { gap: 10, marginTop: 22 },
-  checkButton: { minHeight: 49, borderRadius: 14, backgroundColor: C.burgundy, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9 },
-  checkButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
-  doneButton: { minHeight: 49, borderRadius: 14, backgroundColor: C.burgundyDark, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 9 },
-  doneButtonText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  primaryButton: {
+    minHeight: 50,
+    borderRadius: 14,
+    backgroundColor: C.burgundy,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+  },
+  primaryText: { color: '#fff', fontSize: 15, fontWeight: '600' },
+  secondaryButton: {
+    minHeight: 50,
+    borderRadius: 14,
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 9,
+  },
+  secondaryText: { color: C.burgundy, fontSize: 15, fontWeight: '600' },
+
+  toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center', zIndex: 50, elevation: 50 },
+  toast: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    maxWidth: 420,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    borderRadius: 18,
+    backgroundColor: 'rgba(56, 43, 40, 0.95)',
+  },
+  toastIcon: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: '#A65372',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  toastText: { flexShrink: 1, color: '#fff', fontSize: 14 },
 });
