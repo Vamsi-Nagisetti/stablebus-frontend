@@ -39,7 +39,7 @@ const C = {
 
 type Passenger = {
   title?: string;
-  dob?: string; // API format YYYY-MM-DD
+  dob?: string; // API format DD/MM/YYYY
   name: string;
   age: string;
   gender: string;
@@ -53,7 +53,7 @@ type SavedPassenger = {
   age: number | string;
   gender: string;
   title?: string;
-  date_of_birth?: string;
+  date_of_birth?: string; // DD/MM/YYYY
 };
 
 /* =====================================================
@@ -164,16 +164,20 @@ function isValidDob(v: string): boolean {
   return dt.getFullYear() === y && dt.getMonth() === mo - 1 && dt.getDate() === d && dt <= new Date() && y >= 1900;
 }
 
-/** DD/MM/YYYY -> YYYY-MM-DD ('' when invalid) */
+/**
+ * The StableBus API expects date_of_birth as DD/MM/YYYY (it rejects YYYY-MM-DD with
+ * "Date of birth must be a valid date in DD/MM/YYYY format"), so the typed value is sent as it is.
+ * Returns '' when the date is not valid.
+ */
 function dobToApi(v: string): string {
-  if (!isValidDob(v)) return '';
-  const [d, m, y] = v.split('/');
-  return `${y}-${m}-${d}`;
+  return isValidDob(v) ? v : '';
 }
 
-/** YYYY-MM-DD -> DD/MM/YYYY ('' when missing) */
+/** Accepts DD/MM/YYYY (what the API uses) or YYYY-MM-DD and returns DD/MM/YYYY ('' when missing). */
 function apiToDob(v?: string): string {
-  const m = String(v || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  const text = String(v || '').trim();
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(text)) return text;
+  const m = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
   return m ? `${m[3]}/${m[2]}/${m[1]}` : '';
 }
 

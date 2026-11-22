@@ -28,6 +28,7 @@ import { useFocusEffect, useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
 import { searchApi } from '@/features/search/api';
 import type { City } from '@/types/api';
+import { menuSignals } from '@/features/home/menuSignals';
 import { setSearchResponse } from '@/features/search/resultsCache';
 
 const C = {
@@ -124,8 +125,8 @@ const SKETCH_BLEND_MS = 700;
 const LOAD_SKETCHES = [IMAGES.sketchReveal, IMAGES.sketchBridge];
 
 // Replace with your real pages.
-const TERMS_URL = 'https://stablebus.in/terms';
-const PRIVACY_URL = 'https://stablebus.in/privacy';
+const TERMS_URL = 'https://stablebus.com/terms';
+const PRIVACY_URL = 'https://stablebus.com/privacy';
 
 // Scenic cards: the app looks the cities up by name in the city list from the API.
 // If a name is not in your list the card shows a calm "not available" message.
@@ -150,6 +151,7 @@ const FOOTER_LINKS: { key: string; label: string; url?: string }[] = [
   { key: 'help', label: 'Help & support' },
   { key: 'terms', label: 'Terms', url: TERMS_URL },
   { key: 'privacy', label: 'Privacy', url: PRIVACY_URL },
+  { key: 'agreement', label: 'User Agreement', url: 'https://stablebus.com/user-agreement' },
 ];
 
 const POPULAR_ROUTES: [string, string][] = [
@@ -159,19 +161,6 @@ const POPULAR_ROUTES: [string, string][] = [
   ['Bengaluru', 'Tirupati'],
   ['Hyderabad', 'Bengaluru'],
   ['Vijayawada', 'Hyderabad'],
-];
-
-// Drawer: add the route of each page when it exists, e.g. bookings: '/bookings'.
-// Items without a route show a calm "coming soon" message.
-const DRAWER_ITEMS: { key: string; label: string; icon: keyof typeof Ionicons.glyphMap; route?: string }[] = [
-  { key: 'bookings', label: 'Bookings', icon: 'ticket-outline', route: undefined },
-  { key: 'rewards', label: 'Rewards', icon: 'gift-outline', route: undefined },
-  { key: 'personal', label: 'Personal information', icon: 'person-outline', route: undefined },
-  { key: 'passengers', label: 'Passengers', icon: 'people-outline', route: undefined },
-  { key: 'rate', label: 'Rate app', icon: 'star-outline', route: undefined },
-  { key: 'help', label: 'Help', icon: 'help-circle-outline', route: undefined },
-  { key: 'settings', label: 'Account settings', icon: 'settings-outline', route: undefined },
-  { key: 'notifications', label: 'Notifications', icon: 'notifications-outline', route: undefined },
 ];
 
 const MOBILE_RE = /^[6-9]\d{9}$/;
@@ -665,6 +654,7 @@ function OffersFooter({
   onOffer: (offer: (typeof OFFERS)[number]) => void;
   onHelp: () => void;
 }) {
+  const router = useRouter();
   return (
     <View style={s.footer}>
       <EdgeFade edge="top" height={120} />
@@ -725,7 +715,12 @@ function OffersFooter({
             <Pressable
               key={link.key}
               hitSlop={8}
-              onPress={() => (link.url ? openLink(link.url) : onHelp())}
+              onPress={() => {
+                if (link.key === 'help') router.push('/help' as any);
+                else if (link.key === 'terms') router.push('/terms' as any);
+                else if (link.key === 'privacy') router.push('/privacy' as any);
+                else if (link.key === 'agreement') router.push('/user-agreement' as any);
+              }}
             >
               <Text style={s.footerLink}>{link.label}</Text>
             </Pressable>
@@ -750,6 +745,7 @@ function WelcomeLogin({
   onLoggedIn: () => void;
 }) {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { width, height } = useWindowDimensions();
   const rootRef = useRef<View>(null);
   const keyboardTop = useKeyboardTop();
@@ -944,126 +940,12 @@ function WelcomeLogin({
 
           <Text style={s.termsOnPhoto}>
             By continuing you agree to our{' '}
-            <Text style={s.termsOnPhotoLink} onPress={() => openLink(TERMS_URL)}>Terms &amp; Conditions</Text>
+            <Text style={s.termsOnPhotoLink} onPress={() => router.push('/terms' as any)}>Terms &amp; Conditions</Text>
             {' '}and{' '}
-            <Text style={s.termsOnPhotoLink} onPress={() => openLink(PRIVACY_URL)}>Privacy Policy</Text>.
+            <Text style={s.termsOnPhotoLink} onPress={() => router.push('/privacy' as any)}>Privacy Policy</Text>.
           </Text>
         </View>
       </View>
-    </Modal>
-  );
-}
-
-/* ---------------- Profile drawer (full screen, slides in from the left) ---------------- */
-
-function ProfileDrawer({
-  visible,
-  authed,
-  onClose,
-  onLogin,
-  onLogout,
-  onItem,
-}: {
-  visible: boolean;
-  authed: boolean;
-  onClose: () => void;
-  onLogin: () => void;
-  onLogout: () => void;
-  onItem: (item: (typeof DRAWER_ITEMS)[number]) => void;
-}) {
-  const insets = useSafeAreaInsets();
-  const { width } = useWindowDimensions();
-  const slide = useRef(new Animated.Value(-width)).current;
-  const [rendered, setRendered] = useState(false);
-
-  useEffect(() => {
-    if (!visible) return;
-    setRendered(true);
-    slide.setValue(-width);
-    Animated.timing(slide, { toValue: 0, duration: 260, useNativeDriver: true }).start();
-  }, [visible, slide, width]);
-
-  const close = useCallback(
-    (after?: () => void) => {
-      Animated.timing(slide, { toValue: -width, duration: 220, useNativeDriver: true }).start(() => {
-        setRendered(false);
-        onClose();
-        after?.();
-      });
-    },
-    [slide, width, onClose]
-  );
-
-  return (
-    <Modal visible={rendered} transparent animationType="none" statusBarTranslucent navigationBarTranslucent onRequestClose={() => close()}>
-      <Animated.View style={[s.drawer, { transform: [{ translateX: slide }] }]}>
-        {/* moonlit header photo, melts into the page */}
-        <View style={{ height: insets.top + 190 }}>
-          <FocusImage
-            source={IMAGES.nightLake}
-            aspect={1000 / 563}
-            focusX={0.42}
-            width={width}
-            height={insets.top + 190}
-          />
-          <EdgeFade edge="bottom" height={84} />
-          <Pressable
-            onPress={() => close()}
-            style={[s.drawerClose, { top: insets.top + 10 }]}
-            accessibilityRole="button"
-            accessibilityLabel="Close menu"
-          >
-            <Ionicons name="close" size={20} color="#fff" />
-          </Pressable>
-        </View>
-
-        <View style={s.drawerWho}>
-          <View style={s.drawerAvatar}>
-            <Ionicons name="person-outline" size={26} color={C.burgundy} />
-          </View>
-          <View style={{ flex: 1, minWidth: 0 }}>
-            <Text style={s.drawerHello}>{authed ? 'Welcome back' : 'Hello, traveller'}</Text>
-            {authed ? (
-              <Text style={s.drawerSub}>Your trips and details</Text>
-            ) : (
-              <Pressable onPress={() => close(onLogin)} hitSlop={8}>
-                <Text style={s.linkText}>Log in or sign up</Text>
-              </Pressable>
-            )}
-          </View>
-        </View>
-
-        <ScrollView contentContainerStyle={s.drawerList} showsVerticalScrollIndicator={false}>
-          {DRAWER_ITEMS.map((item, index) => (
-            <Pressable
-              key={item.key}
-              style={[s.drawerRow, index > 0 && s.drawerRowBorder]}
-              onPress={() => close(() => onItem(item))}
-              android_ripple={{ color: C.burgundyLight }}
-            >
-              <View style={s.drawerIcon}>
-                <Ionicons name={item.icon} size={19} color={C.burgundy} />
-              </View>
-              <Text style={s.drawerLabel}>{item.label}</Text>
-              <Ionicons name="chevron-forward" size={17} color={C.muted} />
-            </Pressable>
-          ))}
-        </ScrollView>
-
-        <View style={[s.drawerFooter, { paddingBottom: insets.bottom + 16 }]}>
-          {authed && (
-            <Pressable style={s.logoutRow} onPress={() => close(onLogout)}>
-              <Ionicons name="log-out-outline" size={19} color={C.muted} />
-              <Text style={s.logoutText}>Log out</Text>
-            </Pressable>
-          )}
-          <Text style={s.drawerLegal}>
-            <Text style={s.termsLink} onPress={() => openLink(TERMS_URL)}>Terms &amp; Conditions</Text>
-            {'   ·   '}
-            <Text style={s.termsLink} onPress={() => openLink(PRIVACY_URL)}>Privacy Policy</Text>
-          </Text>
-        </View>
-      </Animated.View>
     </Modal>
   );
 }
@@ -1093,7 +975,6 @@ export default function Home() {
 
   const [authed, setAuthed] = useState(false);
   const [welcomeVisible, setWelcomeVisible] = useState(false);
-  const [drawerOpen, setDrawerOpen] = useState(false);
   const [scenicOpen, setScenicOpen] = useState(false);
   const scrollY = useRef(new Animated.Value(0)).current;
   const { height: viewportHeight } = useWindowDimensions();
@@ -1150,16 +1031,6 @@ export default function Home() {
     showToast('You are logged in.');
   };
 
-  const handleLogout = async () => {
-    try {
-      await clearTokens();
-    } catch {
-      /* ignore */
-    }
-    setAuthed(false);
-    showToast('You have been logged out.');
-  };
-
   const copyOffer = async (code: string) => {
     try {
       // expo-clipboard is optional: without it the code is simply shown in the message.
@@ -1173,11 +1044,6 @@ export default function Home() {
 
   const handleOffer = (offer: (typeof OFFERS)[number]) => {
     if (offer.route) router.push(offer.route as any);
-  };
-
-  const handleDrawerItem = (item: (typeof DRAWER_ITEMS)[number]) => {
-    if (item.route) router.push(item.route as any);
-    else showToast(`${item.label} is coming soon.`);
   };
 
   useEffect(() => {
@@ -1213,6 +1079,15 @@ export default function Home() {
   useFocusEffect(
     useCallback(() => {
       setSearching(false);
+      // Coming back from the menu screen: it may ask for the login screen, and the user may have
+      // logged in or out meanwhile.
+      getTokens()
+        .then(tokens => setAuthed(!!tokens))
+        .catch(() => undefined);
+      if (menuSignals.showWelcome) {
+        menuSignals.showWelcome = false;
+        setWelcomeVisible(true);
+      }
       return () => {
         if (searchingRef.current) {
           setTimeout(() => setSearching(false), 600);
@@ -1520,7 +1395,7 @@ export default function Home() {
               )}
               <Pressable
                 style={s.profile}
-                onPress={() => setDrawerOpen(true)}
+                onPress={() => router.push('/menu' as any)}
                 accessibilityRole="button"
                 accessibilityLabel="Open menu"
               >
@@ -1921,15 +1796,6 @@ export default function Home() {
           </ScrollView>
         </View>
       </Modal>
-
-      <ProfileDrawer
-        visible={drawerOpen}
-        authed={authed}
-        onClose={() => setDrawerOpen(false)}
-        onLogin={() => setWelcomeVisible(true)}
-        onLogout={handleLogout}
-        onItem={handleDrawerItem}
-      />
 
       <WelcomeLogin visible={welcomeVisible} onSkip={skipWelcome} onLoggedIn={handleLoggedIn} />
 
@@ -2768,10 +2634,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
   },
   drawerLabel: { flex: 1, color: C.ink, fontSize: 16 },
-  drawerFooter: { paddingHorizontal: 20, paddingTop: 12, borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.paper },
-  logoutRow: { minHeight: 46, flexDirection: 'row', alignItems: 'center', gap: 12 },
-  logoutText: { color: C.muted, fontSize: 15 },
-  drawerLegal: { color: C.muted, fontSize: 12, textAlign: 'center', marginTop: 8 },
+  drawerGroupGap: { height: 1, backgroundColor: C.border, marginTop: 14, marginBottom: 2 },
 
   /* Toast */
   toastWrap: { position: 'absolute', left: 16, right: 16, alignItems: 'center', zIndex: 50, elevation: 50 },

@@ -7,7 +7,7 @@ import {
 
 const BASE_URL = (
   process.env.EXPO_PUBLIC_API_BASE_URL ||
-  'https://blunderer-revival-referee.ngrok-free.dev'
+  'https://api.stablebus.com'
 ).replace(/\/+$/, '');
 
 console.log('[StableBus] Backend URL:', BASE_URL);
@@ -49,6 +49,44 @@ function makeError(
 
 let refreshPromise: Promise<string | null> | null = null;
 
+/** Reads the "exp" (expiry, in seconds) from a JWT without any library. Returns null if it can't be read. */
+function tokenExpiry(token: string | null | undefined): number | null {
+  try {
+    if (!token) return null;
+    const part = token.split('.')[1];
+    if (!part) return null;
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    let bits = 0;
+    let value = 0;
+    let out = '';
+    for (const c of b64) {
+      const index = chars.indexOf(c);
+      if (index < 0) continue; // padding
+      value = (value << 6) | index;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((value >> bits) & 0xff);
+      }
+    }
+    const exp = JSON.parse(out)?.exp;
+    return typeof exp === 'number' ? exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** True when the token is already expired, or will be within the next 30 seconds. */
+function isExpiringSoon(token: string | null | undefined): boolean {
+  const exp = tokenExpiry(token);
+  return exp !== null && exp * 1000 - Date.now() < 30000;
+}
+
+/**
+ * Gets a new access token. The saved login is cleared ONLY when the server clearly says the refresh token
+ * is no longer valid (400/401/403). A network hiccup or a server error keeps the login so the next try works.
+ */
 async function refreshAccessToken(): Promise<string | null> {
   if (refreshPromise) {
     return refreshPromise;
@@ -59,42 +97,49 @@ async function refreshAccessToken(): Promise<string | null> {
       const refreshToken = await getRefreshToken();
 
       if (!refreshToken) {
-        await clearTokens();
         return null;
       }
 
-      const response = await fetch(`${BASE_URL}/api/v1/auth/refresh`, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-          'ngrok-skip-browser-warning': 'true',
-        },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      });
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const response = await fetch(`${BASE_URL}/api/v1/auth/refresh`, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+              'ngrok-skip-browser-warning': 'true',
+            },
+            body: JSON.stringify({ refresh_token: refreshToken }),
+          });
 
-      if (!response.ok) {
-        await clearTokens();
-        return null;
+          if (response.ok) {
+            const data = (await response.json()) as TokenResponse;
+
+            if (data.access_token && data.refresh_token) {
+              await saveTokens({
+                access_token: data.access_token,
+                refresh_token: data.refresh_token,
+              });
+              return data.access_token;
+            }
+            return null;
+          }
+
+          if ([400, 401, 403].includes(response.status)) {
+            // The refresh token itself is expired or already used: the user has to log in again.
+            await clearTokens();
+            return null;
+          }
+
+          console.warn('[StableBus API] Token refresh failed with status', response.status);
+        } catch (error) {
+          console.warn('[StableBus API] Token refresh interrupted:', error);
+        }
+
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 500));
       }
 
-      const data = (await response.json()) as TokenResponse;
-
-      if (!data.access_token || !data.refresh_token) {
-        await clearTokens();
-        return null;
-      }
-
-      await saveTokens({
-        access_token: data.access_token,
-        refresh_token: data.refresh_token,
-      });
-
-      return data.access_token;
-    } catch (error) {
-      console.warn('[StableBus API] Token refresh failed:', error);
-      await clearTokens();
-      return null;
+      return null; // could not refresh right now; the saved login is kept
     } finally {
       refreshPromise = null;
     }
@@ -235,6 +280,12 @@ async function requestOnce<T>(
 
     let accessToken = await getAccessToken();
 
+    // Renew in advance, so the request never goes out with a token that is about to expire.
+    if (accessToken && !isAuthEndpoint(path) && isExpiringSoon(accessToken)) {
+      const fresh = await refreshAccessToken();
+      if (fresh) accessToken = fresh;
+    }
+
     console.log(
       '[StableBus API] Access token read:',
       !!accessToken
@@ -249,11 +300,18 @@ async function requestOnce<T>(
       timeoutMs
     );
 
-    if (
-      response.status === 401 &&
-      accessToken &&
-      !isAuthEndpoint(path)
-    ) {
+    let looksExpired = response.status === 401;
+    if (!looksExpired && response.status === 403 && accessToken) {
+      // Some servers answer 403 for an expired token.
+      try {
+        const text = await response.clone().text();
+        looksExpired = /expired|invalid.*token|token.*invalid/i.test(text);
+      } catch {
+        looksExpired = false;
+      }
+    }
+
+    if (looksExpired && accessToken && !isAuthEndpoint(path)) {
       const newAccessToken = await refreshAccessToken();
 
       if (newAccessToken) {

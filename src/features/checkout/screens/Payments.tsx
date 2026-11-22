@@ -17,6 +17,15 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import RazorpayCheckout from 'react-native-razorpay';
 import { request } from '@/services/http';
 
+// The booking API accepts operator_name (and rejects other unknown fields such as bus_type or city names),
+// so only the operator is sent. Set to false to leave it out.
+const SEND_BUS_DETAILS = true;
+
+// The booking API also stores boarding_point as-is, so the rest of the bus details (type, times, city names)
+// travel inside it under "_bus". Bookings and the confirmation email read them from there.
+// If the API ever rejects the booking because of this, set it to false.
+const SEND_BUS_IN_POINT = true;
+
 const C = {
   bg: '#F8F4ED',
   paper: '#FFFEFC',
@@ -439,8 +448,23 @@ function getBookingPayload() {
     boarding_id: String(boardingId),
     dropping_id: String(droppingId),
     // Preserve the complete selected points for the confirmation email.
-  boarding_point: boarding,
+  boarding_point: SEND_BUS_IN_POINT
+      ? {
+          ...boarding,
+          _bus: {
+            operator_name: bus.operator_Name || bus.travel_Name || '',
+            bus_type: bus.bus_Type || bus.seat_Layout || '',
+            departure_time: bus.departure_Time || '',
+            arrival_time: bus.arrival_Time || '',
+            source_city_name: from || '',
+            destination_city_name: to || '',
+          },
+        }
+      : boarding,
   dropping_point: dropping,
+    ...(SEND_BUS_DETAILS && (bus.operator_Name || bus.travel_Name)
+      ? { operator_name: bus.operator_Name || bus.travel_Name }
+      : {}),
     passengers: passengerRequests,
 
   };
@@ -778,7 +802,7 @@ function getBookingPayload() {
         <View style={{ flex: 1 }}>
           <Text style={styles.headerTitle}>Payment</Text>
           <Text style={styles.headerSubtitle} numberOfLines={1}>
-            {[`${from} → ${to}`, dateLabel].filter(Boolean).join(' · ')}
+            Review and complete your booking
           </Text>
         </View>
 
@@ -791,6 +815,26 @@ function getBookingPayload() {
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
       >
+        {/* Booking steps: Passengers -> Payment -> Ticket */}
+        <View style={styles.stepper}>
+          <View style={styles.stepItem}>
+            <Ionicons name="checkmark-circle" size={17} color={C.green} />
+            <Text style={styles.stepLabel}>Passengers</Text>
+          </View>
+          <View style={[styles.stepLine, styles.stepLineDone]} />
+          <View style={styles.stepItem}>
+            <View style={styles.stepNow}>
+              <View style={styles.stepNowDot} />
+            </View>
+            <Text style={[styles.stepLabel, styles.stepLabelActive]}>Payment</Text>
+          </View>
+          <View style={styles.stepLine} />
+          <View style={styles.stepItem}>
+            <View style={styles.stepNext} />
+            <Text style={styles.stepLabel}>Ticket</Text>
+          </View>
+        </View>
+
         {/* Ticket */}
         <View style={styles.ticket}>
           <View style={styles.ticketTop}>
@@ -1055,6 +1099,35 @@ const styles = StyleSheet.create({
     maxWidth: 680,
     alignSelf: 'center',
   },
+
+  /* booking steps */
+  stepper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 11,
+    marginBottom: 14,
+  },
+  stepItem: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  stepNow: {
+    width: 17,
+    height: 17,
+    borderRadius: 9,
+    borderWidth: 1.5,
+    borderColor: C.burgundy,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepNowDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: C.burgundy },
+  stepNext: { width: 17, height: 17, borderRadius: 9, borderWidth: 1.5, borderColor: '#D9CEC5' },
+  stepLine: { flex: 1, minWidth: 12, height: 1, backgroundColor: C.border, marginHorizontal: 8 },
+  stepLineDone: { backgroundColor: '#B9CDBF' },
+  stepLabel: { fontSize: 12.5, color: C.muted },
+  stepLabelActive: { color: C.burgundy, fontWeight: '500' },
 
   /* ticket (same look as the passenger screen) */
   ticket: {
