@@ -8,7 +8,7 @@
     "orientation": "portrait",
     "userInterfaceStyle": "light",
 
-    "icon": "src/assets/scenic/icon_ticket.png",
+    "icon": "./src/assets/scenic/stablebus_app_icon_1024.png",
 
     "plugins": [
       "expo-router",
@@ -20,7 +20,7 @@
     "android": {
       "package": "com.stablebus.app",
       "adaptiveIcon": {
-        "foregroundImage": "src/assets/scenic/icon_ticket.png",
+        "foregroundImage": "./src/assets/scenic/stablebus_adaptive_foreground_1024.png",
         "backgroundColor": "#F8F4ED"
       }
     },
