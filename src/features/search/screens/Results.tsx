@@ -20,6 +20,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { searchApi } from '@/features/search/api';
 import { getSearchResponse } from '@/features/search/resultsCache';
+import { buildItems, filterItems, type Item as PointItem, type Kind as PointKind } from '@/features/search/pointHelpers';
 
 const C = {
   bg: '#F8F4ED',
@@ -382,13 +383,17 @@ const BusCard = memo(function BusCard({
   from,
   to,
   onPress,
+  onViewPoints,
 }: {
   row: Row;
   from: string;
   to: string;
   onPress: (bus: Bus) => void;
+  onViewPoints: (bus: Bus, kind: PointKind) => void;
 }) {
   const { bus } = row;
+  const boardingCount = Array.isArray(bus.boardingDetails) ? bus.boardingDetails.length : 0;
+  const droppingCount = Array.isArray(bus.droppingDetails) ? bus.droppingDetails.length : 0;
   return (
     <Pressable
       style={s.busCard}
@@ -425,22 +430,22 @@ const BusCard = memo(function BusCard({
       <View style={s.tags}>
         <View style={s.typeTag}>
           <Ionicons name={row.ac ? 'snow-outline' : 'sunny-outline'} size={13} color={C.muted} />
-          <Text style={s.typeTagText}>{row.ac ? 'AC' : 'NON-AC'}</Text>
+          <Text style={s.typeTagText}>{row.ac ? 'AC' : 'Non-AC'}</Text>
         </View>
         {row.mixed ? (
           <View style={s.typeTag}>
             <Ionicons name="bed-outline" size={13} color={C.muted} />
-            <Text style={s.typeTagText}>SEATER / SLEEPER</Text>
+            <Text style={s.typeTagText}>Seater / sleeper</Text>
           </View>
         ) : row.sleeper ? (
           <View style={s.typeTag}>
             <Ionicons name="bed-outline" size={13} color={C.muted} />
-            <Text style={s.typeTagText}>SLEEPER</Text>
+            <Text style={s.typeTagText}>Sleeper</Text>
           </View>
         ) : row.seater ? (
           <View style={s.typeTag}>
             <Ionicons name="person-outline" size={13} color={C.muted} />
-            <Text style={s.typeTagText}>SEATER</Text>
+            <Text style={s.typeTagText}>Seater</Text>
           </View>
         ) : null}
       </View>
@@ -476,6 +481,20 @@ const BusCard = memo(function BusCard({
         <Ionicons name="ticket-outline" size={13} color={C.muted} />
         <Text style={s.seatCount}>{bus.available_Seats ?? '—'} seats available</Text>
       </View>
+
+      {(boardingCount > 0 || droppingCount > 0) && (
+        <Pressable
+          style={s.pointsLink}
+          onPress={() => onViewPoints(bus, boardingCount > 0 ? 'boarding' : 'dropping')}
+          hitSlop={{ top: 6, bottom: 6 }}
+          accessibilityRole="button"
+          accessibilityLabel="View boarding and dropping points"
+        >
+          <Ionicons name="location-outline" size={15} color={C.burgundy} />
+          <Text style={s.pointsLinkText}>Boarding & dropping points</Text>
+          <Ionicons name="chevron-forward" size={14} color={C.muted} />
+        </Pressable>
+      )}
     </Pressable>
   );
 });
@@ -734,6 +753,151 @@ function useKeyboardOverlap(ref: React.RefObject<View | null>, keyboardTop: numb
   return { overlap, frame, measure };
 }
 
+/* ---------------------------------------------------------------- */
+/* Read-only viewer of a bus's boarding and dropping points          */
+/* ---------------------------------------------------------------- */
+const PointsViewer = memo(function PointsViewer({
+  bus,
+  initialKind,
+  from,
+  to,
+  onClose,
+  isMobile,
+}: {
+  bus: Bus | null;
+  initialKind: PointKind;
+  from: string;
+  to: string;
+  onClose: () => void;
+  isMobile: boolean;
+}) {
+  const insets = useSafeAreaInsets();
+  const { height: windowHeight } = useWindowDimensions();
+  const backdropRef = useRef<View>(null);
+  const keyboardTop = useKeyboardTop();
+  const { overlap, frame, measure } = useKeyboardOverlap(backdropRef, keyboardTop);
+  const availableHeight = frame.h > 0 ? frame.h : windowHeight;
+
+  const [kind, setKind] = useState<PointKind>(initialKind);
+  const [queries, setQueries] = useState<Record<PointKind, string>>({ boarding: '', dropping: '' });
+
+  useEffect(() => {
+    if (bus) {
+      setKind(initialKind);
+      setQueries({ boarding: '', dropping: '' });
+    }
+  }, [bus, initialKind]);
+
+  const boardingItems = useMemo(() => buildItems(bus?.boardingDetails || [], 'boarding'), [bus]);
+  const droppingItems = useMemo(() => buildItems(bus?.droppingDetails || [], 'dropping'), [bus]);
+
+  const all = kind === 'boarding' ? boardingItems : droppingItems;
+  const query = queries[kind];
+  const items = useMemo(() => filterItems(all, query), [all, query]);
+
+  return (
+    <Modal visible={!!bus} transparent animationType="slide" statusBarTranslucent onRequestClose={onClose}>
+      <View ref={backdropRef} collapsable={false} onLayout={measure} style={s.modalBackdrop}>
+        <Pressable style={StyleSheet.absoluteFill} onPress={onClose} />
+
+        <View
+          style={[
+            s.pointsSheet,
+            !isMobile && s.filterSheetWide,
+            {
+              marginBottom: overlap || (isMobile ? 0 : 20),
+              height: Math.max(320, (availableHeight - overlap) * 0.82),
+            },
+          ]}
+        >
+          <View style={s.sheetHandle} />
+
+          <View style={s.sheetHeader}>
+            <View style={{ flex: 1, minWidth: 0, paddingRight: 10 }}>
+              <Text style={s.sheetTitle} numberOfLines={1}>{bus?.operator_Name || 'Bus operator'}</Text>
+              <Text style={s.sheetSubtitle} numberOfLines={1}>{from} → {to}</Text>
+            </View>
+            <Pressable style={s.closeButton} onPress={onClose} accessibilityLabel="Close">
+              <Ionicons name="close" size={20} color={C.ink} />
+            </Pressable>
+          </View>
+
+          <View style={s.viewerTabs}>
+            {(['boarding', 'dropping'] as PointKind[]).map(k => {
+              const active = kind === k;
+              const count = k === 'boarding' ? boardingItems.length : droppingItems.length;
+              return (
+                <Pressable key={k} onPress={() => setKind(k)} style={[s.viewerTab, active && s.viewerTabActive]}>
+                  <Text style={[s.viewerTabText, active && s.viewerTabTextActive]}>
+                    {k === 'boarding' ? 'Boarding' : 'Dropping'}
+                  </Text>
+                  <Text style={[s.viewerTabCount, active && s.viewerTabTextActive]}>{count}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
+          <View style={s.viewerSearch}>
+            <Ionicons name="search-outline" size={17} color={C.muted} />
+            <TextInput
+              value={query}
+              onChangeText={text => setQueries(current => ({ ...current, [kind]: text }))}
+              placeholder={kind === 'boarding' ? 'Search boarding points' : 'Search dropping points'}
+              placeholderTextColor={C.muted}
+              style={s.viewerSearchInput}
+              returnKeyType="search"
+              autoCorrect={false}
+              autoCapitalize="none"
+            />
+            {!!query && (
+              <Pressable onPress={() => setQueries(current => ({ ...current, [kind]: '' }))} hitSlop={10}>
+                <Ionicons name="close-circle" size={17} color="#C9BDB4" />
+              </Pressable>
+            )}
+          </View>
+
+          <FlatList
+            data={items}
+            keyExtractor={(item: PointItem) => item.id}
+            keyboardShouldPersistTaps="handled"
+            keyboardDismissMode="on-drag"
+            showsVerticalScrollIndicator={false}
+            contentContainerStyle={[s.viewerList, { paddingBottom: 18 + (keyboardTop != null ? 0 : insets.bottom) }]}
+            ItemSeparatorComponent={() => <View style={s.viewerDivider} />}
+            ListEmptyComponent={
+              <Text style={s.viewerEmpty}>
+                {query.trim() ? `No ${kind} points match "${query.trim()}".` : `No ${kind} points listed.`}
+              </Text>
+            }
+            renderItem={({ item }: { item: PointItem }) => (
+              <View style={s.viewerRow}>
+                <View style={s.viewerPin}>
+                  <Ionicons
+                    name={kind === 'boarding' ? 'location-outline' : 'flag-outline'}
+                    size={15}
+                    color={C.burgundy}
+                  />
+                </View>
+                <View style={{ flex: 1, minWidth: 0 }}>
+                  <Text style={s.viewerName}>{item.name}</Text>
+                  {!!item.address && <Text style={s.viewerAddress}>{item.address}</Text>}
+                  {item.notes.map(note => (
+                    <View key={note.text} style={s.viewerNote}>
+                      <Ionicons name={note.icon} size={13} color="#B3924F" />
+                      <Text style={s.viewerNoteText}>{note.text}</Text>
+                    </View>
+                  ))}
+                </View>
+                {!!item.time && <Text style={s.viewerTime}>{item.time}</Text>}
+              </View>
+            )}
+          />
+        </View>
+      </View>
+    </Modal>
+  );
+});
+
 /** Calm full-screen loader: a title, one line of context and a thin progress bar. No illustration. */
 function OpeningLoader({ visible, title, subtitle }: { visible: boolean; title: string; subtitle?: string }) {
   const progress = useRef(new Animated.Value(0)).current;
@@ -808,6 +972,11 @@ export default function Results() {
   const [showSort, setShowSort] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
   const [appliedFilters, setAppliedFilters] = useState<FilterState>(emptyFilters);
+
+  // Boarding / dropping points viewer
+  const [pointsView, setPointsView] = useState<{ bus: Bus; kind: PointKind } | null>(null);
+  const viewPoints = useCallback((bus: Bus, kind: PointKind) => setPointsView({ bus, kind }), []);
+  const closePoints = useCallback(() => setPointsView(null), []);
 
   // Opening the seat screen
   const [openingSeats, setOpeningSeats] = useState(false);
@@ -1003,9 +1172,9 @@ export default function Results() {
 
   const renderItem = useCallback(
     ({ item }: { item: Row }) => (
-      <BusCard row={item} from={from} to={to} onPress={openBus} />
+      <BusCard row={item} from={from} to={to} onPress={openBus} onViewPoints={viewPoints} />
     ),
-    [from, to, openBus]
+    [from, to, openBus, viewPoints]
   );
 
   const keyExtractor = useCallback((item: Row) => item.key, []);
@@ -1043,7 +1212,7 @@ export default function Results() {
             <Ionicons
               name="options-outline"
               size={18}
-              color={activeFilterCount > 0 ? C.white : C.burgundy}
+              color={C.burgundy}
             />
             <Text style={[s.filterButtonText, activeFilterCount > 0 && s.filterButtonTextActive]}>
               Filters{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
@@ -1069,7 +1238,7 @@ export default function Results() {
                 <Ionicons
                   name={TYPE_ICONS[item]}
                   size={16}
-                  color={active ? C.white : C.burgundy}
+                  color={C.burgundy}
                 />
                 <Text style={[s.filterText, active && s.filterTextActive]}>{item}</Text>
               </Pressable>
@@ -1344,6 +1513,15 @@ export default function Results() {
         isMobile={isMobile}
       />
 
+      <PointsViewer
+        bus={pointsView?.bus ?? null}
+        initialKind={pointsView?.kind ?? 'boarding'}
+        from={from}
+        to={to}
+        onClose={closePoints}
+        isMobile={isMobile}
+      />
+
       {/* FULL-SCREEN LOADER WHILE OPENING SEATS */}
       <OpeningLoader
         visible={openingSeats}
@@ -1363,9 +1541,7 @@ const s = StyleSheet.create({
   },
 
   header: {
-    backgroundColor: C.paper,
-    borderBottomWidth: 1,
-    borderBottomColor: C.border,
+    backgroundColor: C.bg,
   },
   headerInner: {
     height: 65,
@@ -1375,15 +1551,17 @@ const s = StyleSheet.create({
     gap: 12,
   },
   backButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 13,
-    backgroundColor: C.bg,
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
     alignItems: 'center',
     justifyContent: 'center',
   },
   headerRoute: { flex: 1, minWidth: 0 },
-  headerTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
+  headerTitle: { fontSize: 16, fontWeight: '400', color: C.ink },
   routeArrow: { color: C.burgundy },
   headerDate: { fontSize: 12, color: C.muted, marginTop: 3 },
   editButton: {
@@ -1395,7 +1573,7 @@ const s = StyleSheet.create({
     borderRadius: 9,
     backgroundColor: C.burgundyLight,
   },
-  editText: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
+  editText: { fontSize: 13, color: C.burgundy, fontWeight: '400' },
 
   scroll: { paddingHorizontal: 13, paddingTop: 15, paddingBottom: 35 },
   content: { width: '100%' },
@@ -1405,7 +1583,7 @@ const s = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 14,
   },
-  pageTitle: { fontSize: 22, fontWeight: '700', color: C.ink },
+  pageTitle: { fontSize: 19, fontWeight: '400', color: C.ink },
   resultCount: { fontSize: 12, color: C.muted, marginTop: 4 },
   dateBadge: {
     flexDirection: 'row',
@@ -1416,7 +1594,7 @@ const s = StyleSheet.create({
     borderRadius: 9,
     backgroundColor: C.burgundyLight,
   },
-  dateBadgeText: { fontSize: 12, color: C.burgundy, fontWeight: '600' },
+  dateBadgeText: { fontSize: 12, color: C.burgundy, fontWeight: '400' },
 
   controls: {
     flexDirection: 'row',
@@ -1443,9 +1621,9 @@ const s = StyleSheet.create({
     borderColor: C.border,
     backgroundColor: C.paper,
   },
-  filterChipActive: { backgroundColor: C.burgundy, borderColor: C.burgundy },
-  filterText: { fontSize: 13, color: C.muted, fontWeight: '600' },
-  filterTextActive: { color: C.white, fontWeight: '700' },
+  filterChipActive: { backgroundColor: C.burgundyLight, borderColor: '#DDBFC5' },
+  filterText: { fontSize: 13, color: C.muted, fontWeight: '400' },
+  filterTextActive: { color: C.burgundy, fontWeight: '500' },
 
   filterButton: {
     flexDirection: 'row',
@@ -1460,9 +1638,9 @@ const s = StyleSheet.create({
     height: 44,
     justifyContent: 'center',
   },
-  filterButtonActive: { backgroundColor: C.burgundy, borderColor: C.burgundy },
-  filterButtonText: { fontSize: 13, color: C.ink, fontWeight: '600' },
-  filterButtonTextActive: { color: C.white },
+  filterButtonActive: { backgroundColor: C.burgundyLight, borderColor: '#DDBFC5' },
+  filterButtonText: { fontSize: 13, color: C.ink, fontWeight: '500' },
+  filterButtonTextActive: { color: C.burgundy },
 
   sortButton: {
     flexDirection: 'row',
@@ -1477,7 +1655,7 @@ const s = StyleSheet.create({
     height: 44,
     justifyContent: 'center',
   },
-  sortButtonText: { fontSize: 13, color: C.ink, fontWeight: '600' },
+  sortButtonText: { fontSize: 13, color: C.ink, fontWeight: '500' },
   sortOption: {
     minHeight: 54,
     flexDirection: 'row',
@@ -1487,7 +1665,7 @@ const s = StyleSheet.create({
     borderBottomColor: C.border,
   },
   sortOptionText: { fontSize: 15, color: C.muted },
-  sortOptionSelected: { color: C.burgundy, fontWeight: '700' },
+  sortOptionSelected: { color: C.burgundy, fontWeight: '500' },
   sortLabel: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1495,16 +1673,21 @@ const s = StyleSheet.create({
     marginBottom: 11,
   },
   sortLabelText: { fontSize: 12, color: C.muted },
-  clearSort: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
+  clearSort: { fontSize: 13, color: C.burgundy, fontWeight: '500' },
 
   busList: { gap: 9 },
   busCard: {
     backgroundColor: C.paper,
-    borderRadius: 13,
+    borderRadius: 18,
     borderWidth: 1,
     borderColor: C.border,
-    padding: 14,
+    padding: 16,
     overflow: 'hidden',
+    shadowColor: '#783D4A',
+    shadowOpacity: 0.05,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 4 },
+    elevation: 1,
   },
   busTop: {
     flexDirection: 'row',
@@ -1528,13 +1711,13 @@ const s = StyleSheet.create({
     justifyContent: 'center',
   },
   operatorText: { flex: 1, minWidth: 0 },
-  operatorName: { fontSize: 14, fontWeight: '700', color: C.ink },
-  busType: { fontSize: 11, color: C.muted, marginTop: 3, lineHeight: 15},
+  operatorName: { fontSize: 15, fontWeight: '500', color: C.burgundy },
+  busType: { fontSize: 12, color: C.muted, marginTop: 3, lineHeight: 16 },
   fareBlock: { alignItems: 'flex-end', minWidth: 85 },
   fareCaption: { fontSize: 10, color: C.muted },
   fareValue: {
-    fontSize: 19,
-    fontWeight: '700',
+    fontSize: 17,
+    fontWeight: '500',
     color: C.burgundy,
     marginTop: 2,
   },
@@ -1544,7 +1727,7 @@ const s = StyleSheet.create({
     gap: 3,
     marginTop: 3,
   },
-  ratingText: { fontSize: 11, color: C.muted, fontWeight: '600' },
+  ratingText: { fontSize: 11, color: C.muted, fontWeight: '500' },
 
   tags: { flexDirection: 'row', flexWrap: 'wrap', gap: 5, marginTop: 6 },
   typeTag: {
@@ -1557,11 +1740,10 @@ const s = StyleSheet.create({
     backgroundColor: '#F3EFE9',
   },
   typeTagText: {
-    fontSize: 10,
+    fontSize: 11.5,
     color: C.muted,
-    fontWeight: '700',
-    letterSpacing: 0.2,
-  },
+    fontWeight: '400',
+      },
   cardDivider: { height: 1, backgroundColor: C.border, marginVertical: 7 },
 
   journeySection: {
@@ -1579,12 +1761,12 @@ const s = StyleSheet.create({
   timelineStops: { flex: 1, justifyContent: 'space-between', minWidth: 0 },
   timelineStop: { flex: 1, justifyContent: 'center', paddingVertical: 1 },
   timeValue: {
-    fontSize: 17,
-    fontWeight: '700',
+    fontSize: 16,
+    fontWeight: '500',
     color: C.ink,
-    letterSpacing: -0.3,
+    
   },
-  timeCaption: { fontSize: 11, color: C.muted, marginTop: 2, maxWidth: 160},
+  timeCaption: { fontSize: 12, color: C.muted, marginTop: 2, maxWidth: 160 },
   timelineTrack: {
     width: 18,
     alignItems: 'center',
@@ -1614,7 +1796,7 @@ const s = StyleSheet.create({
     minWidth: 75,
     paddingLeft: 6,
   },
-  durationText: { fontSize: 14, color: C.ink, fontWeight: '700' },
+  durationText: { fontSize: 14, color: C.ink, fontWeight: '500' },
   durationCaption: {
     fontSize: 10,
     color: C.muted,
@@ -1628,7 +1810,7 @@ const s = StyleSheet.create({
     gap: 4,
     marginTop: 3,
   },
-  seatCount: { fontSize: 11, color: C.muted, fontWeight: '500' },
+  seatCount: { fontSize: 12, color: C.muted },
 
   emptyCard: {
     backgroundColor: C.paper,
@@ -1648,7 +1830,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: 13,
   },
-  emptyTitle: { fontSize: 17, fontWeight: '700', color: C.ink },
+  emptyTitle: { fontSize: 17, fontWeight: '500', color: C.ink },
   emptySubtitle: {
     fontSize: 13,
     lineHeight: 19,
@@ -1664,7 +1846,7 @@ const s = StyleSheet.create({
     paddingHorizontal: 17,
     paddingVertical: 14,
   },
-  backHomeText: { color: C.white, fontSize: 13, fontWeight: '600' },
+  backHomeText: { color: C.white, fontSize: 13, fontWeight: '500' },
   bottomNote: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -1677,7 +1859,7 @@ const s = StyleSheet.create({
   // Date calendar
   dateBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(35, 27, 25, 0.48)',
+    backgroundColor: 'rgba(35, 27, 25, 0.32)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 18,
@@ -1695,7 +1877,7 @@ const s = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
-  calendarTitle: { fontSize: 18, fontWeight: '700', color: C.ink },
+  calendarTitle: { fontSize: 18, fontWeight: '500', color: C.ink },
   calendarSubtitle: { fontSize: 12, color: C.muted, marginTop: 4 },
   monthNavigation: {
     flexDirection: 'row',
@@ -1713,7 +1895,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
   },
   disabledArrow: { opacity: 0.3 },
-  monthTitle: { fontSize: 15, fontWeight: '700', color: C.burgundy },
+  monthTitle: { fontSize: 15, fontWeight: '500', color: C.burgundy },
   calendarGrid: { flexDirection: 'row', flexWrap: 'wrap' },
   calendarCell: {
     width: '14.2857%',
@@ -1721,12 +1903,12 @@ const s = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  weekdayText: { fontSize: 12, color: C.muted, fontWeight: '700' },
+  weekdayText: { fontSize: 12, color: C.muted, fontWeight: '500' },
   calendarDay: { borderRadius: 12 },
   calendarDaySelected: { backgroundColor: C.burgundy },
   calendarDayDisabled: { opacity: 0.3 },
-  calendarDayText: { fontSize: 14, color: C.ink, fontWeight: '600' },
-  calendarDayTextSelected: { color: C.white, fontWeight: '700' },
+  calendarDayText: { fontSize: 14, color: C.ink, fontWeight: '500' },
+  calendarDayTextSelected: { color: C.white, fontWeight: '500' },
   calendarDayTextDisabled: { color: '#B8ADA5' },
   selectedDateRow: {
     flexDirection: 'row',
@@ -1737,7 +1919,7 @@ const s = StyleSheet.create({
     padding: 11,
     marginTop: 15,
   },
-  selectedDateText: { fontSize: 13, color: C.burgundy, fontWeight: '600' },
+  selectedDateText: { fontSize: 13, color: C.burgundy, fontWeight: '500' },
   dateErrorRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 8, marginTop: 12, paddingHorizontal: 2 },
   dateErrorText: { flex: 1, color: C.burgundy, fontSize: 13, lineHeight: 19 },
   searchDateButton: {
@@ -1751,12 +1933,12 @@ const s = StyleSheet.create({
     marginTop: 13,
   },
   searchDateButtonDisabled: { opacity: 0.65 },
-  searchDateButtonText: { color: C.white, fontSize: 14, fontWeight: '700' },
+  searchDateButtonText: { color: C.white, fontSize: 14, fontWeight: '500' },
 
   // Filter modal
   modalBackdrop: {
     flex: 1,
-    backgroundColor: 'rgba(35, 27, 25, 0.42)',
+    backgroundColor: 'rgba(35, 27, 25, 0.3)',
     justifyContent: 'flex-end',
   },
   filterSheet: {
@@ -1791,7 +1973,7 @@ const s = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
-  sheetTitle: { fontSize: 21, fontWeight: '700', color: C.ink },
+  sheetTitle: { fontSize: 19, fontWeight: '400', color: C.ink },
   sheetSubtitle: { fontSize: 12, color: C.muted, marginTop: 3 },
   closeButton: {
     width: 44,
@@ -1809,7 +1991,7 @@ const s = StyleSheet.create({
     borderBottomColor: C.border,
   },
   filterSectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 11 },
-  filterSectionTitle: { fontSize: 14, fontWeight: '600', color: C.ink },
+  filterSectionTitle: { fontSize: 14, fontWeight: '500', color: C.ink },
   optionHint: { fontSize: 11, color: C.muted, marginTop: 2 },
   filterOptions: {
     flexDirection: 'row',
@@ -1869,7 +2051,7 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: C.paper,
   },
-  clearButtonText: { fontSize: 14, fontWeight: '600', color: C.burgundy },
+  clearButtonText: { fontSize: 14, fontWeight: '500', color: C.burgundy },
   applyButton: {
     flex: 1.5,
     height: 52,
@@ -1878,15 +2060,87 @@ const s = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: C.burgundy,
   },
-  applyButtonText: { fontSize: 14, fontWeight: '700', color: C.white },
+  applyButtonText: { fontSize: 14, fontWeight: '500', color: C.white },
   loaderScreen: { flex: 1, backgroundColor: '#F8F4ED', alignItems: 'center', justifyContent: 'center', paddingHorizontal: 25 },
-  loaderTitle: { color: '#382B28', fontSize: 20, fontWeight: '600', letterSpacing: -0.3, textAlign: 'center' },
+  loaderTitle: { color: '#382B28', fontSize: 20, fontWeight: '500',  textAlign: 'center' },
   loaderSubtitle: { color: '#887A73', fontSize: 13, fontWeight: '500', marginTop: 8, textAlign: 'center' },
   loaderTrack: { width: 190, height: 3, borderRadius: 9, overflow: 'hidden', backgroundColor: '#E9DDD7', marginTop: 22 },
   loaderFill: { width: '34%', height: '100%', borderRadius: 9, backgroundColor: '#783D4A' },
   controlsDivider: { width: 1, height: 24, backgroundColor: C.border, marginHorizontal: 2 },
   listSeparator: { height: 10 },
-  sortBackdrop: { flex: 1, backgroundColor: 'rgba(35, 27, 25, 0.42)', justifyContent: 'flex-end' },
+
+  pointsLink: {
+    marginTop: 10,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  pointsLinkText: { flex: 1, color: C.burgundy, fontSize: 13 },
+
+  pointsSheet: {
+    backgroundColor: C.paper,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingTop: 9,
+    overflow: 'hidden',
+  },
+  viewerTabs: {
+    flexDirection: 'row',
+    gap: 4,
+    marginHorizontal: 20,
+    marginTop: 14,
+    padding: 4,
+    borderRadius: 16,
+    backgroundColor: 'rgba(120, 61, 74, 0.06)',
+  },
+  viewerTab: {
+    flex: 1,
+    height: 38,
+    borderRadius: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  viewerTabActive: { backgroundColor: C.paper },
+  viewerTabText: { color: C.muted, fontSize: 13.5 },
+  viewerTabTextActive: { color: C.burgundy },
+  viewerTabCount: { color: C.muted, fontSize: 12 },
+  viewerSearch: {
+    height: 44,
+    marginHorizontal: 20,
+    marginTop: 12,
+    paddingHorizontal: 13,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 9,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.bg,
+  },
+  viewerSearchInput: { flex: 1, color: C.ink, fontSize: 14, paddingVertical: 0 },
+  viewerList: { paddingHorizontal: 20, paddingTop: 8 },
+  viewerRow: { flexDirection: 'row', alignItems: 'flex-start', gap: 12, paddingVertical: 14 },
+  viewerPin: {
+    width: 30,
+    height: 30,
+    borderRadius: 10,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  viewerName: { color: C.ink, fontSize: 14.5, fontWeight: '500' },
+  viewerAddress: { color: C.muted, fontSize: 12.5, lineHeight: 18, marginTop: 3 },
+  viewerTime: { color: C.muted, fontSize: 12.5, marginTop: 2 },
+  viewerNote: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 6 },
+  viewerNoteText: { flex: 1, color: '#7A6643', fontSize: 12 },
+  viewerDivider: { height: 1, backgroundColor: C.border },
+  viewerEmpty: { color: C.muted, fontSize: 14, textAlign: 'center', paddingVertical: 28 },
+  sortBackdrop: { flex: 1, backgroundColor: 'rgba(35, 27, 25, 0.3)', justifyContent: 'flex-end' },
   sortSheet: {
     backgroundColor: C.paper,
     borderTopLeftRadius: 23,
@@ -1896,5 +2150,5 @@ const s = StyleSheet.create({
     paddingBottom: 26,
   },
   sortSheetWide: { width: 420, alignSelf: 'center', borderRadius: 22, marginBottom: 20 },
-  sortSheetTitle: { fontSize: 19, fontWeight: '700', color: C.ink, marginBottom: 6 },
+  sortSheetTitle: { fontSize: 19, fontWeight: '500', color: C.ink, marginBottom: 6 },
 });
