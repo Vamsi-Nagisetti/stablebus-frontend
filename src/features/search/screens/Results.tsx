@@ -197,14 +197,13 @@ function getFare(bus: Bus): number {
   return numeric(bus.fareMasters?.[0]?.total_Amount);
 }
 
+/** Rating given by StableBus travellers (added by our server). 0 when nobody has rated yet. */
 function getRating(bus: Bus): number {
-  return numeric(firstValue(bus, [
-    'rating',
-    'bus_Rating',
-    'operator_Rating',
-    'average_Rating',
-    'review_Rating',
-  ]));
+  return numeric(bus.stb_rating?.average);
+}
+
+function getRatingCount(bus: Bus): number {
+  return numeric(bus.stb_rating?.count);
 }
 
 function getAmenities(bus: Bus): string[] {
@@ -443,7 +442,10 @@ const BusCard = memo(function BusCard({
           {row.rating > 0 && (
             <View style={s.ratingRow}>
               <Ionicons name="star" size={13} color="#C18A43" />
-              <Text style={s.ratingText}>{row.rating.toFixed(1)}</Text>
+              <Text style={s.ratingText}>
+                {row.rating.toFixed(1)}/5
+                <Text style={s.ratingCount}> ({getRatingCount(bus)})</Text>
+              </Text>
             </View>
           )}
         </View>
@@ -2046,6 +2048,7 @@ const s = StyleSheet.create({
     marginTop: 3,
   },
   ratingText: { fontSize: 11, color: C.muted, fontWeight: '500' },
+  ratingCount: { fontSize: 11, color: C.muted, fontWeight: '400' },
 
   features: { flexDirection: 'row', flexWrap: 'wrap', columnGap: 18, rowGap: 8, marginTop: 12 },
   feature: { flexDirection: 'row', alignItems: 'center', gap: 7 },

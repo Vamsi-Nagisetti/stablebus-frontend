@@ -24,6 +24,8 @@ import {
   CancellationQuote,
   bookingsApi,
 } from '@/features/bookings/api';
+import RateTripSheet, { RateRow, RateTarget } from '@/features/reviews/RateTripSheet';
+import { reviewsApi } from '@/features/reviews/api';
 
 const C = {
   bg: '#F8F4ED',
@@ -111,14 +113,14 @@ const coinBanners = (booking: Booking): CoinBannerInfo[] => {
       key: 'earned',
       kind: 'reward',
       title: `${coinText(w.coins_earned)} earned`,
-      caption: 'Added to your wallet for your next ticket.',
+      caption: 'in your wallet',
     });
   } else if (w.coins_expected) {
     out.push({
       key: 'expected',
       kind: 'reward',
       title: `${coinText(w.coins_expected)} to earn`,
-      caption: 'Added to your wallet after you complete this trip.',
+      caption: 'after you complete this trip',
     });
   }
 
@@ -128,7 +130,7 @@ const coinBanners = (booking: Booking): CoinBannerInfo[] => {
         key: 'returned',
         kind: 'used',
         title: `${coinText(w.coins_used)} returned`,
-        caption: 'Back in your wallet.',
+        caption: 'back in your wallet',
       });
     } else {
       out.push({
@@ -137,8 +139,8 @@ const coinBanners = (booking: Booking): CoinBannerInfo[] => {
         title: `${coinText(w.coins_used)} used`,
         caption:
           w.coins_state === 'PENDING'
-            ? 'Returned to your wallet if you cancel.'
-            : 'Applied to this ticket.',
+            ? 'returned if you cancel'
+            : 'applied to this ticket',
       });
     }
   }
@@ -153,16 +155,16 @@ const CoinBanners = ({ booking }: { booking: Booking }) => {
       {items.map(item => (
         <View key={item.key} style={styles.coinBanner}>
           {item.kind === 'reward' ? (
-            <Image source={require('@/assets/scenic/coin.png')} style={styles.coinBannerCoin} resizeMode="contain" />
+            <Image source={require('@/assets/scenic/coin_flat.png')} style={styles.coinBannerCoin} resizeMode="contain" />
           ) : (
             <View style={styles.coinBannerWallet}>
-              <Ionicons name="wallet-outline" size={15} color={C.muted} />
+              <Ionicons name="wallet-outline" size={14} color={C.muted} />
             </View>
           )}
-          <View style={{ flex: 1, minWidth: 0 }}>
-            <Text style={styles.coinBannerTitle} numberOfLines={1}>{item.title}</Text>
-            <Text style={styles.coinBannerCaption} numberOfLines={2}>{item.caption}</Text>
-          </View>
+          <Text style={styles.coinBannerTitle} numberOfLines={2}>
+            {item.title}
+            <Text style={styles.coinBannerCaption}>{`  ·  ${item.caption}`}</Text>
+          </Text>
         </View>
       ))}
     </View>
@@ -315,6 +317,12 @@ export default function BookingsScreen() {
   const [tab, setTab] = useState<'upcoming' | 'completed' | 'other'>('upcoming');
 
   const [details, setDetails] = useState<Booking | null>(null);
+
+  // Ratings for completed trips
+  const [ratings, setRatings] = useState<Record<string, number>>({});
+  const [rewardCoins, setRewardCoins] = useState(0);
+  const [ratingsOn, setRatingsOn] = useState(false);
+  const [rateTarget, setRateTarget] = useState<RateTarget | null>(null);
   const [cancelBooking, setCancelBooking] = useState<Booking | null>(null);
   const [selectedSeats, setSelectedSeats] = useState<string[]>([]);
   const [quote, setQuote] = useState<CancellationQuote | null>(null);
@@ -422,6 +430,53 @@ export default function BookingsScreen() {
       }),
     [items, todayKey]
   );
+
+  // Which completed trips are already rated, and what a rating is worth.
+  const completedIds = completed.map(b => b.booking_id).join(',');
+  useEffect(() => {
+    if (!completedIds) return;
+    let alive = true;
+    reviewsApi
+      .status(completedIds.split(','))
+      .then(res => {
+        if (!alive) return;
+        setRatingsOn(!!res.enabled);
+        setRewardCoins(res.reward_coins || 0);
+        setRatings(Object.fromEntries(Object.entries(res.reviews || {}).map(([id, r]) => [id, r.rating])));
+      })
+      .catch(() => {
+        // Ratings are optional: hide the row if the server cannot be reached.
+      });
+    return () => {
+      alive = false;
+    };
+  }, [completedIds]);
+
+  const isCompletedTrip = (booking: Booking) => {
+    const journey = booking.journey_date?.slice(0, 10);
+    return !isCancelled(booking) && !isPending(booking) && !!journey && journey < todayKey;
+  };
+
+  const openRate = (booking: Booking) => {
+    // Two sheets cannot be open together: the details sheet would hide the rating sheet.
+    setDetails(null);
+    const bus = ((booking.boarding_point as any)?._bus || {}) as Record<string, string>;
+    setRateTarget({
+      bookingId: booking.booking_id,
+      operator: booking.operator_name || bus.operator_name || '',
+      route: `${cityName(booking.source_city_id, bus.source_city_name)} → ${cityName(booking.destination_city_id, bus.destination_city_name)}`,
+      date: dateLabel(booking.journey_date),
+    });
+  };
+
+  const rateRow = (booking: Booking) =>
+    ratingsOn && isCompletedTrip(booking) ? (
+      <RateRow
+        rating={ratings[booking.booking_id]}
+        rewardCoins={rewardCoins}
+        onPress={() => openRate(booking)}
+      />
+    ) : null;
 
   // Cancelled, failed and payment-pending bookings live together in their own tab.
   const other = useMemo(
@@ -677,6 +732,7 @@ export default function BookingsScreen() {
           <StatusPill status={booking.booking_status} />
         </View>
         <CoinBanners booking={booking} />
+        {rateRow(booking)}
       </Pressable>
     );
   };
@@ -839,6 +895,17 @@ export default function BookingsScreen() {
         </Animated.View>
       )}
 
+      <RateTripSheet
+        target={rateTarget}
+        rewardCoins={rewardCoins}
+        onClose={() => setRateTarget(null)}
+        onDone={(bookingId, rating, coins) => {
+          setRatings(prev => ({ ...prev, [bookingId]: rating }));
+          setRateTarget(null);
+          showToast(coins > 0 ? `Thank you! ${coins} coins added to your wallet.` : 'Thank you for rating your trip.');
+        }}
+      />
+
       {/* Booking details */}
       <Modal
         visible={!!details}
@@ -923,6 +990,7 @@ export default function BookingsScreen() {
                 </View>
 
                 <CoinBanners booking={details} />
+                {rateRow(details)}
 
                 <Text style={styles.sectionTitle}>Passengers</Text>
                 <View style={styles.panel}>
@@ -1181,22 +1249,18 @@ const styles = StyleSheet.create({
   pointName: { color: C.ink, fontSize: 14, fontWeight: '600', marginTop: 5 },
   pointTime: { color: C.burgundy, fontSize: 13, marginTop: 3 },
   statusLine: { flexDirection: 'row', marginTop: 12 },
-  coinBannerStack: { marginTop: 12, gap: 6 },
-  coinBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    paddingVertical: 9,
-    paddingHorizontal: 12,
-    borderRadius: 14,
-    backgroundColor: '#FAF6F0',
-    borderWidth: 1,
-    borderColor: '#F0E8DE',
+  coinBannerStack: {
+    marginTop: 12,
+    paddingTop: 10,
+    gap: 6,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
   },
-  coinBannerCoin: { width: 28, height: 28 },
-  coinBannerWallet: { width: 28, height: 28, alignItems: 'center', justifyContent: 'center' },
-  coinBannerTitle: { color: C.ink, fontSize: 13, fontWeight: '500' },
-  coinBannerCaption: { color: C.muted, fontSize: 11.5, lineHeight: 16, marginTop: 1 },
+  coinBanner: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  coinBannerCoin: { width: 18, height: 18 },
+  coinBannerWallet: { width: 18, height: 18, alignItems: 'center', justifyContent: 'center' },
+  coinBannerTitle: { flex: 1, minWidth: 0, color: C.muted, fontSize: 12.5, lineHeight: 17 },
+  coinBannerCaption: { color: C.muted, fontSize: 12.5, fontWeight: '400' },
   coinDot: {
     width: 20,
     height: 20,

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ActivityIndicator,
   Animated,
+  Easing,
   BackHandler,
   Image,
   Keyboard,
@@ -20,13 +21,14 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { Image as ExpoImage } from 'expo-image';
-import Svg, { Defs, LinearGradient as SvgLinearGradient, Rect, Stop } from 'react-native-svg';
+import Svg, { Circle, Defs, LinearGradient as SvgLinearGradient, RadialGradient, Rect, Stop, Text as SvgText } from 'react-native-svg';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { sendOTP, verifyOTP } from '@/features/auth/api';
 import { saveTokens, getTokens, clearTokens } from '@/features/auth/tokenStorage';
 import { useFocusEffect, useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
 import { searchApi } from '@/features/search/api';
+import { request } from '@/services/http';
 import type { City } from '@/types/api';
 import { menuSignals } from '@/features/home/menuSignals';
 import { registerPush } from '@/features/notifications/push';
@@ -136,16 +138,6 @@ const SCENIC_ROUTES = [
   { key: 'kerala', title: 'Bengaluru → Kerala', caption: 'Backwaters and palm-lined roads', from: ['Bengaluru', 'Bangalore'], to: ['Kochi', 'Cochin', 'Ernakulam', 'Kerala'], image: IMAGES.kerala },
   { key: 'ghats', title: 'Bengaluru → Goa', caption: 'Misty ghats and waterfalls', from: ['Bengaluru', 'Bangalore'], to: ['Goa', 'Panaji', 'Panjim', 'Madgaon', 'Margao'], image: IMAGES.ghats },
   { key: 'andhra', title: 'Hyderabad → Vijayawada', caption: 'Green fields, golden hours', from: ['Hyderabad'], to: ['Vijayawada'], image: IMAGES.andhra },
-];
-
-// OFFERS: add, edit or remove entries. Leave the list empty to hide the Offers block.
-// code      -> optional; tapping the card copies it
-// route     -> optional; tapping the card opens this page
-// These three are SAMPLE entries so you can see the layout: replace them with your real offers.
-const OFFERS: { key: string; title: string; caption: string; code?: string; icon: keyof typeof Ionicons.glyphMap; route?: string }[] = [
-  { key: 'first', title: 'Your first trip', caption: 'A small thank-you on your first booking', code: 'WELCOME', icon: 'gift-outline' },
-  { key: 'weekend', title: 'Weekend getaways', caption: 'Plan ahead and travel lighter', code: 'WEEKEND', icon: 'sunny-outline' },
-  { key: 'friends', title: 'Travelling together', caption: 'Book more seats, enjoy the journey', icon: 'people-outline' },
 ];
 
 const FOOTER_LINKS: { key: string; label: string; url?: string }[] = [
@@ -687,17 +679,210 @@ function ScenicSection({
   );
 }
 
+/* ---------------- Gold Mile (replaces "Offers for you") ---------------- */
+
+type GoldMile = {
+  enabled: boolean;
+  state: string;
+  tier: 'PRE_REGISTERED' | 'FIRST_TIME' | 'REGULAR';
+  required_trips: number;
+  completed_trips: number;
+  upcoming_trips: number;
+  qualified: boolean;
+  starts_on: string | null;
+  ends_on: string | null;
+  days_left: number | null;
+};
+
+const GOLD = '#D9AE55';
+const GOLD_SOFT = '#F1DC9C';
+const SERIF = Platform.select({ ios: 'Georgia', android: 'serif', default: 'Georgia, "Times New Roman", serif' });
+const NUMBER_WORDS = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six'];
+
+const GOLD_KICKER: Record<GoldMile['tier'] | 'GUEST', string> = {
+  PRE_REGISTERED: 'A little something for our early believers',
+  FIRST_TIME: 'Welcome to the Gold Mile',
+  REGULAR: 'For our regular travellers',
+  GUEST: 'For every StableBus traveller',
+};
+
+const shortDate = (iso: string) => {
+  const d = new Date(`${iso}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+};
+
+function GoldCoin({ size = 54 }: { size?: number }) {
+  return <Image source={require('@/assets/scenic/coin.png')} style={{ width: size, height: size }} resizeMode="contain" />;
+}
+
+function GoldMileCard({ authed, onSignIn }: { authed: boolean; onSignIn: () => void }) {
+  const [data, setData] = useState<GoldMile | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const load = useCallback(() => {
+    let alive = true;
+    setLoading(true);
+    setFailed(false);
+    const timer = setTimeout(() => {
+      request<GoldMile>('/api/v1/campaign/gold-mile', { timeoutMs: 15000 })
+        .then(result => alive && setData(result))
+        .catch(() => alive && setFailed(true))
+        .finally(() => alive && setLoading(false));
+    }, 500);
+    return () => {
+      alive = false;
+      clearTimeout(timer);
+    };
+  }, []);
+
+  // Fill the timeline from the signed-in user's trips (and refresh when Home comes back into view).
+  useFocusEffect(
+    useCallback(() => {
+      if (!authed) {
+        setData(null);
+        setFailed(false);
+        return undefined;
+      }
+      return load();
+    }, [authed, load])
+  );
+
+  // The campaign can be switched off from the server.
+  if (authed && data && data.enabled === false) return null;
+
+  const signedIn = authed && !!data;
+  const required = data?.required_trips ?? 2;
+  const completed = data?.completed_trips ?? 0;
+  const upcoming = Math.min(data?.upcoming_trips ?? 0, Math.max(0, required - completed));
+  const words = NUMBER_WORDS[required] ?? String(required);
+  const tier = signedIn ? data!.tier : 'GUEST';
+
+  const doneRatio = Math.min(1, completed / required);
+  const onTheWayRatio = Math.min(1, (completed + upcoming) / required);
+
+  let status = '';
+  if (signedIn) {
+    if (data!.qualified) status = `You're in the draw. ${required} trips completed.`;
+    else {
+      status = `${completed} of ${required} trips completed`;
+      if (upcoming > 0) status += `, ${upcoming} on the way`;
+    }
+  }
+  const daysLeft = signedIn ? data!.days_left : null;
+
+  if (signedIn && data!.qualified) {
+    const total = data!.total_completed_trips ?? required;
+    return (
+      <View style={s.goldWon}>
+        <Text style={[s.goldSpark, { top: 14, left: '46%', fontSize: 12 }]}>✦</Text>
+        <Text style={[s.goldSpark, { top: 54, right: 118, fontSize: 9, opacity: 0.55 }]}>✦</Text>
+        <Text style={[s.goldSpark, { bottom: 70, left: 18, fontSize: 10, opacity: 0.5 }]}>✦</Text>
+        <Text style={[s.goldSpark, { top: 24, right: 14, fontSize: 9, opacity: 0.6 }]}>✦</Text>
+
+        <View style={s.goldTop}>
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <View style={s.goldBadge}>
+              <Ionicons name="checkmark-circle" size={14} color={C.burgundy} />
+              <Text style={s.goldBadgeText}>Qualified</Text>
+            </View>
+            <Text style={s.goldWonTitle}>You're in the draw</Text>
+            <Text style={s.goldWonBody}>
+              {total} trips completed. You have a chance to win{' '}
+              <Text style={s.goldHeadlineGold}>1 gram of gold</Text>.
+            </Text>
+          </View>
+          <GoldCoin size={84} />
+        </View>
+
+        <View style={[s.goldTrack, { marginTop: 18, backgroundColor: 'rgba(120,61,74,0.14)' }]}>
+          <View style={[s.goldFill, { width: '100%' }]} />
+        </View>
+        <View style={s.goldMarks}>
+          {Array.from({ length: required + 1 }, (_, k) => (
+            <Text key={k} style={[s.goldMark, s.goldMarkOn]}>
+              {k === 0 ? 'Start' : k === required ? '1g gold' : String(k)}
+            </Text>
+          ))}
+        </View>
+
+        <Text style={s.goldWonNote}>
+          {daysLeft != null && daysLeft > 0 ? `Your next round begins in ${daysLeft} days.  ` : ''}Terms, eligibility and winner
+          selection apply.
+        </Text>
+      </View>
+    );
+  }
+
+  return (
+    <View style={s.goldCard}>
+      <View style={s.goldTop}>
+        <View style={{ flex: 1, minWidth: 0 }}>
+          <Text style={s.goldKicker}>{GOLD_KICKER[tier]}</Text>
+          <Text style={s.goldHeadline}>
+            {signedIn ? `${words} trips` : 'A few trips'} for a chance to win{' '}
+            <Text style={s.goldHeadlineGold}>1 gram of gold</Text>
+          </Text>
+        </View>
+        <GoldCoin />
+      </View>
+
+      {signedIn ? (
+        <>
+          <View style={s.goldTrack}>
+            <View style={[s.goldFillSoft, { width: `${onTheWayRatio * 100}%` }]} />
+            <View style={[s.goldFill, { width: `${doneRatio * 100}%` }]} />
+          </View>
+          <View style={s.goldMarks}>
+            {Array.from({ length: required + 1 }, (_, k) => (
+              <Text key={k} style={[s.goldMark, k > 0 && k <= completed && s.goldMarkOn]}>
+                {k === 0 ? 'Start' : k === required ? '1g gold' : String(k)}
+              </Text>
+            ))}
+          </View>
+          <View style={s.goldStatusRow}>
+            {data!.qualified && <Ionicons name="checkmark-circle" size={15} color={C.burgundy} />}
+            <Text style={s.goldStatus}>
+              {status}
+              {daysLeft != null && daysLeft > 0 ? `  ·  resets in ${daysLeft} days` : ''}
+            </Text>
+          </View>
+        </>
+      ) : (
+        <>
+          <Text style={s.goldBody}>
+            2 trips if you pre-registered, 3 if you're new to StableBus, 4 for everyone else. Sign in and we'll show your own
+            progress.
+          </Text>
+          <Pressable style={s.goldButton} onPress={onSignIn}>
+            <Text style={s.goldButtonText}>Sign in to see my progress</Text>
+          </Pressable>
+        </>
+      )}
+
+      {authed && failed && !loading && (
+        <Pressable style={s.goldButton} onPress={() => load()}>
+          <Text style={s.goldButtonText}>Couldn't load. Tap to retry</Text>
+        </Pressable>
+      )}
+      {authed && loading && !data && <ActivityIndicator color={C.burgundy} style={{ marginTop: 14 }} />}
+
+      <Text style={s.goldTerms}>Terms, eligibility and winner selection apply.</Text>
+    </View>
+  );
+}
+
 /* ---------------- Offers + footer (melts in from the page, sits on a soft tint) ---------------- */
 
 function OffersFooter({
   bottomInset,
-  onCopy,
-  onOffer,
+  authed,
+  onSignIn,
   onHelp,
 }: {
   bottomInset: number;
-  onCopy: (code: string) => void;
-  onOffer: (offer: (typeof OFFERS)[number]) => void;
+  authed: boolean;
+  onSignIn: () => void;
   onHelp: () => void;
 }) {
   const router = useRouter();
@@ -706,47 +891,13 @@ function OffersFooter({
       <EdgeFade edge="top" height={120} />
 
       <View style={[s.footerInner, { paddingBottom: bottomInset + 26 }]}>
-        {OFFERS.length > 0 && (
-          <>
-            <View style={s.offersHeading}>
-              <Text style={s.sectionTitle}>Offers for you</Text>
-              <Text style={s.sectionSubtitle}>Small things that make travel nicer</Text>
-            </View>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              style={s.slider}
-              contentContainerStyle={s.sliderContent}
-              snapToInterval={OFFER_W + 12}
-              decelerationRate="fast"
-            >
-              {OFFERS.map(offer => (
-                <Pressable
-                  key={offer.key}
-                  style={s.offerCard}
-                  onPress={() => (offer.code ? onCopy(offer.code) : onOffer(offer))}
-                  android_ripple={{ color: C.burgundyLight }}
-                >
-                  <View style={s.offerIcon}>
-                    <Ionicons name={offer.icon} size={20} color={C.burgundy} />
-                  </View>
-                  <View style={{ flex: 1, minWidth: 0 }}>
-                    <Text style={s.offerTitle} numberOfLines={1}>{offer.title}</Text>
-                    <Text style={s.offerCaption} numberOfLines={2}>{offer.caption}</Text>
-                    {!!offer.code && (
-                      <View style={s.offerCode}>
-                        <Text style={s.offerCodeText}>{offer.code}</Text>
-                        <Ionicons name="copy-outline" size={12} color={C.burgundy} />
-                      </View>
-                    )}
-                  </View>
-                </Pressable>
-              ))}
-            </ScrollView>
-          </>
-        )}
+        <View style={s.offersHeading}>
+          <Text style={s.sectionTitle}>Gold Mile</Text>
+          <Text style={s.sectionSubtitle}>Travel with us, and win a little gold</Text>
+        </View>
+        <GoldMileCard authed={authed} onSignIn={onSignIn} />
 
-        <View style={[s.footerBrand, OFFERS.length > 0 && { marginTop: 34 }]}>
+        <View style={[s.footerBrand, { marginTop: 34 }]}>
           <View style={s.brandMark}>
             <Ionicons name="bus-outline" size={19} color={C.white} />
           </View>
@@ -1076,21 +1227,6 @@ export default function Home() {
     setAuthed(true);
     setWelcomeVisible(false);
     showToast('You are logged in.');
-  };
-
-  const copyOffer = async (code: string) => {
-    try {
-      // expo-clipboard is optional: without it the code is simply shown in the message.
-      const Clipboard = require('expo-clipboard');
-      await Clipboard.setStringAsync(code);
-      showToast(`Code ${code} copied.`);
-    } catch {
-      showToast(`Your code: ${code}`);
-    }
-  };
-
-  const handleOffer = (offer: (typeof OFFERS)[number]) => {
-    if (offer.route) router.push(offer.route as any);
   };
 
   useEffect(() => {
@@ -1685,8 +1821,8 @@ export default function Home() {
         {/* OFFERS + FOOTER */}
         <OffersFooter
           bottomInset={insets.bottom}
-          onCopy={copyOffer}
-          onOffer={handleOffer}
+          authed={authed}
+          onSignIn={() => setWelcomeVisible(true)}
           onHelp={() => showToast('Help & support is coming soon.')}
         />
 
@@ -2499,44 +2635,61 @@ const s = StyleSheet.create({
     paddingTop: 54,
   },
   offersHeading: { marginBottom: 14 },
-  offerCard: {
-    width: OFFER_W,
-    minHeight: 112,
-    borderRadius: 20,
-    padding: 14,
-    backgroundColor: 'rgba(255,254,252,0.82)',
-    flexDirection: 'row',
-    gap: 12,
+  goldCard: { paddingTop: 2 },
+  goldWon: {
+    borderRadius: 26,
+    padding: 18,
+    backgroundColor: 'rgba(120,61,74,0.07)',
+    borderWidth: 1,
+    borderColor: 'rgba(120,61,74,0.18)',
+    overflow: 'hidden',
     shadowColor: '#783D4A',
-    shadowOpacity: 0.07,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 1,
+    shadowOpacity: 0.12,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 6 },
+    elevation: 2,
   },
-  offerIcon: {
-    width: 42,
-    height: 42,
-    borderRadius: 13,
-    backgroundColor: C.burgundyLight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  offerTitle: { color: C.ink, fontSize: 15, fontWeight: '600' },
-  offerCaption: { color: C.muted, fontSize: 12, lineHeight: 17, marginTop: 3 },
-  offerCode: {
+  goldSpark: { position: 'absolute', color: '#B07A86', opacity: 0.8 },
+  goldBadge: {
     alignSelf: 'flex-start',
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    marginTop: 9,
+    gap: 5,
     paddingHorizontal: 10,
     height: 24,
     borderRadius: 12,
-    borderWidth: 1,
-    borderStyle: 'dashed',
-    borderColor: '#C9A0A8',
+    backgroundColor: 'rgba(255,254,252,0.7)',
+    marginBottom: 10,
   },
-  offerCodeText: { color: C.burgundy, fontSize: 11, fontWeight: '600', letterSpacing: 0.8 },
+  goldBadgeText: { color: C.burgundy, fontSize: 11.5, fontWeight: '600', letterSpacing: 0.3 },
+  goldWonTitle: { color: C.ink, fontSize: 22, fontWeight: '600', letterSpacing: -0.3 },
+  goldWonBody: { color: C.muted, fontSize: 13, lineHeight: 19, marginTop: 6 },
+  goldWonNote: { color: C.muted, fontSize: 11, lineHeight: 16, marginTop: 14 },
+  goldTop: { flexDirection: 'row', alignItems: 'center', gap: 14 },
+  goldKicker: { color: C.muted, fontSize: 12, marginBottom: 5 },
+  goldHeadline: { color: C.ink, fontSize: 17, lineHeight: 24, fontWeight: '500' },
+  goldHeadlineGold: { color: C.burgundy, fontFamily: SERIF, fontStyle: 'italic', fontWeight: '600' },
+  goldBody: { color: C.muted, fontSize: 12.5, lineHeight: 19, marginTop: 14 },
+  goldTrack: { height: 6, borderRadius: 3, backgroundColor: 'rgba(120,61,74,0.12)', overflow: 'hidden', marginTop: 18 },
+  goldFill: { position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 3, backgroundColor: C.burgundy },
+  goldFillSoft: { position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 3, backgroundColor: 'rgba(120,61,74,0.28)' },
+  goldMarks: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 },
+  goldMark: { color: C.muted, fontSize: 11.5 },
+  goldMarkOn: { color: C.burgundy, fontWeight: '600' },
+  goldStatusRow: { flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10 },
+  goldStatus: { color: C.ink, fontSize: 12.5, flexShrink: 1, lineHeight: 18 },
+  goldButton: {
+    alignSelf: 'flex-start',
+    marginTop: 14,
+    paddingHorizontal: 16,
+    height: 38,
+    borderRadius: 19,
+    backgroundColor: 'rgba(120,61,74,0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  goldButtonText: { color: C.burgundy, fontSize: 13, fontWeight: '600' },
+  goldTerms: { color: C.muted, fontSize: 10.5, lineHeight: 15, marginTop: 14, opacity: 0.8 },
   footerBrand: { flexDirection: 'row', alignItems: 'center', gap: 10 },
   footerBrandText: { color: C.ink, fontSize: 18, fontWeight: '700', letterSpacing: -0.4 },
   footerTagline: { color: C.muted, fontSize: 12, marginTop: 2 },
