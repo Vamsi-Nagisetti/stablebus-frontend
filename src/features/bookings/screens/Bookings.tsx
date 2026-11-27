@@ -94,7 +94,7 @@ type CoinBannerInfo = {
 const coinText = (n: number) => `${n.toLocaleString('en-IN')} ${n === 1 ? 'coin' : 'coins'}`;
 
 /** Quiet coin notes for one ticket. Rewards carry the coin picture; coins spent carry a wallet icon. */
-const coinBanners = (booking: Booking): CoinBannerInfo[] => {
+const coinBanners = (booking: Booking, arrived = false): CoinBannerInfo[] => {
   const w = (booking as any).wallet as
     | {
         coins_used?: number;
@@ -120,7 +120,7 @@ const coinBanners = (booking: Booking): CoinBannerInfo[] => {
       key: 'expected',
       kind: 'reward',
       title: `${coinText(w.coins_expected)} to earn`,
-      caption: 'after you complete this trip',
+      caption: arrived ? 'being added to your wallet' : 'after you complete this trip',
     });
   }
 
@@ -147,8 +147,8 @@ const coinBanners = (booking: Booking): CoinBannerInfo[] => {
   return out;
 };
 
-const CoinBanners = ({ booking }: { booking: Booking }) => {
-  const items = coinBanners(booking);
+const CoinBanners = ({ booking, arrived = false }: { booking: Booking; arrived?: boolean }) => {
+  const items = coinBanners(booking, arrived);
   if (!items.length) return null;
   return (
     <View style={styles.coinBannerStack}>
@@ -181,6 +181,70 @@ const isPending = (booking: Booking) =>
 const getDateKey = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+/** "09:00 AM", "21:30" or "9:00" -> minutes after midnight, or null when it cannot be read. */
+const clockMinutes = (value?: string | null): number | null => {
+  const v = String(value || '').trim();
+  const m = v.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const mins = Number(m[2]);
+  const mer = m[3]?.toLowerCase();
+  if (mer === 'pm' && h < 12) h += 12;
+  if (mer === 'am' && h === 12) h = 0;
+  if (h > 23 || mins > 59) return null;
+  return h * 60 + mins;
+};
+
+/** Departure moment of a trip (journey date + departure time), or null when the time is unknown. */
+const departureAt = (booking: Booking): Date | null => {
+  const day = booking.journey_date?.slice(0, 10);
+  if (!day) return null;
+  const bus = ((booking.boarding_point as any)?._bus || {}) as Record<string, string>;
+  const boarding = (booking.boarding_point || {}) as Record<string, unknown>;
+  const minutes =
+    clockMinutes(bus.departure_time) ??
+    clockMinutes(String(boarding.boarding_Time ?? boarding.boarding_time ?? boarding.time ?? ''));
+  if (minutes === null) return null;
+  const date = new Date(`${day}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return null;
+  date.setMinutes(minutes);
+  return date;
+};
+
+/** Arrival moment of a trip. An overnight trip arrives the next day. Null when the time is unknown. */
+const arrivalAt = (booking: Booking): Date | null => {
+  const day = booking.journey_date?.slice(0, 10);
+  if (!day) return null;
+  const bus = ((booking.boarding_point as any)?._bus || {}) as Record<string, string>;
+  const arrives = clockMinutes(bus.arrival_time);
+  if (arrives === null) return null;
+  const date = new Date(`${day}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return null;
+  const departs = clockMinutes(bus.departure_time);
+  if (departs !== null && arrives <= departs) date.setDate(date.getDate() + 1);
+  date.setMinutes(arrives);
+  return date;
+};
+
+/** True once the bus has reached its destination. Without an arrival time, once the journey day is over. */
+const hasArrived = (booking: Booking, now: Date): boolean => {
+  const arrival = arrivalAt(booking);
+  if (arrival) return now.getTime() >= arrival.getTime();
+  const day = booking.journey_date?.slice(0, 10);
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  return !!day && day < today;
+};
+
+/** True once the bus has left. Without a readable time, a trip counts as started the day after. */
+const hasStarted = (booking: Booking, now: Date): boolean => {
+  const departure = departureAt(booking);
+  if (departure) return now.getTime() >= departure.getTime();
+  const day = booking.journey_date?.slice(0, 10);
+  const d = now;
+  const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return !!day && day < today;
 };
 
 const firstPointValue = (value: Record<string, unknown>, keys: string[]): string | null => {
@@ -294,11 +358,11 @@ function EdgeFade({ edge, height }: { edge: 'top' | 'bottom'; height: number }) 
   );
 }
 
-function StatusPill({ status }: { status: string }) {
+function StatusPill({ status, label }: { status: string; label?: string }) {
   const tone = statusTone(status);
   return (
     <View style={[styles.statusPill, { backgroundColor: tone.bg }]}>
-      <Text style={[styles.status, { color: tone.fg }]}>{statusLabel(status)}</Text>
+      <Text style={[styles.status, { color: tone.fg }]}>{label || statusLabel(status)}</Text>
     </View>
   );
 }
@@ -356,6 +420,13 @@ export default function BookingsScreen() {
 
   const todayKey = getDateKey();
 
+  // Re-check every minute so a trip moves to "Ongoing & done" the moment the bus leaves.
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(new Date()), 60000);
+    return () => clearInterval(timer);
+  }, []);
+
   const load = useCallback(async (isRefresh = false) => {
     try {
       if (isRefresh) setRefreshing(true);
@@ -411,28 +482,29 @@ export default function BookingsScreen() {
     return `${String(h % 12 || 12).padStart(2, '0')}:${m[2]} ${h >= 12 ? 'PM' : 'AM'}`;
   };
 
-  // Confirmed journeys from today on.
+  // Confirmed journeys whose bus has not left yet.
   const upcoming = useMemo(
     () =>
-      items.filter(booking => {
-        const journey = booking.journey_date?.slice(0, 10);
-        return !isCancelled(booking) && !isPending(booking) && !!journey && journey >= todayKey;
-      }),
-    [items, todayKey]
+      items.filter(
+        booking => !isCancelled(booking) && !isPending(booking) && !hasStarted(booking, now)
+      ),
+    [items, now]
   );
 
-  // Confirmed journeys that are done.
+  // Confirmed journeys that have started (ongoing) or are finished.
   const completed = useMemo(
     () =>
-      items.filter(booking => {
-        const journey = booking.journey_date?.slice(0, 10);
-        return !isCancelled(booking) && !isPending(booking) && !!journey && journey < todayKey;
-      }),
-    [items, todayKey]
+      items.filter(
+        booking => !isCancelled(booking) && !isPending(booking) && hasStarted(booking, now)
+      ),
+    [items, now]
   );
 
   // Which completed trips are already rated, and what a rating is worth.
-  const completedIds = completed.map(b => b.booking_id).join(',');
+  const completedIds = completed
+    .filter(b => hasArrived(b, now))
+    .map(b => b.booking_id)
+    .join(',');
   useEffect(() => {
     if (!completedIds) return;
     let alive = true;
@@ -452,9 +524,16 @@ export default function BookingsScreen() {
     };
   }, [completedIds]);
 
-  const isCompletedTrip = (booking: Booking) => {
-    const journey = booking.journey_date?.slice(0, 10);
-    return !isCancelled(booking) && !isPending(booking) && !!journey && journey < todayKey;
+  // A trip is finished once the bus has reached its destination.
+  const isCompletedTrip = (booking: Booking) =>
+    !isCancelled(booking) && !isPending(booking) && hasArrived(booking, now);
+
+  /** "On the way" while travelling, "Completed" once arrived, otherwise the booking status. */
+  const tripStatusLabel = (booking: Booking) => {
+    if (isCancelled(booking) || isPending(booking)) return undefined;
+    if (hasArrived(booking, now)) return 'Completed';
+    if (hasStarted(booking, now)) return 'On the way';
+    return undefined;
   };
 
   const openRate = (booking: Booking) => {
@@ -494,6 +573,7 @@ export default function BookingsScreen() {
     return (
       !!journey &&
       journey >= getDateKey() &&
+      !hasStarted(booking, new Date()) &&
       String(booking.booking_status).toUpperCase() === 'CONFIRMED' &&
       (booking.seat_numbers || []).some(
         seat => !(booking.cancelled_seat_numbers || []).includes(String(seat))
@@ -729,9 +809,9 @@ export default function BookingsScreen() {
           <Text style={styles.amount}>{money(booking.total_amount, booking.currency)}</Text>
         </View>
         <View style={styles.statusLine}>
-          <StatusPill status={booking.booking_status} />
+          <StatusPill status={booking.booking_status} label={tripStatusLabel(booking)} />
         </View>
-        <CoinBanners booking={booking} />
+        <CoinBanners booking={booking} arrived={hasArrived(booking, now)} />
         {rateRow(booking)}
       </Pressable>
     );
@@ -797,9 +877,9 @@ export default function BookingsScreen() {
       <View style={styles.tabs}>
         {(
           [
-            { key: 'upcoming', label: 'Upcoming', count: upcoming.length, flex: 1 },
-            { key: 'completed', label: 'Completed', count: completed.length, flex: 1.1 },
-            { key: 'other', label: 'Pending & cancelled', count: other.length, flex: 1.7 },
+            { key: 'upcoming', label: 'Upcoming', flex: 1 },
+            { key: 'completed', label: 'Ongoing & done', flex: 1.35 },
+            { key: 'other', label: 'Pending & cancelled', flex: 1.65 },
           ] as const
         ).map(item => {
           const active = tab === item.key;
@@ -812,7 +892,6 @@ export default function BookingsScreen() {
               <Text style={[styles.tabText, active && styles.activeTabText]} numberOfLines={1}>
                 {item.label}
               </Text>
-              <Text style={[styles.tabCount, active && styles.activeTabCount]}>{item.count}</Text>
             </Pressable>
           );
         })}
@@ -853,18 +932,18 @@ export default function BookingsScreen() {
                 {tab === 'upcoming'
                   ? 'No upcoming journeys'
                   : tab === 'completed'
-                    ? 'No past journeys yet'
+                    ? 'No ongoing or past journeys yet'
                     : 'Nothing pending or cancelled'}
               </Text>
               <Text style={styles.emptyText}>
                 {tab === 'upcoming'
                   ? 'When you book a bus, your ticket will wait for you here.'
                   : tab === 'completed'
-                    ? 'Journeys you have completed will appear here.'
+                    ? 'Once your bus leaves, the journey moves here.'
                     : 'Bookings that are waiting for payment or were cancelled will appear here.'}
               </Text>
               {tab === 'upcoming' && (
-                <Pressable onPress={() => router.back()} style={styles.softButton}>
+                <Pressable onPress={() => router.replace('/' as any)} style={styles.softButton}>
                   <Text style={styles.softButtonText}>Plan a journey</Text>
                   <Ionicons name="arrow-forward" size={15} color={C.burgundy} />
                 </Pressable>
@@ -938,7 +1017,7 @@ export default function BookingsScreen() {
                     </Text>
                     <Text style={styles.date}>{dateLabel(details.journey_date)}</Text>
                   </View>
-                  <StatusPill status={details.booking_status} />
+                  <StatusPill status={details.booking_status} label={tripStatusLabel(details)} />
                 </View>
 
                 {/* journey timeline */}
@@ -989,7 +1068,7 @@ export default function BookingsScreen() {
                   </View>
                 </View>
 
-                <CoinBanners booking={details} />
+                <CoinBanners booking={details} arrived={hasArrived(details, now)} />
                 {rateRow(details)}
 
                 <Text style={styles.sectionTitle}>Passengers</Text>
@@ -1212,7 +1291,7 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 2 },
     elevation: 1,
   },
-  tabText: { color: C.muted, fontSize: 13, flexShrink: 1 },
+  tabText: { color: C.muted, fontSize: 12.5, flexShrink: 1 },
   activeTabText: { color: C.burgundy, fontWeight: '500' },
   tabCount: { color: C.muted, fontSize: 12 },
   activeTabCount: { color: C.burgundy },

@@ -244,7 +244,6 @@ export default function WalletScreen() {
           </Pressable>
 
           <View style={[styles.heroInner, { paddingTop: insets.top + 54 }]}>
-            <Image source={COIN} style={styles.heroCoin} resizeMode="contain" />
             {loading ? (
               <ActivityIndicator color={C.burgundy} style={{ marginVertical: 40 }} />
             ) : error ? (
@@ -259,6 +258,7 @@ export default function WalletScreen() {
               <>
                 <Text style={styles.youHave}>You have</Text>
                 <View style={styles.balanceRow}>
+                  <Image source={require('@/assets/scenic/coin_flat.png')} style={styles.balanceCoin} resizeMode="contain" />
                   <Text style={styles.balance}>{(wallet?.coins ?? 0).toLocaleString('en-IN')}</Text>
                   <Text style={styles.balanceUnit}>coins</Text>
                 </View>
@@ -361,12 +361,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  heroInner: { alignItems: 'center', paddingHorizontal: 20, paddingBottom: 56, minHeight: 300 },
-  heroCoin: { width: 132, height: 132, marginBottom: 6 },
+  heroInner: { alignItems: 'center', paddingHorizontal: 20, paddingBottom: 52, minHeight: 210 },
   youHave: { color: C.muted, fontSize: 13.5 },
-  balanceRow: { flexDirection: 'row', alignItems: 'baseline', gap: 8, marginTop: 2 },
-  balance: { color: C.burgundy, fontSize: 46, fontWeight: '600', letterSpacing: -1.2 },
-  balanceUnit: { color: C.ink, fontSize: 18, fontWeight: '500' },
+  balanceRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 6 },
+  balanceCoin: { width: 26, height: 26 },
+  balance: { color: C.burgundy, fontSize: 32, fontWeight: '500', letterSpacing: -0.5 },
+  balanceUnit: { color: C.muted, fontSize: 15, fontWeight: '400' },
   worth: { color: C.muted, fontSize: 14.5 },
   expiryPill: {
     marginTop: 14,

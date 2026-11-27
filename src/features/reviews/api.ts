@@ -23,10 +23,10 @@ export const reviewsApi = {
     });
   },
 
-  submit(bookingId: string, rating: number, comment: string) {
+  submit(bookingId: string, rating: number, comment: string, tags: string[] = []) {
     return request<ReviewResult>(`/api/v1/reviews/bookings/${encodeURIComponent(bookingId)}`, {
       method: 'POST',
-      body: JSON.stringify({ rating, comment: comment.trim() || null }),
+      body: JSON.stringify({ rating, comment: comment.trim() || null, tags }),
       timeoutMs: 20000,
     });
   },

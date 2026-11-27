@@ -23,7 +23,9 @@ const C = {
   border: '#EAE0D7',
   burgundy: '#783D4A',
   burgundyLight: '#F4EAEB',
-  star: '#C18A43',
+  star: '#783D4A',
+  starOff: '#E3D3D6',
+  bg: '#F8F4ED',
   danger: '#A34444',
 };
 
@@ -52,7 +54,7 @@ export function RateRow({
         <Text style={styles.rowMuted}>You rated this trip</Text>
         <View style={styles.starsSmall}>
           {[1, 2, 3, 4, 5].map(n => (
-            <Ionicons key={n} name={n <= rating ? 'star' : 'star-outline'} size={12} color={C.star} />
+            <Ionicons key={n} name="star" size={12} color={n <= rating ? C.star : C.starOff} />
           ))}
         </View>
       </View>
@@ -61,7 +63,7 @@ export function RateRow({
   return (
     <View style={styles.row}>
       <Text style={styles.rowMuted}>How was your trip?</Text>
-      <Text onPress={onPress} style={styles.rowLink} accessibilityRole="button">
+      <Text onPress={onPress} style={styles.rowLink}>
         Rate{rewardCoins > 0 ? `  ·  Earn ${rewardCoins} coins` : ''}
       </Text>
     </View>
@@ -150,11 +152,11 @@ export default function RateTripSheet({
                   accessibilityRole="button"
                   accessibilityLabel={`${n} star${n > 1 ? 's' : ''}`}
                 >
-                  <Ionicons name={n <= rating ? 'star' : 'star-outline'} size={40} color={C.star} />
+                  <Ionicons name="star" size={36} color={n <= rating ? C.star : C.starOff} />
                 </Pressable>
               ))}
             </View>
-            <Text style={styles.label}>{rating ? LABELS[rating] : 'Tap a star'}</Text>
+            <Text style={[styles.label, !!rating && { color: C.burgundy, fontWeight: '500' }]}>{rating ? LABELS[rating] : 'Tap a star'}</Text>
 
             <TextInput
               value={comment}
@@ -194,44 +196,44 @@ export default function RateTripSheet({
 const styles = StyleSheet.create({
   overlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(56,43,40,0.38)' },
   sheet: {
-    backgroundColor: C.paper,
+    backgroundColor: C.bg,
     borderTopLeftRadius: 26,
     borderTopRightRadius: 26,
-    paddingHorizontal: 20,
+    paddingHorizontal: 18,
     paddingTop: 10,
     maxHeight: '88%',
   },
-  handle: { alignSelf: 'center', width: 42, height: 4, borderRadius: 2, backgroundColor: C.border, marginBottom: 12 },
+  handle: { alignSelf: 'center', width: 38, height: 4, borderRadius: 3, backgroundColor: '#DDD2C8', marginBottom: 12 },
   header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 },
-  title: { fontSize: 20, fontWeight: '700', color: C.ink },
-  close: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#F4EFE8', alignItems: 'center', justifyContent: 'center' },
+  title: { fontSize: 18, fontWeight: '500', color: C.ink },
+  close: { width: 38, height: 38, borderRadius: 12, backgroundColor: C.paper, borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center' },
 
   tripBox: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
     padding: 14,
-    borderRadius: 16,
-    backgroundColor: '#FBF7F1',
+    borderRadius: 18,
+    backgroundColor: C.paper,
     borderWidth: 1,
     borderColor: C.border,
   },
-  busIcon: { width: 40, height: 40, borderRadius: 20, backgroundColor: C.burgundyLight, alignItems: 'center', justifyContent: 'center' },
-  operator: { fontSize: 15, fontWeight: '700', color: C.ink },
+  busIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: C.burgundyLight, alignItems: 'center', justifyContent: 'center' },
+  operator: { fontSize: 15, fontWeight: '500', color: C.burgundy },
   meta: { fontSize: 12.5, color: C.muted, marginTop: 2 },
 
-  question: { fontSize: 16, fontWeight: '600', color: C.ink, textAlign: 'center', marginTop: 22 },
-  stars: { flexDirection: 'row', justifyContent: 'center', gap: 10, marginTop: 14 },
-  label: { textAlign: 'center', marginTop: 8, fontSize: 14, color: C.burgundy, fontWeight: '600', minHeight: 20 },
+  question: { fontSize: 15, fontWeight: '500', color: C.ink, textAlign: 'center', marginTop: 22 },
+  stars: { flexDirection: 'row', justifyContent: 'center', gap: 12, marginTop: 14 },
+  label: { textAlign: 'center', marginTop: 8, fontSize: 13.5, color: C.muted, minHeight: 20 },
 
   input: {
     marginTop: 18,
     minHeight: 96,
     maxHeight: 160,
-    borderRadius: 14,
+    borderRadius: 16,
     borderWidth: 1,
     borderColor: C.border,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: C.paper,
     paddingHorizontal: 14,
     paddingVertical: 12,
     fontSize: 14.5,
@@ -243,9 +245,9 @@ const styles = StyleSheet.create({
   rewardText: { fontSize: 13, color: C.muted },
 
   error: { marginTop: 12, textAlign: 'center', color: C.danger, fontSize: 13 },
-  button: { marginTop: 18, height: 50, borderRadius: 25, backgroundColor: C.burgundy, alignItems: 'center', justifyContent: 'center' },
-  buttonOff: { opacity: 0.45 },
-  buttonText: { color: '#fff', fontSize: 16, fontWeight: '700' },
+  button: { marginTop: 18, minHeight: 52, borderRadius: 14, backgroundColor: C.burgundy, alignItems: 'center', justifyContent: 'center' },
+  buttonOff: { opacity: 0.4 },
+  buttonText: { color: '#fff', fontSize: 15, fontWeight: '500' },
 
   // Quiet line used on completed trip cards
   row: {

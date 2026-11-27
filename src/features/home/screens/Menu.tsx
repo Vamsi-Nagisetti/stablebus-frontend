@@ -197,7 +197,7 @@ export default function MenuScreen() {
 
       <View style={{ height: photoHeight }}>
         <FocusImage source={HEADER_PHOTO} aspect={1000 / 563} focusX={0.42} width={width} height={photoHeight} />
-        <BottomFade height={84} />
+        <BottomFade height={110} />
         <Pressable
           onPress={() => router.back()}
           style={[styles.close, { top: insets.top + 10 }]}
@@ -212,7 +212,7 @@ export default function MenuScreen() {
         <View style={styles.avatar}>
           <Ionicons name="person-outline" size={26} color={C.burgundy} />
         </View>
-        <View style={{ flex: 1, minWidth: 0 }}>
+        <View style={{ flex: 1, minWidth: 0, marginTop: 38 }}>
           <Text style={styles.hello}>{authed ? 'Welcome back' : 'Hello, traveller'}</Text>
           {authed ? (
             <Text style={styles.sub}>Your trips and details</Text>
@@ -272,11 +272,11 @@ const styles = StyleSheet.create({
   },
 
   who: {
-    marginTop: -40,
+    marginTop: -32,
     paddingHorizontal: 20,
     paddingBottom: 6,
     flexDirection: 'row',
-    alignItems: 'center',
+    alignItems: 'flex-start',
     gap: 14,
   },
   avatar: {
