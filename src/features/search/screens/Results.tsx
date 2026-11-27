@@ -47,6 +47,12 @@ type Bus = {
   [key: string]: any;
 };
 
+type SearchRoute = { from: string; to: string; fromCityId: string; toCityId: string };
+type EditCity = { cityID: string | number; cityName: string };
+
+// Cities are fetched once and kept for the next time the Edit sheet opens.
+let citiesMemory: EditCity[] | null = null;
+
 type Sort =
   | 'Recommended'
   | 'Early departure'
@@ -394,6 +400,22 @@ const BusCard = memo(function BusCard({
   const { bus } = row;
   const boardingCount = Array.isArray(bus.boardingDetails) ? bus.boardingDetails.length : 0;
   const droppingCount = Array.isArray(bus.droppingDetails) ? bus.droppingDetails.length : 0;
+
+  // AC / Non-AC, seat type, then one amenity the operator lists (clear icon + label).
+  const features: { icon: IconName; label: string }[] = [
+    { icon: row.ac ? 'snow-outline' : 'sunny-outline', label: row.ac ? 'AC' : 'Non-AC' },
+    ...(row.mixed
+      ? [{ icon: 'bed-outline' as IconName, label: 'Seater / sleeper' }]
+      : row.sleeper
+        ? [{ icon: 'bed-outline' as IconName, label: 'Sleeper' }]
+        : row.seater
+          ? [{ icon: 'person-outline' as IconName, label: 'Seater' }]
+          : []),
+    ...row.amenities
+      .filter(label => label.length <= 14)
+      .slice(0, 1)
+      .map(label => ({ icon: amenityIcon(label), label })),
+  ];
   return (
     <Pressable
       style={s.busCard}
@@ -427,27 +449,13 @@ const BusCard = memo(function BusCard({
         </View>
       </View>
 
-      <View style={s.tags}>
-        <View style={s.typeTag}>
-          <Ionicons name={row.ac ? 'snow-outline' : 'sunny-outline'} size={13} color={C.muted} />
-          <Text style={s.typeTagText}>{row.ac ? 'AC' : 'Non-AC'}</Text>
-        </View>
-        {row.mixed ? (
-          <View style={s.typeTag}>
-            <Ionicons name="bed-outline" size={13} color={C.muted} />
-            <Text style={s.typeTagText}>Seater / sleeper</Text>
+      <View style={s.features}>
+        {features.map(item => (
+          <View key={item.label} style={s.feature}>
+            <Ionicons name={item.icon} size={17} color={C.burgundy} />
+            <Text style={s.featureText} numberOfLines={1}>{item.label}</Text>
           </View>
-        ) : row.sleeper ? (
-          <View style={s.typeTag}>
-            <Ionicons name="bed-outline" size={13} color={C.muted} />
-            <Text style={s.typeTagText}>Sleeper</Text>
-          </View>
-        ) : row.seater ? (
-          <View style={s.typeTag}>
-            <Ionicons name="person-outline" size={13} color={C.muted} />
-            <Text style={s.typeTagText}>Seater</Text>
-          </View>
-        ) : null}
+        ))}
       </View>
 
       <View style={s.cardDivider} />
@@ -950,10 +958,14 @@ export default function Results() {
   const insets = useSafeAreaInsets();
   const isMobile = width < 640;
 
-  const from = readRouteString(routeParams.from) || 'Departure';
-  const to = readRouteString(routeParams.to) || 'Destination';
-  const fromCityId = readRouteString(routeParams.fromCityId);
-  const toCityId = readRouteString(routeParams.toCityId);
+  // The route can now be changed from the Edit sheet, so it lives in state.
+  const [route, setRoute] = useState<SearchRoute>(() => ({
+    from: readRouteString(routeParams.from) || 'Departure',
+    to: readRouteString(routeParams.to) || 'Destination',
+    fromCityId: readRouteString(routeParams.fromCityId),
+    toCityId: readRouteString(routeParams.toCityId),
+  }));
+  const { from, to, fromCityId, toCityId } = route;
 
   // Parse ONCE (lazy initializer). The old code re-parsed the whole response on every render.
   // Home now hands the response over through resultsCache; the route param is only a fallback.
@@ -1016,6 +1028,7 @@ export default function Results() {
     calendarMonth.getMonth() === maxDate.getMonth();
 
   const openDatePicker = () => {
+    pendingRouteRef.current = null;
     const current = journeyDate ? new Date(`${journeyDate}T00:00:00`) : new Date();
     setSelectedDate(journeyDate || todayKey);
     setCalendarMonth(new Date(current.getFullYear(), current.getMonth(), 1));
@@ -1033,7 +1046,13 @@ export default function Results() {
     setSelectedDate(value);
   };
 
+  // Cities chosen in the Edit sheet before jumping to the full calendar.
+  const pendingRouteRef = useRef<SearchRoute | null>(null);
+
   const searchForSelectedDate = async () => {
+    const target = pendingRouteRef.current ?? route;
+    const fromCityId = target.fromCityId;
+    const toCityId = target.toCityId;
     if (!fromCityId || !toCityId) {
       setDateError('Something is missing from this search. Please go back to Home and search again.');
       return;
@@ -1057,8 +1076,10 @@ export default function Results() {
       setJourneyDate(selectedDate);
       setShowDatePicker(false);
 
-      // Only the small date param is updated; the big response stays in state.
-      router.setParams({ date: selectedDate });
+      // Only the small params are updated; the big response stays in state.
+      if (pendingRouteRef.current) setRoute(pendingRouteRef.current);
+      pendingRouteRef.current = null;
+      router.setParams({ date: selectedDate, ...target });
 
       setSort('Recommended');
       setAppliedFilters(emptyFilters);
@@ -1067,6 +1088,140 @@ export default function Results() {
       setDateError(error?.message || "We couldn't search buses just now. Please try again.");
     } finally {
       setSearchingDate(false);
+    }
+  };
+
+  /* ---- Edit sheet: change cities and date without leaving this screen ---- */
+
+  const [showEdit, setShowEdit] = useState(false);
+  const [editView, setEditView] = useState<'main' | 'from' | 'to'>('main');
+  const [editFrom, setEditFrom] = useState<EditCity | null>(null);
+  const [editTo, setEditTo] = useState<EditCity | null>(null);
+  const [editDate, setEditDate] = useState('');
+  const [editError, setEditError] = useState('');
+  const [editSearching, setEditSearching] = useState(false);
+  const [editLoader, setEditLoader] = useState(false);
+  const [cityQuery, setCityQuery] = useState('');
+  const [cityList, setCityList] = useState<EditCity[]>(citiesMemory ?? []);
+  const [citiesLoading, setCitiesLoading] = useState(false);
+
+  const loadCities = useCallback(async () => {
+    if (citiesMemory?.length) {
+      setCityList(citiesMemory);
+      return;
+    }
+    setCitiesLoading(true);
+    try {
+      const response: any = await searchApi.cities();
+      const list: EditCity[] = Array.isArray(response?.cityDetails) ? response.cityDetails : [];
+      citiesMemory = list;
+      setCityList(list);
+    } catch {
+      setEditError("We couldn't load the cities. Please try again.");
+    } finally {
+      setCitiesLoading(false);
+    }
+  }, []);
+
+  const openEdit = () => {
+    setEditFrom({ cityID: fromCityId, cityName: from });
+    setEditTo({ cityID: toCityId, cityName: to });
+    setEditDate(journeyDate || todayKey);
+    setEditView('main');
+    setCityQuery('');
+    setEditError('');
+    setShowEdit(true);
+    loadCities();
+  };
+
+  const swapEditCities = () => {
+    setEditFrom(editTo);
+    setEditTo(editFrom);
+    setEditError('');
+  };
+
+  const pickEditCity = (city: EditCity) => {
+    setEditError('');
+    if (editView === 'from') {
+      // Picking the city that is already the destination swaps the two.
+      if (editTo && String(editTo.cityID) === String(city.cityID)) setEditTo(editFrom);
+      setEditFrom(city);
+    } else {
+      if (editFrom && String(editFrom.cityID) === String(city.cityID)) setEditFrom(editTo);
+      setEditTo(city);
+    }
+    setCityQuery('');
+    setEditView('main');
+  };
+
+  const quickDates = useMemo(
+    () => Array.from({ length: 7 }, (_, i) => dateKey(new Date(Date.now() + i * 86400000))),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [todayKey]
+  );
+
+  const filteredCities = useMemo(() => {
+    const q = cityQuery.trim().toLowerCase();
+    const list = q ? cityList.filter(c => c.cityName.toLowerCase().includes(q)) : cityList;
+    return list.slice(0, 80);
+  }, [cityList, cityQuery]);
+
+  const openCalendarFromEdit = () => {
+    if (!editFrom || !editTo) return;
+    pendingRouteRef.current = {
+      from: editFrom.cityName,
+      to: editTo.cityName,
+      fromCityId: String(editFrom.cityID),
+      toCityId: String(editTo.cityID),
+    };
+    const current = editDate ? new Date(`${editDate}T00:00:00`) : new Date();
+    setSelectedDate(editDate || todayKey);
+    setCalendarMonth(new Date(current.getFullYear(), current.getMonth(), 1));
+    setDateError('');
+    setShowEdit(false);
+    setTimeout(() => setShowDatePicker(true), 260);
+  };
+
+  const searchFromEdit = async () => {
+    if (!editFrom || !editTo || editSearching) return;
+    if (String(editFrom.cityID) === String(editTo.cityID)) {
+      setEditError('Departure and destination cannot be the same city.');
+      return;
+    }
+    setEditSearching(true);
+    setEditError('');
+    // Close the sheet and show the full-screen loader (after the sheet has slid away).
+    setShowEdit(false);
+    const loaderTimer = setTimeout(() => setEditLoader(true), 280);
+    try {
+      const [year, month, day] = editDate.split('-');
+      const response = await searchApi.buses({
+        from_city: String(editFrom.cityID),
+        to_city: String(editTo.cityID),
+        travel_date: `${month}/${day}/${year}`,
+      });
+      const next: SearchRoute = {
+        from: editFrom.cityName,
+        to: editTo.cityName,
+        fromCityId: String(editFrom.cityID),
+        toCityId: String(editTo.cityID),
+      };
+      setBuses(Array.isArray(response?.buses) ? response.buses : []);
+      setSearchKey(response?.search_Key);
+      setJourneyDate(editDate);
+      setRoute(next);
+      router.setParams({ date: editDate, ...next });
+      setSort('Recommended');
+      setAppliedFilters(emptyFilters);
+      setShowSort(false);
+    } catch (error: any) {
+      // Bring the sheet back with the reason, so nothing typed is lost.
+      setEditError(error?.message || "We couldn't search buses just now. Please try again.");
+      setTimeout(() => setShowEdit(true), 320);
+    } finally {
+      clearTimeout(loaderTimer);
+      setEditLoader(false);
+      setEditSearching(false);
     }
   };
 
@@ -1309,7 +1464,7 @@ export default function Results() {
             <Text style={s.headerDate}>{formatJourneyDate(journeyDate)}</Text>
           </View>
 
-          <Pressable style={s.editButton} onPress={() => router.back()}>
+          <Pressable style={s.editButton} onPress={openEdit}>
             <Ionicons name="create-outline" size={18} color={C.burgundy} />
             <Text style={s.editText}>Edit</Text>
           </Pressable>
@@ -1365,6 +1520,162 @@ export default function Results() {
                 {sort === item && <Ionicons name="checkmark" size={20} color={C.burgundy} />}
               </Pressable>
             ))}
+          </View>
+        </View>
+      </Modal>
+
+      {/* EDIT SEARCH SHEET */}
+      <Modal
+        visible={showEdit}
+        transparent
+        statusBarTranslucent
+        animationType="slide"
+        onRequestClose={() => (editView === 'main' ? setShowEdit(false) : setEditView('main'))}
+      >
+        <View style={s.sortBackdrop}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setShowEdit(false)} />
+          <View
+            style={[
+              s.editSheet,
+              !isMobile && s.sortSheetWide,
+              editView !== 'main' && { height: '72%' },
+              { paddingBottom: 18 + insets.bottom },
+            ]}
+          >
+            <View style={s.sheetHandle} />
+
+            {editView === 'main' ? (
+              <>
+                <View style={s.editHeader}>
+                  <View>
+                    <Text style={s.sortSheetTitle}>Edit search</Text>
+                    <Text style={s.editSubtitle}>Change your cities or travel date</Text>
+                  </View>
+                  <Pressable style={s.closeButton} onPress={() => setShowEdit(false)}>
+                    <Ionicons name="close" size={20} color={C.ink} />
+                  </Pressable>
+                </View>
+
+                <View style={s.editRoute}>
+                  <Pressable style={s.editField} onPress={() => { setEditView('from'); setCityQuery(''); }}>
+                    <Ionicons name="radio-button-on" size={17} color={C.burgundy} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.editFieldLabel}>From</Text>
+                      <Text style={s.editFieldValue} numberOfLines={1}>{editFrom?.cityName || 'Select city'}</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                  </Pressable>
+
+                  <View style={s.editDivider}>
+                    <View style={s.editDividerLine} />
+                    <Pressable style={s.swapButton} onPress={swapEditCities} hitSlop={8} accessibilityLabel="Swap cities">
+                      <Ionicons name="swap-vertical" size={18} color={C.burgundy} />
+                    </Pressable>
+                  </View>
+
+                  <Pressable style={s.editField} onPress={() => { setEditView('to'); setCityQuery(''); }}>
+                    <Ionicons name="location" size={17} color={C.burgundy} />
+                    <View style={{ flex: 1 }}>
+                      <Text style={s.editFieldLabel}>To</Text>
+                      <Text style={s.editFieldValue} numberOfLines={1}>{editTo?.cityName || 'Select city'}</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={16} color={C.muted} />
+                  </Pressable>
+                </View>
+
+                <Text style={s.editLabel}>Travel date</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={s.dateChipRow}>
+                  {quickDates.map((value, index) => {
+                    const d = new Date(`${value}T00:00:00`);
+                    const on = editDate === value;
+                    return (
+                      <Pressable key={value} style={[s.dateChip, on && s.dateChipOn]} onPress={() => { setEditDate(value); setEditError(''); }}>
+                        <Text style={[s.dateChipTop, on && s.dateChipTextOn]}>
+                          {index === 0 ? 'Today' : index === 1 ? 'Tomorrow' : d.toLocaleDateString('en-IN', { weekday: 'short' })}
+                        </Text>
+                        <Text style={[s.dateChipDay, on && s.dateChipTextOn]}>
+                          {d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                  <Pressable style={[s.dateChip, !quickDates.includes(editDate) && s.dateChipOn]} onPress={openCalendarFromEdit}>
+                    <Ionicons name="calendar-outline" size={18} color={!quickDates.includes(editDate) ? C.white : C.burgundy} />
+                    <Text style={[s.dateChipTop, !quickDates.includes(editDate) && s.dateChipTextOn]}>
+                      {!quickDates.includes(editDate) ? formatJourneyDate(editDate).replace(/^\w+, /, '').replace(/,?\s\d{4}$/, '') : 'More'}
+                    </Text>
+                  </Pressable>
+                </ScrollView>
+
+                {!!editError && (
+                  <View style={s.dateErrorRow}>
+                    <Ionicons name="information-circle-outline" size={16} color={C.burgundy} />
+                    <Text style={s.dateErrorText}>{editError}</Text>
+                  </View>
+                )}
+
+                <Pressable
+                  style={[s.searchDateButton, (editSearching || !editFrom || !editTo) && s.searchDateButtonDisabled]}
+                  disabled={editSearching || !editFrom || !editTo}
+                  onPress={searchFromEdit}
+                >
+                  {editSearching ? (
+                    <>
+                      <ActivityIndicator color={C.white} size="small" />
+                      <Text style={s.searchDateButtonText}>Searching buses...</Text>
+                    </>
+                  ) : (
+                    <>
+                      <Ionicons name="search-outline" size={17} color={C.white} />
+                      <Text style={s.searchDateButtonText}>Update search</Text>
+                    </>
+                  )}
+                </Pressable>
+              </>
+            ) : (
+              <>
+                <View style={s.editHeader}>
+                  <Pressable style={s.closeButton} onPress={() => setEditView('main')}>
+                    <Ionicons name="arrow-back" size={20} color={C.ink} />
+                  </Pressable>
+                  <View style={{ flex: 1, marginLeft: 12 }}>
+                    <Text style={s.sortSheetTitle}>{editView === 'from' ? 'Departure city' : 'Destination city'}</Text>
+                  </View>
+                </View>
+                <View style={s.citySearch}>
+                  <Ionicons name="search-outline" size={18} color={C.muted} />
+                  <TextInput
+                    value={cityQuery}
+                    onChangeText={setCityQuery}
+                    placeholder="Search city"
+                    placeholderTextColor="#A99B94"
+                    style={s.citySearchInput}
+                    autoFocus
+                  />
+                  {!!cityQuery && (
+                    <Pressable onPress={() => setCityQuery('')} hitSlop={10}>
+                      <Ionicons name="close-circle" size={18} color={C.muted} />
+                    </Pressable>
+                  )}
+                </View>
+                {citiesLoading ? (
+                  <ActivityIndicator color={C.burgundy} style={{ marginTop: 30 }} />
+                ) : (
+                  <FlatList
+                    data={filteredCities}
+                    keyExtractor={c => `${c.cityID}-${c.cityName}`}
+                    keyboardShouldPersistTaps="always"
+                    renderItem={({ item }) => (
+                      <Pressable style={s.cityRow} onPress={() => pickEditCity(item)}>
+                        <Ionicons name="location-outline" size={17} color={C.muted} />
+                        <Text style={s.cityRowText}>{item.cityName}</Text>
+                      </Pressable>
+                    )}
+                    ListEmptyComponent={<Text style={s.cityEmpty}>No cities found.</Text>}
+                  />
+                )}
+              </>
+            )}
           </View>
         </View>
       </Modal>
@@ -1520,6 +1831,13 @@ export default function Results() {
         to={to}
         onClose={closePoints}
         isMobile={isMobile}
+      />
+
+      {/* FULL-SCREEN LOADER WHILE THE EDITED SEARCH RUNS */}
+      <OpeningLoader
+        visible={editLoader}
+        title="Finding buses"
+        subtitle={editFrom && editTo ? `${editFrom.cityName} → ${editTo.cityName}` : undefined}
       />
 
       {/* FULL-SCREEN LOADER WHILE OPENING SEATS */}
@@ -1729,6 +2047,9 @@ const s = StyleSheet.create({
   },
   ratingText: { fontSize: 11, color: C.muted, fontWeight: '500' },
 
+  features: { flexDirection: 'row', flexWrap: 'wrap', columnGap: 18, rowGap: 8, marginTop: 12 },
+  feature: { flexDirection: 'row', alignItems: 'center', gap: 7 },
+  featureText: { fontSize: 13.5, color: C.ink, maxWidth: 130 },
   tags: { flexDirection: 'row', flexWrap: 'wrap', gap: 5, marginTop: 6 },
   typeTag: {
     flexDirection: 'row',
@@ -2151,4 +2472,68 @@ const s = StyleSheet.create({
   },
   sortSheetWide: { width: 420, alignSelf: 'center', borderRadius: 22, marginBottom: 20 },
   sortSheetTitle: { fontSize: 19, fontWeight: '500', color: C.ink, marginBottom: 6 },
+
+  // Edit search sheet
+  editSheet: {
+    backgroundColor: C.paper,
+    borderTopLeftRadius: 23,
+    borderTopRightRadius: 23,
+    paddingHorizontal: 20,
+    paddingTop: 9,
+  },
+  editHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  editSubtitle: { fontSize: 12.5, color: C.muted, marginTop: -2 },
+  editRoute: { borderRadius: 16, borderWidth: 1, borderColor: C.border, backgroundColor: C.bg, paddingHorizontal: 14 },
+  editField: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12 },
+  editFieldLabel: { fontSize: 11.5, color: C.muted },
+  editFieldValue: { fontSize: 16, color: C.ink, fontWeight: '500', marginTop: 1 },
+  editDivider: { height: 1, justifyContent: 'center' },
+  editDividerLine: { height: 1, backgroundColor: C.border },
+  swapButton: {
+    position: 'absolute',
+    right: 0,
+    top: -17,
+    width: 34,
+    height: 34,
+    borderRadius: 17,
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  editLabel: { fontSize: 12.5, color: C.muted, marginTop: 16, marginBottom: 8 },
+  dateChipRow: { gap: 8, paddingRight: 8 },
+  dateChip: {
+    minWidth: 78,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 2,
+  },
+  dateChipOn: { backgroundColor: C.burgundy, borderColor: C.burgundy },
+  dateChipTop: { fontSize: 11.5, color: C.muted },
+  dateChipDay: { fontSize: 13.5, color: C.ink, fontWeight: '500' },
+  dateChipTextOn: { color: C.white },
+  citySearch: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    height: 48,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: C.bg,
+    borderWidth: 1,
+    borderColor: C.border,
+    marginBottom: 6,
+  },
+  citySearchInput: { flex: 1, fontSize: 15, color: C.ink, paddingVertical: 0 },
+  cityRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 14, borderBottomWidth: 1, borderBottomColor: '#F1EAE2' },
+  cityRowText: { fontSize: 15, color: C.ink },
+  cityEmpty: { color: C.muted, fontSize: 14, textAlign: 'center', marginTop: 28 },
 });

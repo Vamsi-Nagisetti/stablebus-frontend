@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "599035107655",
+    "project_id": "stablebus-e0467",
+    "storage_bucket": "stablebus-e0467.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:599035107655:android:ab38c5f9313cfc2fd01462",
+        "android_client_info": {
+          "package_name": "com.stablebus.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC8oGMv08uk-Q62gI_doWlpC3egkk0eG-U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

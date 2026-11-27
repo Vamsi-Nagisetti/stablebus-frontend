@@ -29,6 +29,7 @@ import * as SecureStore from 'expo-secure-store';
 import { searchApi } from '@/features/search/api';
 import type { City } from '@/types/api';
 import { menuSignals } from '@/features/home/menuSignals';
+import { registerPush } from '@/features/notifications/push';
 import { setSearchResponse } from '@/features/search/resultsCache';
 
 const C = {
@@ -175,11 +176,25 @@ const PAGE_RGB = '248,244,237';
 // The welcome screen is shown once per app open; "Skip" keeps it away until the app is reopened.
 let welcomeDismissed = false;
 
+/** Spelling-tolerant city name: "Tirupathi" = "Tirupati", "Bangalore" = "Bengaluru", "(AP)" suffixes ignored. */
+function normalizeCity(name: string): string {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\(.*?\)/g, '')
+    .replace(/[^a-z]/g, '')
+    .replace(/th/g, 't')
+    .replace(/^bangalore$/, 'bengaluru')
+    .replace(/^bangaluru$/, 'bengaluru')
+    .replace(/^bengalore$/, 'bengaluru');
+}
+
 function findCity(cities: City[], names: string[]): City | undefined {
-  const lower = names.map(n => n.toLowerCase());
+  const wanted = names.map(normalizeCity).filter(Boolean);
+  const indexed = cities.map(c => ({ city: c, key: normalizeCity(c.cityName) }));
   return (
-    cities.find(c => lower.includes(c.cityName.toLowerCase())) ||
-    cities.find(c => lower.some(n => c.cityName.toLowerCase().includes(n)))
+    indexed.find(x => wanted.includes(x.key))?.city ||
+    indexed.find(x => wanted.some(n => x.key.startsWith(n) || n.startsWith(x.key)))?.city ||
+    indexed.find(x => wanted.some(n => x.key.includes(n)))?.city
   );
 }
 
@@ -309,6 +324,37 @@ const CityPickerModal = React.memo(function CityPickerModal({
     </Modal>
   );
 });
+
+/**
+ * Bus-search memory. A search that was started early (see the prefetch effect in Home) or recently
+ * finished is reused, so tapping "Search buses" can open Results instantly.
+ */
+const SEARCH_TTL_MS = 120000;
+const searchStore = new Map<string, { at: number; data?: any; promise?: Promise<any> }>();
+
+function fetchBuses(params: { from_city: string; to_city: string; travel_date: string }): Promise<any> {
+  const key = `${params.from_city}|${params.to_city}|${params.travel_date}`;
+  const hit = searchStore.get(key);
+  if (hit) {
+    if (hit.data && Date.now() - hit.at < SEARCH_TTL_MS) return Promise.resolve(hit.data);
+    if (hit.promise) return hit.promise;
+  }
+  if (searchStore.size > 12) {
+    const oldest = [...searchStore.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+    if (oldest) searchStore.delete(oldest[0]);
+  }
+  const promise = withRetry(() => searchApi.buses(params))
+    .then(data => {
+      searchStore.set(key, { at: Date.now(), data });
+      return data;
+    })
+    .catch(error => {
+      searchStore.delete(key);
+      throw error;
+    });
+  searchStore.set(key, { at: Date.now(), promise });
+  return promise;
+}
 
 /** Runs a read-only request again once if the connection was cancelled or timed out. */
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -806,6 +852,7 @@ function WelcomeLogin({
       setError('');
       const result = await verifyOTP(mobile, otp);
       await saveTokens({ access_token: result.access_token, refresh_token: result.refresh_token });
+      registerPush(); // register this phone for notifications (never blocks or fails the login)
       onLoggedIn();
     } catch (e: any) {
       setOtp('');
@@ -1082,7 +1129,9 @@ export default function Home() {
       // Coming back from the menu screen: it may ask for the login screen, and the user may have
       // logged in or out meanwhile.
       getTokens()
-        .then(tokens => setAuthed(!!tokens))
+        .then(tokens => {
+          setAuthed(!!tokens);
+        })
         .catch(() => undefined);
       if (menuSignals.showWelcome) {
         menuSignals.showWelcome = false;
@@ -1292,6 +1341,21 @@ export default function Home() {
     );
   };
 
+  // Warm the search quietly once the route and date have stayed the same for a moment, so the
+  // results are usually ready by the time "Search buses" is tapped.
+  useEffect(() => {
+    if (!from || !to || searching || String(from.cityID) === String(to.cityID)) return;
+    const timer = setTimeout(() => {
+      const [year, month, day] = journeyDate.split('-');
+      fetchBuses({
+        from_city: String(from.cityID),
+        to_city: String(to.cityID),
+        travel_date: `${month}/${day}/${year}`,
+      }).catch(() => undefined);
+    }, 700);
+    return () => clearTimeout(timer);
+  }, [from, to, journeyDate, searching]);
+
   const runSearch = async (fromCity: City, toCity: City) => {
     if (searching) return;
 
@@ -1303,14 +1367,14 @@ export default function Home() {
       const [year, month, day] = journeyDate.split('-');
       const travel_date = `${month}/${day}/${year}`;
 
-      const response = await withRetry(() =>
-        searchApi.buses({
-          from_city: String(fromCity.cityID),
-          to_city: String(toCity.cityID),
-          travel_date,
-        })
-      );
+      const t0 = Date.now();
+      const response = await fetchBuses({
+        from_city: String(fromCity.cityID),
+        to_city: String(toCity.cityID),
+        travel_date,
+      });
 
+      console.log(`[Search] API answered in ${Date.now() - t0} ms`);
       // Hand the response over in memory, then open Results once the API has fully answered.
       setSearchResponse(response);
       router.push({
@@ -1391,6 +1455,17 @@ export default function Home() {
                 <Pressable style={s.helpButton}>
                   <Ionicons name="help-circle-outline" size={17} color={C.muted} />
                   <Text style={s.helpText}>Help & support</Text>
+                </Pressable>
+              )}
+              {authed && (
+                <Pressable
+                  style={s.walletChip}
+                  onPress={() => router.push('/wallet' as any)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Wallet"
+                >
+                  <Ionicons name="wallet-outline" size={15} color={C.burgundy} />
+                  <Text style={s.walletChipText}>Wallet</Text>
                 </Pressable>
               )}
               <Pressable
@@ -1858,6 +1933,18 @@ const s = StyleSheet.create({
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: 15 },
   helpButton: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   helpText: { fontSize: 11, color: C.muted, fontWeight: '500' },
+  walletChip: {
+    height: 33,
+    paddingHorizontal: 11,
+    borderRadius: 17,
+    borderWidth: 1,
+    borderColor: C.border,
+    backgroundColor: C.paper,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  walletChipText: { fontSize: 13, fontWeight: '600', color: C.burgundy },
   profile: {
     width: 33,
     height: 33,

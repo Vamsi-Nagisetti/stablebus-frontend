@@ -20,6 +20,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { sendOTP, verifyOTP } from '@/features/auth/api';
 import { saveTokens, getTokens, clearTokens } from '@/features/auth/tokenStorage';
+import { registerPush } from '@/features/notifications/push';
 import { request } from '@/services/http';
 
 const C = {
@@ -189,13 +190,54 @@ function ageFromDob(v: string): number {
   return age;
 }
 
-/** Survives leaving and re-opening this screen (e.g. going back to change seats). */
+/**
+ * Survives leaving and re-opening this screen (e.g. going back to change seats).
+ * It belongs to ONE person (`owner`: the user id from the login token, or 'guest').
+ * It is wiped whenever a different person (or nobody) is signed in, so one account can
+ * never see another account's saved passengers or contact details.
+ */
 const sessionCache: {
+  owner: string | null;
   authed: boolean;
   saved: SavedPassenger[] | null;
   contact: { mobile: string; email: string };
   draft: Omit<Passenger, 'seatIndex'>[];
-} = { authed: false, saved: null, contact: { mobile: '', email: '' }, draft: [] };
+} = { owner: null, authed: false, saved: null, contact: { mobile: '', email: '' }, draft: [] };
+
+function wipeSessionCache(owner: string | null) {
+  sessionCache.owner = owner;
+  sessionCache.authed = false;
+  sessionCache.saved = null;
+  sessionCache.contact = { mobile: '', email: '' };
+  sessionCache.draft = [];
+}
+
+/** Reads the user id ("sub") from a login token without any library. */
+function ownerOfToken(token: string | null | undefined): string {
+  try {
+    const part = String(token || '').split('.')[1];
+    if (!part) return 'guest';
+    const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    let bits = 0;
+    let value = 0;
+    let out = '';
+    for (const c of b64) {
+      const index = chars.indexOf(c);
+      if (index < 0) continue;
+      value = (value << 6) | index;
+      bits += 6;
+      if (bits >= 8) {
+        bits -= 8;
+        out += String.fromCharCode((value >> bits) & 0xff);
+      }
+    }
+    const sub = JSON.parse(out)?.sub;
+    return sub !== undefined && sub !== null ? `user:${sub}` : 'guest';
+  } catch {
+    return 'guest';
+  }
+}
 
 function statusOf(error: any): number | undefined {
   return error?.status ?? error?.statusCode ?? error?.response?.status;
@@ -759,23 +801,12 @@ export default function Passengers() {
     [selectedSeats]
   );
 
-  // Re-fill passengers from the last visit (e.g. after changing seats), respecting ladies seats.
-  const [passengers, setPassengers] = useState<Passenger[]>(() => {
-    const result: Passenger[] = [];
-    const taken = new Set<number>();
-    for (const draft of sessionCache.draft) {
-      const female = isFemalePassenger(draft.gender);
-      const index = selectedSeats.findIndex(
-        (seat, i) => !taken.has(i) && (!isLadiesSeat(seat) || female)
-      );
-      if (index < 0) continue;
-      taken.add(index);
-      result.push({ ...draft, seatIndex: index });
-    }
-    return result;
-  });
-  const [mobile, setMobile] = useState(sessionCache.contact.mobile);
-  const [email, setEmail] = useState(sessionCache.contact.email);
+  // Passengers from the last visit (e.g. after changing seats) are filled back in only after we
+  // have checked who is signed in (see the restore effect below), respecting ladies seats.
+  const [passengers, setPassengers] = useState<Passenger[]>([]);
+  const cacheReady = useRef(false);
+  const [mobile, setMobile] = useState('');
+  const [email, setEmail] = useState('');
   const [accountError, setAccountError] = useState(false);
   const [submitted, setSubmitted] = useState(false);
   const [savingContact, setSavingContact] = useState(false);
@@ -790,8 +821,8 @@ export default function Passengers() {
   const otpShake = useRef(new Animated.Value(0)).current;
 
   const [authLoading, setAuthLoading] = useState(false);
-  const [isAuthenticated, setIsAuthenticated] = useState(sessionCache.authed);
-  const [savedPassengers, setSavedPassengers] = useState<SavedPassenger[]>(sessionCache.saved ?? []);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [savedPassengers, setSavedPassengers] = useState<SavedPassenger[]>([]);
 
   const [showAdd, setShowAdd] = useState(false);
   const [addTarget, setAddTarget] = useState<number | null>(null);
@@ -801,10 +832,12 @@ export default function Passengers() {
   const [editDeleting, setEditDeleting] = useState(false);
 
   useEffect(() => {
+    if (!cacheReady.current) return;
     sessionCache.draft = passengers.map(({ seatIndex, ...rest }) => rest);
   }, [passengers]);
 
   useEffect(() => {
+    if (!cacheReady.current) return;
     sessionCache.contact = { mobile, email };
   }, [mobile, email]);
 
@@ -856,10 +889,13 @@ export default function Passengers() {
     if (!mounted.current) return;
     if (unauthorized) {
       await clearTokens().catch(() => undefined);
-      sessionCache.authed = false;
-      sessionCache.saved = null;
+      wipeSessionCache('guest');
       setIsAuthenticated(false);
       setSavedPassengers([]);
+      setPassengers([]);
+      setMobile('');
+      setEmail('');
+      savedContact.current = { mobile: '', email: '' };
       return;
     }
     setAccountError(failed);
@@ -868,14 +904,43 @@ export default function Passengers() {
   // Restore login from persisted tokens.
   useEffect(() => {
     (async () => {
+      let tokens: any = null;
       try {
-        const tokens = await getTokens();
-        if (!tokens || !mounted.current) return;
+        tokens = await getTokens();
+      } catch {
+        // Guest checkout stays available if token storage cannot be read.
+      }
+      if (!mounted.current) return;
+
+      // Who is signed in right now? Anything remembered for somebody else is thrown away.
+      const owner = ownerOfToken(tokens?.access_token);
+      if (sessionCache.owner !== owner) wipeSessionCache(owner);
+
+      // Fill the form back in from this same person's last visit.
+      const result: Passenger[] = [];
+      const taken = new Set<number>();
+      for (const draft of sessionCache.draft) {
+        const female = isFemalePassenger(draft.gender);
+        const index = selectedSeats.findIndex(
+          (seat, i) => !taken.has(i) && (!isLadiesSeat(seat) || female)
+        );
+        if (index < 0) continue;
+        taken.add(index);
+        result.push({ ...draft, seatIndex: index });
+      }
+      if (result.length) setPassengers(result);
+      if (sessionCache.contact.mobile) setMobile(sessionCache.contact.mobile);
+      if (sessionCache.contact.email) setEmail(sessionCache.contact.email);
+      if (sessionCache.saved) setSavedPassengers(sessionCache.saved);
+      cacheReady.current = true;
+
+      if (!tokens?.access_token && !tokens?.refresh_token) return;
+      try {
         sessionCache.authed = true;
         setIsAuthenticated(true);
         await loadAccount();
       } catch {
-        // Guest checkout stays available if token storage cannot be read.
+        // Guest checkout stays available if the account cannot be loaded.
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -997,6 +1062,19 @@ export default function Passengers() {
       setOtpError('');
       const result = await verifyOTP(mobile.trim(), otp);
       await saveTokens({ access_token: result.access_token, refresh_token: result.refresh_token });
+      registerPush(); // register this phone for notifications
+      // A different person than the one this screen remembered: forget everything about the old one.
+      const newOwner = ownerOfToken(result.access_token);
+      if (sessionCache.owner !== newOwner) {
+        const previous = sessionCache.owner;
+        wipeSessionCache(newOwner);
+        if (previous && previous !== 'guest') {
+          setPassengers([]);
+          setSavedPassengers([]);
+          setEmail('');
+          savedContact.current = { mobile: '', email: '' };
+        }
+      }
       sessionCache.authed = true;
       setIsAuthenticated(true);
       setLoginVisible(false);

@@ -1,8 +1,10 @@
-
 import React from 'react';
 import { Stack } from 'expo-router';
+import { usePushNotifications } from '@/features/notifications/usePushNotifications';
 
 export default function RootLayout() {
+  usePushNotifications();
+
   return (
     <Stack
       initialRouteName="index"
@@ -16,7 +18,6 @@ export default function RootLayout() {
       <Stack.Screen name="points" />
       <Stack.Screen name="passengers" />
       <Stack.Screen name="payment" />
-      <Stack.Screen name="ticket" />
       <Stack.Screen name="tickets" />
 
       {/* Authentication */}
@@ -24,6 +25,7 @@ export default function RootLayout() {
       <Stack.Screen name="verify-otp" />
 
       {/* Profile screens */}
+      <Stack.Screen name="menu" />
       <Stack.Screen name="bookings" />
       <Stack.Screen name="rewards" />
       <Stack.Screen name="saved-passengers" />

@@ -1,10 +1,9 @@
-
 {
   "expo": {
     "name": "StableBus",
     "slug": "stablebus",
     "scheme": "stablebus",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
 
@@ -14,11 +13,13 @@
       "expo-router",
       "expo-secure-store",
       "expo-asset",
-      "expo-image"
+      "expo-image",
+      ["expo-notifications", { "color": "#783D4A" }]
     ],
 
     "android": {
       "package": "com.stablebus.app",
+      "googleServicesFile": "./google-services.json",
       "adaptiveIcon": {
         "foregroundImage": "./src/assets/scenic/stablebus_adaptive_foreground_1024.png",
         "backgroundColor": "#F8F4ED"

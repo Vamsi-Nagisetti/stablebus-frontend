@@ -8,6 +8,7 @@ import {
   ScrollView,
   StatusBar,
   StyleSheet,
+  Switch,
   Text,
   View,
 } from 'react-native';
@@ -60,8 +61,26 @@ type ApiResponse = {
   amount?: string;
   status?: string;
   booking_status?: string;
+  gateway?: string;
+  coins_used?: number;
   message?: string;
 };
+
+// 1 coin = ₹0.25 (4 coins = ₹1). The server re-checks every amount.
+const COIN_RUPEES = 0.25;
+const MIN_CASH = 1;
+
+/** How many coins to apply so that cash is either 0 or at least ₹1 (never a tiny gateway amount). */
+function coinsToApply(fare: number, balance: number, maxPercent = 100): number {
+  const paise = Math.round(fare * 100);
+  const maxByPrice = Math.floor((paise * Math.min(100, Math.max(0, maxPercent))) / 100 / 25);
+  let coins = Math.max(0, Math.min(balance, maxByPrice));
+  const cashPaise = paise - coins * 25;
+  if (cashPaise > 0 && cashPaise < MIN_CASH * 100) {
+    coins = Math.max(0, Math.floor((paise - MIN_CASH * 100) / 25));
+  }
+  return coins;
+}
 
 function parseJson(value: unknown): any {
   if (!value) return null;
@@ -294,6 +313,27 @@ export default function Payment() {
   // After an uncertain payment result the button stays off, so nobody pays twice.
   const [locked, setLocked] = useState(false);
 
+  // Wallet coins (only signed-in users have a wallet; guests simply get no balance).
+  const [walletCoins, setWalletCoins] = useState(0);
+  const [useCoins, setUseCoins] = useState(false);
+  const [maxRedeemPercent, setMaxRedeemPercent] = useState(100);
+
+  useEffect(() => {
+    let alive = true;
+    request<{ coins?: number; max_redeem_percent?: number }>('/api/v1/wallet?brief=true', { timeoutMs: 15000 })
+      .then(res => {
+        if (!alive) return;
+        setWalletCoins(Math.max(0, Number(res?.coins) || 0));
+        if (res?.max_redeem_percent !== undefined) setMaxRedeemPercent(Number(res.max_redeem_percent));
+      })
+      .catch(() => {
+        if (alive) setWalletCoins(0);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   /**
    * Fare breakdown from the seats' own fare data: base fare + each tax/charge, adding up to the
    * amount that is actually charged (`totalFare`). Nothing is invented: anything the seat data does
@@ -338,7 +378,12 @@ export default function Payment() {
     return { base: extra > 0.009 || charges.length ? base : payable, charges };
   }, [selectedSeats, fare]);
 
-  const amountLabel = formatAmount(fare);
+  // The coin choice is frozen once a payment order exists (the server stored that exact split).
+  const coinsToUse = useCoins ? coinsToApply(fare, walletCoins, maxRedeemPercent) : 0;
+  const coinDiscount = Math.round(coinsToUse * COIN_RUPEES * 100) / 100;
+  const cashToPay = Math.max(0, Math.round((fare - coinDiscount) * 100) / 100);
+  const walletOnly = coinsToUse > 0 && cashToPay === 0;
+  const amountLabel = formatAmount(cashToPay);
 
  
 function getBookingPayload() {
@@ -536,9 +581,16 @@ function getBookingPayload() {
           : undefined,
         body: JSON.stringify({
           idempotency_key: paymentIdempotencyKey,
+          coins_to_use: coinsToUse,
         }),
       }
     );
+
+    // Coins covered the whole price: no gateway order exists and none is needed.
+    if (result.gateway === 'WALLET' && result.status === 'SUCCESS' && result.payment_id) {
+      setPaymentId(result.payment_id);
+      return result;
+    }
 
     if (result.status !== 'PENDING' || !result.payment_id || !result.gateway_order_id) {
       throw new Error(
@@ -609,7 +661,7 @@ function getBookingPayload() {
 
     const razorpayKey = process.env.EXPO_PUBLIC_RAZORPAY_KEY_ID;
 
-    if (!razorpayKey) {
+    if (!razorpayKey && !walletOnly) {
       showToast('Payments are not set up in this build yet.');
       console.warn('[Payment] Add EXPO_PUBLIC_RAZORPAY_KEY_ID to your mobile app environment.');
       return;
@@ -641,16 +693,21 @@ function getBookingPayload() {
 
       stage = 'order';
       // Step 2: Create the Razorpay order through StableBus backend.
-      let payment = paymentId && gatewayOrderId
+      let payment = paymentId && !gatewayOrderId && walletOnly
+        ? ({ payment_id: paymentId, gateway: 'WALLET', status: 'SUCCESS', amount: '0' } as ApiResponse)
+        : paymentId && gatewayOrderId
         ? {
             payment_id: paymentId,
             gateway_order_id: gatewayOrderId,
-            amount: String(fare),
+            amount: String(cashToPay),
             currency: 'INR',
             status: 'PENDING',
           } as ApiResponse
         : await initiatePayment(id, token);
 
+      const paidWithCoinsOnly = payment.gateway === 'WALLET' && payment.status === 'SUCCESS';
+
+      if (!paidWithCoinsOnly) {
       const keyAmount = Math.round(Number(payment.amount) * 100);
 
       if (!Number.isFinite(keyAmount) || keyAmount <= 0) {
@@ -725,6 +782,8 @@ function getBookingPayload() {
         );
         setLocked(true);
         return;
+      }
+
       }
 
       // Step 5: Ask the bus provider to issue the ticket, then open
@@ -988,9 +1047,45 @@ function getBookingPayload() {
               <Text style={styles.totalLabel}>Total payable</Text>
               <Text style={styles.totalSub}>Inclusive of all taxes</Text>
             </View>
-            <Text style={styles.totalAmount}>{amountLabel}</Text>
+            <Text style={styles.totalAmount}>{formatAmount(fare)}</Text>
           </View>
+
+          {coinsToUse > 0 && (
+            <>
+              <View style={styles.fareRow}>
+                <Text style={styles.fareLabel}>Coins ({coinsToUse})</Text>
+                <Text style={[styles.fareValue, { color: C.green }]}>− {formatAmount(coinDiscount)}</Text>
+              </View>
+              <View style={styles.fareRow}>
+                <Text style={[styles.fareLabel, { fontWeight: '600', color: C.ink }]}>To pay now</Text>
+                <Text style={[styles.fareValue, { fontWeight: '700' }]}>{amountLabel}</Text>
+              </View>
+            </>
+          )}
         </View>
+
+        {(walletCoins > 0 || coinsToUse > 0) && (
+          <View style={styles.coinCard}>
+            <View style={styles.coinIcon}>
+              <Ionicons name="wallet-outline" size={19} color={C.burgundy} />
+            </View>
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={styles.coinTitle}>Use StableBus coins</Text>
+              <Text style={styles.coinSub}>
+                {useCoins && coinsToUse > 0
+                  ? `Using ${coinsToUse} coins · you save ${formatAmount(coinDiscount)}`
+                  : `${walletCoins} coins available · worth ${formatAmount(walletCoins * COIN_RUPEES)}`}
+              </Text>
+            </View>
+            <Switch
+              value={useCoins}
+              onValueChange={setUseCoins}
+              disabled={loading || !!paymentId || locked}
+              trackColor={{ false: '#D9CFC8', true: C.burgundy }}
+              thumbColor="#fff"
+            />
+          </View>
+        )}
 
         <View style={styles.secureNote}>
           <Ionicons name="shield-checkmark-outline" size={16} color={C.green} />
@@ -1023,7 +1118,7 @@ function getBookingPayload() {
               <ActivityIndicator color="#fff" />
             ) : (
               <>
-                <Text style={styles.payButtonText}>{finalMessage && !locked ? 'Try again' : 'Pay securely'}</Text>
+                <Text style={styles.payButtonText}>{finalMessage && !locked ? 'Try again' : walletOnly ? 'Pay with coins' : 'Pay securely'}</Text>
                 <Ionicons name="arrow-forward" size={17} color="#fff" />
               </>
             )}
@@ -1304,6 +1399,27 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: 10,
   },
+  coinCard: {
+    marginTop: 14,
+    padding: 14,
+    borderRadius: 18,
+    backgroundColor: C.paper,
+    borderWidth: 1,
+    borderColor: C.border,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  coinIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 13,
+    backgroundColor: C.burgundyLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  coinTitle: { color: C.ink, fontSize: 15, fontWeight: '500' },
+  coinSub: { color: C.muted, fontSize: 12.5, marginTop: 2 },
   payButtonDisabled: { backgroundColor: '#B9A6A8' },
   payButtonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
 

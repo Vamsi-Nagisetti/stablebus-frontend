@@ -82,6 +82,93 @@ const statusTone = (status: string) => {
   return { bg: C.burgundyLight, fg: C.burgundy };
 };
 
+type CoinBannerInfo = {
+  key: string;
+  kind: 'reward' | 'used';
+  title: string;
+  caption: string;
+};
+
+const coinText = (n: number) => `${n.toLocaleString('en-IN')} ${n === 1 ? 'coin' : 'coins'}`;
+
+/** Quiet coin notes for one ticket. Rewards carry the coin picture; coins spent carry a wallet icon. */
+const coinBanners = (booking: Booking): CoinBannerInfo[] => {
+  const w = (booking as any).wallet as
+    | {
+        coins_used?: number;
+        coins_state?: 'PENDING' | 'USED' | 'RETURNED';
+        coins_returned?: number;
+        coins_earned?: number;
+        coins_expected?: number;
+      }
+    | null
+    | undefined;
+  if (!w) return [];
+  const out: CoinBannerInfo[] = [];
+
+  if (w.coins_earned) {
+    out.push({
+      key: 'earned',
+      kind: 'reward',
+      title: `${coinText(w.coins_earned)} earned`,
+      caption: 'Added to your wallet for your next ticket.',
+    });
+  } else if (w.coins_expected) {
+    out.push({
+      key: 'expected',
+      kind: 'reward',
+      title: `${coinText(w.coins_expected)} to earn`,
+      caption: 'Added to your wallet after you complete this trip.',
+    });
+  }
+
+  if (w.coins_used) {
+    if (w.coins_state === 'RETURNED') {
+      out.push({
+        key: 'returned',
+        kind: 'used',
+        title: `${coinText(w.coins_used)} returned`,
+        caption: 'Back in your wallet.',
+      });
+    } else {
+      out.push({
+        key: 'used',
+        kind: 'used',
+        title: `${coinText(w.coins_used)} used`,
+        caption:
+          w.coins_state === 'PENDING'
+            ? 'Returned to your wallet if you cancel.'
+            : 'Applied to this ticket.',
+      });
+    }
+  }
+  return out;
+};
+
+const CoinBanners = ({ booking }: { booking: Booking }) => {
+  const items = coinBanners(booking);
+  if (!items.length) return null;
+  return (
+    <View style={styles.coinBannerStack}>
+      {items.map(item => (
+        <View key={item.key} style={styles.coinBanner}>
+          {item.kind === 'reward' ? (
+            <Image source={require('@/assets/scenic/coin.png')} style={styles.coinBannerCoin} resizeMode="contain" />
+          ) : (
+            <View style={styles.coinBannerWallet}>
+              <Ionicons name="wallet-outline" size={15} color={C.muted} />
+            </View>
+          )}
+          <View style={{ flex: 1, minWidth: 0 }}>
+            <Text style={styles.coinBannerTitle} numberOfLines={1}>{item.title}</Text>
+            <Text style={styles.coinBannerCaption} numberOfLines={2}>{item.caption}</Text>
+          </View>
+        </View>
+      ))}
+    </View>
+  );
+};
+
 const isCancelled = (booking: Booking) =>
   ['CANCELLED', 'FAILED'].includes(String(booking.booking_status).toUpperCase());
 
@@ -456,11 +543,12 @@ export default function BookingsScreen() {
       setBusy(true);
       setError('');
 
-      await bookingsApi.cancel(
+      const result: any = await bookingsApi.cancel(
         cancelBooking.booking_id,
         selectedSeats,
         quote.cancellationCharge_Key as string
       );
+      const refund = result?.refund;
 
       setCancelBooking(null);
       setQuote(null);
@@ -468,7 +556,18 @@ export default function BookingsScreen() {
       setSelectedSeats([]);
 
       await load(true);
-      showToast('Cancellation confirmed by the provider.');
+      const rupees = Number(refund?.refund_cash || 0);
+      const coins = Number(refund?.refund_coins || 0);
+      const parts: string[] = [];
+      if (rupees > 0) parts.push(`₹${rupees.toLocaleString('en-IN')} to your original payment method`);
+      if (coins > 0) parts.push(`${coins} coins back to your wallet`);
+      showToast(
+        parts.length
+          ? `Cancelled. Refund: ${parts.join(' and ')}.`
+          : refund?.status === 'FAILED_NEEDS_REVIEW'
+            ? 'Cancelled. We are processing your refund and will update you shortly.'
+            : 'Cancellation confirmed.'
+      );
     } catch (e: any) {
       const message = e?.message || 'Cancellation could not be confirmed.';
       setConfirming(false);
@@ -577,6 +676,7 @@ export default function BookingsScreen() {
         <View style={styles.statusLine}>
           <StatusPill status={booking.booking_status} />
         </View>
+        <CoinBanners booking={booking} />
       </Pressable>
     );
   };
@@ -821,6 +921,8 @@ export default function BookingsScreen() {
                     <Text style={styles.factValueStrong}>{money(details.total_amount, details.currency)}</Text>
                   </View>
                 </View>
+
+                <CoinBanners booking={details} />
 
                 <Text style={styles.sectionTitle}>Passengers</Text>
                 <View style={styles.panel}>
@@ -1079,6 +1181,30 @@ const styles = StyleSheet.create({
   pointName: { color: C.ink, fontSize: 14, fontWeight: '600', marginTop: 5 },
   pointTime: { color: C.burgundy, fontSize: 13, marginTop: 3 },
   statusLine: { flexDirection: 'row', marginTop: 12 },
+  coinBannerStack: { marginTop: 12, gap: 6 },
+  coinBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderRadius: 14,
+    backgroundColor: '#FAF6F0',
+    borderWidth: 1,
+    borderColor: '#F0E8DE',
+  },
+  coinBannerCoin: { width: 28, height: 28 },
+  coinBannerWallet: { width: 28, height: 28, alignItems: 'center', justifyContent: 'center' },
+  coinBannerTitle: { color: C.ink, fontSize: 13, fontWeight: '500' },
+  coinBannerCaption: { color: C.muted, fontSize: 11.5, lineHeight: 16, marginTop: 1 },
+  coinDot: {
+    width: 20,
+    height: 20,
+    borderRadius: 10,
+    backgroundColor: '#EDC25A',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   statusPill: { paddingHorizontal: 10, height: 26, borderRadius: 13, justifyContent: 'center' },
   status: { fontSize: 12, fontWeight: '500' },
 
