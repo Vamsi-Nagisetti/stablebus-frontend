@@ -15,7 +15,13 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import RazorpayCheckout from 'react-native-razorpay';
+import { CFPaymentGatewayService } from 'react-native-cashfree-pg-sdk';
+import {
+  CFDropCheckoutPayment,
+  CFEnvironment,
+  CFSession,
+  CFThemeBuilder,
+} from 'cashfree-pg-api-contract';
 import { request } from '@/services/http';
 
 // The booking API accepts operator_name (and rejects other unknown fields such as bus_type or city names),
@@ -58,6 +64,7 @@ type ApiResponse = {
   currency?: string;
   payment_id?: string;
   gateway_order_id?: string;
+  payment_session_id?: string;
   amount?: string;
   status?: string;
   booking_status?: string;
@@ -277,6 +284,7 @@ export default function Payment() {
   const [guestToken, setGuestToken] = useState('');
   const [paymentId, setPaymentId] = useState('');
   const [gatewayOrderId, setGatewayOrderId] = useState('');
+  const [paymentSessionId, setPaymentSessionId] = useState('');
 
   // Keep the same keys if the user retries an uncertain network operation.
   const [bookingIdempotencyKey] = useState(() =>
@@ -600,6 +608,7 @@ function getBookingPayload() {
 
     setPaymentId(result.payment_id);
     setGatewayOrderId(result.gateway_order_id);
+    setPaymentSessionId(result.payment_session_id || '');
 
     return result;
   }
@@ -608,7 +617,7 @@ function getBookingPayload() {
     id: string,
     guestAccessToken: string,
     stablePaymentId: string,
-    razorpayPaymentId: string,
+    gatewayPaymentId: string,
     signature: string
   ): Promise<ApiResponse> {
     setStep('Verifying your payment');
@@ -623,7 +632,7 @@ function getBookingPayload() {
           : undefined,
         body: JSON.stringify({
           payment_id: stablePaymentId,
-          gateway_payment_id: razorpayPaymentId,
+          gateway_payment_id: gatewayPaymentId,
           signature,
         }),
       }
@@ -659,14 +668,6 @@ function getBookingPayload() {
       return;
     }
 
-    const razorpayKey = process.env.EXPO_PUBLIC_RAZORPAY_KEY_ID;
-
-    if (!razorpayKey && !walletOnly) {
-      showToast('Payments are not set up in this build yet.');
-      console.warn('[Payment] Add EXPO_PUBLIC_RAZORPAY_KEY_ID to your mobile app environment.');
-      return;
-    }
-
     if (!fare || fare <= 0) {
       showToast('The booking amount is not valid. Please go back and try again.');
       return;
@@ -692,13 +693,14 @@ function getBookingPayload() {
       const token = created.guest_access_token || guestToken;
 
       stage = 'order';
-      // Step 2: Create the Razorpay order through StableBus backend.
+      // Step 2: Create the payment order through StableBus backend.
       let payment = paymentId && !gatewayOrderId && walletOnly
         ? ({ payment_id: paymentId, gateway: 'WALLET', status: 'SUCCESS', amount: '0' } as ApiResponse)
-        : paymentId && gatewayOrderId
+        : paymentId && gatewayOrderId && paymentSessionId
         ? {
             payment_id: paymentId,
             gateway_order_id: gatewayOrderId,
+            payment_session_id: paymentSessionId,
             amount: String(cashToPay),
             currency: 'INR',
             status: 'PENDING',
@@ -714,66 +716,75 @@ function getBookingPayload() {
         throw new Error('Backend returned an invalid payment amount.');
       }
 
-      // Step 3: Open Razorpay native checkout.
+      // Step 3: Open Cashfree checkout.
       stage = 'checkout';
       setStep('Waiting for payment');
 
-      // The full-screen loader is a native Modal. Razorpay's own screen must not launch while that
+      // The full-screen loader is a native Modal. Cashfree's own screen must not launch while that
       // Modal is still closing, or Android swallows it. Give the Modal time to disappear first.
       await new Promise(resolve => setTimeout(resolve, 700));
 
-      // react-native-razorpay is a native module and is unavailable in Expo Go.
-      // Check it before calling .open() so the user gets an actionable message.
-      const razorpayModule = RazorpayCheckout as
-        | { open?: (options: Record<string, any>) => Promise<any> }
-        | null
-        | undefined;
+      const sessionId = payment.payment_session_id;
+      if (!sessionId) {
+        throw new Error('The payment session is not ready. Please try again.');
+      }
 
-      if (!razorpayModule || typeof razorpayModule.open !== 'function') {
+      const cashfreeEnv =
+        process.env.EXPO_PUBLIC_CASHFREE_ENV === 'PRODUCTION'
+          ? CFEnvironment.PRODUCTION
+          : CFEnvironment.SANDBOX;
+
+      // The Cashfree SDK is a native module: it is unavailable in Expo Go and on the web.
+      if (!CFPaymentGatewayService || typeof CFPaymentGatewayService.doPayment !== 'function') {
         throw new Error(
-          'Razorpay native SDK is unavailable in this app build. Install and run a rebuilt Android/iOS development build containing react-native-razorpay. Your temporary booking and payment order have already been created; retrying on this screen will reuse them.'
+          'Payments are not available in this app build. Please install the latest development build of StableBus.'
         );
       }
 
-      let checkout: any;
-      try {
-        checkout = await razorpayModule.open({
-          key: razorpayKey,
-          order_id: payment.gateway_order_id!,
-          amount: String(keyAmount),
-          currency: payment.currency || 'INR',
-          name: 'StableBus',
-          description: `${from} to ${to}`,
-          prefill: {
-            contact: String(contact.mobile || ''),
-            email: String(contact.email || ''),
-          },
-          theme: {
-            color: C.burgundy,
+      // Cashfree reports the result through callbacks. Turn them into one promise.
+      const orderIdFromSdk = await new Promise<string>((resolve, reject) => {
+        CFPaymentGatewayService.setCallback({
+          onVerify: (orderID: string) => resolve(orderID),
+          onError: (cfError: any, orderID: string) => {
+            const message = String(cfError?.getMessage?.() || cfError?.message || 'Payment was not completed');
+            const err: any = new Error(message);
+            if (/cancel|dropped|back/i.test(message)) err.code = 'PAYMENT_CANCELLED';
+            err.orderId = orderID;
+            reject(err);
           },
         });
-      } catch (openError: any) {
-        if (/of null|undefined/i.test(String(openError?.message))) {
-          throw new Error('Payments are not available in this app build. Please install the latest development build of StableBus.');
+
+        try {
+          const session = new CFSession(sessionId, payment.gateway_order_id!, cashfreeEnv);
+          const theme = new CFThemeBuilder()
+            .setNavigationBarBackgroundColor(C.burgundy)
+            .setNavigationBarTextColor('#FFFFFF')
+            .setButtonBackgroundColor(C.burgundy)
+            .setButtonTextColor('#FFFFFF')
+            .setPrimaryTextColor(C.ink)
+            .setSecondaryTextColor(C.muted)
+            .build();
+          CFPaymentGatewayService.doPayment(new CFDropCheckoutPayment(session, null, theme));
+        } catch (startError) {
+          reject(startError);
         }
-        throw openError;
-      }
+      }).finally(() => {
+        try {
+          CFPaymentGatewayService.removeCallback();
+        } catch {
+          // nothing to remove
+        }
+      });
 
-      const razorpayPaymentId = checkout.razorpay_payment_id;
-      const signature = checkout.razorpay_signature;
-
-      if (!razorpayPaymentId || !signature) {
-        throw new Error('Razorpay did not return payment verification details.');
-      }
-
-      // Step 4: Backend verifies signature and captured amount.
+      // Step 4: Backend asks Cashfree what really happened. The app's word is never trusted.
+      // Cashfree has no signature: the order id is the payment reference.
       stage = 'verify';
       const verified = await verifyPayment(
         id,
         token,
         payment.payment_id!,
-        razorpayPaymentId,
-        signature
+        orderIdFromSdk || payment.gateway_order_id!,
+        ''
       );
 
       if (verified.status !== 'SUCCESS') {
@@ -817,7 +828,7 @@ function getBookingPayload() {
         String(raw).toLowerCase().includes('cancel') || error?.code === 'PAYMENT_CANCELLED';
 
       if (cancelled) {
-        // Razorpay cancellation is not a failure: nothing was charged and paying again is fine.
+        // Cancelling the payment screen is not a failure: nothing was charged and paying again is fine.
         setFinalMessage('Payment was cancelled. Your booking has not been confirmed.');
       } else if (stage === 'verify' || stage === 'ticket') {
         // Money may already have been taken: never invite a second payment.
@@ -1090,7 +1101,7 @@ function getBookingPayload() {
         <View style={styles.secureNote}>
           <Ionicons name="shield-checkmark-outline" size={16} color={C.green} />
           <Text style={styles.secureText}>
-            Secured by Razorpay. Your card and UPI details are never stored by StableBus.
+            Secured by Cashfree Payments. Your card and UPI details are never stored by StableBus.
           </Text>
         </View>
 
