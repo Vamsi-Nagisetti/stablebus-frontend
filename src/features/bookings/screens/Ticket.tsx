@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Image,
   Animated,
   BackHandler,
   Pressable,
@@ -15,6 +16,23 @@ import { Ionicons } from '@expo/vector-icons';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { request } from '@/services/http';
+import { feedback } from '@/features/feedback/feedback';
+
+/* Small round traveller picture for a passenger (picked from gender / title). */
+const AVATAR_FEMALE = require('@/assets/scenic/avatar_female.png');
+const AVATAR_MALE = require('@/assets/scenic/avatar_male.png');
+
+function PassengerAvatar({ gender, title, size = 42 }: { gender?: string; title?: string; size?: number }) {
+  const female =
+    /^(f|female|woman|girl)/i.test(String(gender || '').trim()) ||
+    /^(ms|mrs|miss)\.?$/i.test(String(title || '').trim());
+  return (
+    <Image
+      source={female ? AVATAR_FEMALE : AVATAR_MALE}
+      style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: '#FBEDE6' }}
+    />
+  );
+}
 
 const C = {
   bg: '#F8F4ED',
@@ -49,6 +67,7 @@ type ApiResponse = {
   supplier_refno?: string | null;
   transport_pnr?: string | null;
   message?: string;
+  status?: string;
 };
 
 const PHONE_RE = /(?:\+?91[\s-]*)?(?:\d[\s-]*){10,}/g;
@@ -147,6 +166,10 @@ export default function Tickets() {
   const journeyDate = firstParam(params, ['date']);
   const amount = firstParam(params, ['totalFare', 'amount']);
   const currency = firstParam(params, ['currency']) || 'INR';
+  // Set when this screen is showing a payment that did not end in a ticket (pending, failed, cancelled).
+  const paymentId = firstParam(params, ['paymentId']);
+  const gatewayOrderId = firstParam(params, ['gatewayOrderId']);
+  const paymentMessage = firstParam(params, ['message']);
 
   const [bookingStatus, setBookingStatus] = useState(
     firstParam(params, ['bookingStatus', 'booking_status']).toUpperCase() || 'TICKETING_UNKNOWN'
@@ -186,10 +209,29 @@ export default function Tickets() {
     return () => subscription.remove();
   }, [router]);
 
+  // A soft pop and a double tap when the ticket is confirmed; one longer buzz when it is still
+  // pending or failed. Plays once per status, so refreshing does not repeat it.
+  const lastFeedback = useRef('');
+  useEffect(() => {
+    if (lastFeedback.current === bookingStatus) return;
+    lastFeedback.current = bookingStatus;
+    if (bookingStatus === 'CONFIRMED') feedback.success();
+    else if (bookingStatus !== 'CANCELLED') feedback.attention();
+  }, [bookingStatus]);
+
   const isConfirmed = bookingStatus === 'CONFIRMED';
-  const isFailed = ['BOOKING_FAILED', 'CANCELLED'].includes(bookingStatus);
-  const tone = isConfirmed ? C.green : isFailed ? C.red : C.amber;
-  const toneLight = isConfirmed ? C.greenLight : isFailed ? C.redLight : C.amberLight;
+  const isPaymentStage = bookingStatus.startsWith('PAYMENT_');
+  const isPaymentPending = bookingStatus === 'PAYMENT_PENDING';
+  const isPaymentCancelled = bookingStatus === 'PAYMENT_CANCELLED';
+  const isFailed = ['BOOKING_FAILED', 'CANCELLED', 'PAYMENT_FAILED'].includes(bookingStatus);
+  const tone = isConfirmed ? C.green : isFailed ? C.red : isPaymentCancelled ? C.burgundy : C.amber;
+  const toneLight = isConfirmed
+    ? C.greenLight
+    : isFailed
+      ? C.redLight
+      : isPaymentCancelled
+        ? C.burgundyLight
+        : C.amberLight;
 
   const busName = bus.operator_Name || bus.travel_Name || 'Bus operator';
   const busType = bus.bus_Type || bus.seat_Layout || 'Bus service';
@@ -201,16 +243,76 @@ export default function Tickets() {
   const dateLabel = formatDate(journeyDate);
   const paid = formatMoney(amount, currency);
 
-  const statusTitle = isConfirmed
-    ? 'Ticket confirmed'
-    : isFailed
-      ? 'Booking not confirmed'
-      : 'Payment received';
-  const statusText = isConfirmed
-    ? 'Have a safe and comfortable journey.'
-    : isFailed
-      ? 'Your ticket could not be confirmed. Please contact support before doing anything else.'
-      : 'We are waiting for the bus operator to confirm your ticket. Please do not pay again.';
+  const statusTitle = isPaymentStage
+    ? isPaymentPending
+      ? 'Payment is being confirmed'
+      : isPaymentCancelled
+        ? 'Payment cancelled'
+        : 'Payment did not go through'
+    : isConfirmed
+      ? 'Ticket confirmed'
+      : isFailed
+        ? 'Booking not confirmed'
+        : 'Payment received';
+  const statusText = isPaymentStage
+    ? isPaymentPending
+      ? paymentMessage ||
+        'We are waiting for your bank. Please do not pay again. If the payment goes through, your ticket is issued automatically.'
+      : isPaymentCancelled
+        ? 'No money was taken. You can try again while your seats are held.'
+        : 'If any money was deducted, your bank will return it automatically. You can try again.'
+    : isConfirmed
+      ? 'Have a safe and comfortable journey.'
+      : isFailed
+        ? 'Your ticket could not be confirmed. Please contact support before doing anything else.'
+        : 'We are waiting for the bus operator to confirm your ticket. Please do not pay again.';
+
+  // Pending payment: ask the server (and through it the bank) what has happened so far.
+  async function checkPaymentStatus() {
+    if (!bookingId || !paymentId || checking) return;
+    setChecking(true);
+    const headers = guestToken ? { 'X-Guest-Access-Token': guestToken } : undefined;
+    try {
+      const verified = await request<ApiResponse>(`/api/v1/bookings/${bookingId}/payments/verify`, {
+        method: 'POST',
+        timeoutMs: 90000,
+        headers,
+        body: JSON.stringify({ payment_id: paymentId, gateway_payment_id: gatewayOrderId, signature: '' }),
+      });
+      const paymentStatus = String(verified.status || '').toUpperCase();
+
+      if (paymentStatus === 'SUCCESS') {
+        let ticket: ApiResponse;
+        try {
+          ticket = await request<ApiResponse>(`/api/v1/bookings/${bookingId}/ticketing`, {
+            method: 'POST',
+            timeoutMs: 90000,
+            headers,
+          });
+        } catch {
+          // The server may already have started or finished the ticket by itself.
+          ticket = await request<ApiResponse>(`/api/v1/bookings/${bookingId}/requery`, {
+            method: 'POST',
+            timeoutMs: 90000,
+            headers,
+          });
+        }
+        const next = String(ticket.booking_status || 'TICKETING_UNKNOWN').toUpperCase();
+        setBookingStatus(next);
+        if (ticket.transport_pnr) setPnr(ticket.transport_pnr);
+        if (ticket.supplier_refno) setSupplierRef(ticket.supplier_refno);
+        showToast(next === 'CONFIRMED' ? 'Your ticket is confirmed.' : 'Payment received. Confirming your ticket.');
+      } else if (paymentStatus === 'FAILED') {
+        setBookingStatus('PAYMENT_FAILED');
+      } else {
+        showToast('Your bank has not confirmed yet. Please do not pay again.');
+      }
+    } catch (error: any) {
+      showToast(error?.message || 'Could not check the status. Please try again shortly.');
+    } finally {
+      setChecking(false);
+    }
+  }
 
   async function checkTicketStatus() {
     if (!bookingId || checking) return;
@@ -278,12 +380,16 @@ export default function Tickets() {
           <Ionicons name="home-outline" size={20} color={C.ink} />
         </Pressable>
         <View style={{ flex: 1 }}>
-          <Text style={styles.headerTitle}>Your ticket</Text>
+          <Text style={styles.headerTitle}>{isPaymentStage ? 'Your booking' : 'Your ticket'}</Text>
           <Text style={styles.headerSubtitle}>StableBus booking</Text>
         </View>
-        <Pressable onPress={shareTicket} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Share ticket">
-          <Ionicons name="share-social-outline" size={20} color={C.burgundy} />
-        </Pressable>
+        {isPaymentStage ? (
+          <View style={styles.iconButton} />
+        ) : (
+          <Pressable onPress={shareTicket} style={styles.iconButton} accessibilityRole="button" accessibilityLabel="Share ticket">
+            <Ionicons name="share-social-outline" size={20} color={C.burgundy} />
+          </Pressable>
+        )}
       </View>
 
       <ScrollView
@@ -294,7 +400,7 @@ export default function Tickets() {
         <View style={styles.hero}>
           <View style={[styles.heroIcon, { backgroundColor: toneLight }]}>
             <Ionicons
-              name={isConfirmed ? 'checkmark' : isFailed ? 'close' : 'time-outline'}
+              name={isConfirmed ? 'checkmark' : isFailed ? 'close' : isPaymentCancelled ? 'remove' : 'time-outline'}
               size={30}
               color={tone}
             />
@@ -388,29 +494,33 @@ export default function Tickets() {
             value={bookingId || '—'}
             onCopy={bookingId ? () => copyValue(bookingId, 'Booking ID') : undefined}
           />
-          <View style={styles.divider} />
-          <ReferenceRow
-            label="Operator PNR"
-            value={pnr || 'Pending'}
-            strong
-            muted={!pnr}
-            onCopy={pnr ? () => copyValue(pnr, 'PNR') : undefined}
-          />
-          {!!supplierRef && (
+          {!isPaymentStage && (
             <>
               <View style={styles.divider} />
               <ReferenceRow
-                label="Operator reference"
-                value={supplierRef}
-                onCopy={() => copyValue(supplierRef, 'Reference')}
+                label="Operator PNR"
+                value={pnr || 'Pending'}
+                strong
+                muted={!pnr}
+                onCopy={pnr ? () => copyValue(pnr, 'PNR') : undefined}
               />
+              {!!supplierRef && (
+                <>
+                  <View style={styles.divider} />
+                  <ReferenceRow
+                    label="Operator reference"
+                    value={supplierRef}
+                    onCopy={() => copyValue(supplierRef, 'Reference')}
+                  />
+                </>
+              )}
             </>
           )}
           {!!paid && (
             <>
               <View style={styles.divider} />
               <View style={styles.refRow}>
-                <Text style={styles.refLabel}>Total paid</Text>
+                <Text style={styles.refLabel}>{isPaymentStage ? 'Amount' : 'Total paid'}</Text>
                 <Text style={styles.paid}>{paid}</Text>
               </View>
             </>
@@ -424,9 +534,7 @@ export default function Tickets() {
             <View key={`${p.seat || 'seat'}-${index}`}>
               {index > 0 && <View style={styles.divider} />}
               <View style={styles.passengerRow}>
-                <View style={styles.seatChip}>
-                  <Text style={styles.seatChipText}>{p.seat || '—'}</Text>
-                </View>
+                <PassengerAvatar gender={p.gender} title={p.title} size={42} />
                 <View style={{ flex: 1, minWidth: 0 }}>
                   <Text style={styles.passengerName} numberOfLines={1}>
                     {[p.title, p.name].filter(Boolean).join(' ') || `Passenger ${index + 1}`}
@@ -435,6 +543,9 @@ export default function Tickets() {
                     {[p.age ? `${p.age} yrs` : '', p.gender || ''].filter(Boolean).join(' · ') || 'Passenger'}
                     {p.ticket_number ? `  ·  Ticket ${p.ticket_number}` : ''}
                   </Text>
+                </View>
+                <View style={styles.seatChip}>
+                  <Text style={styles.seatChipText}>{p.seat || '—'}</Text>
                 </View>
               </View>
             </View>
@@ -450,7 +561,17 @@ export default function Tickets() {
           </View>
         )}
 
-        {!isConfirmed && !isFailed && (
+        {isPaymentPending && (
+          <View style={[styles.note, { backgroundColor: C.amberLight }]}>
+            <Ionicons name="information-circle-outline" size={19} color={C.amber} />
+            <Text style={[styles.noteText, { color: '#76551F' }]}>
+              Please do not pay again. We check with your bank automatically and issue your ticket as soon as the payment
+              goes through. You will get a notification.
+            </Text>
+          </View>
+        )}
+
+        {!isConfirmed && !isFailed && !isPaymentStage && (
           <View style={[styles.note, { backgroundColor: C.amberLight }]}>
             <Ionicons name="information-circle-outline" size={19} color={C.amber} />
             <Text style={[styles.noteText, { color: '#76551F' }]}>
@@ -460,7 +581,23 @@ export default function Tickets() {
         )}
 
         <View style={styles.actions}>
-          {!isConfirmed && !isFailed && (
+          {isPaymentPending && !!paymentId && (
+            <Pressable
+              style={[styles.primaryButton, checking && { opacity: 0.8 }]}
+              onPress={checkPaymentStatus}
+              disabled={checking}
+            >
+              {checking ? <ActivityIndicator color="#fff" /> : <Ionicons name="refresh" size={18} color="#fff" />}
+              <Text style={styles.primaryText}>{checking ? 'Checking status…' : 'Check payment status'}</Text>
+            </Pressable>
+          )}
+          {(bookingStatus === 'PAYMENT_FAILED' || isPaymentCancelled) && router.canGoBack() && (
+            <Pressable style={styles.primaryButton} onPress={() => router.back()}>
+              <Ionicons name="refresh" size={18} color="#fff" />
+              <Text style={styles.primaryText}>Try again</Text>
+            </Pressable>
+          )}
+          {!isConfirmed && !isFailed && !isPaymentStage && (
             <Pressable
               style={[styles.primaryButton, checking && { opacity: 0.8 }]}
               onPress={checkTicketStatus}

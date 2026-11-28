@@ -19,7 +19,6 @@ const SAVED_TOKEN_KEY = 'stablebus_registered_push_token';
 // Show notifications (banner + sound) while the app is open too. (Not used on web.)
 if (Platform.OS !== 'web') Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
     shouldShowBanner: true,
     shouldShowList: true,
     shouldPlaySound: true,
@@ -27,11 +26,25 @@ if (Platform.OS !== 'web') Notifications.setNotificationHandler({
   }),
 });
 
+// Set to true ONLY after you have rebuilt the app with the stablebus_pop.wav sound included
+// (the "sounds" entry of the expo-notifications plugin in app.json). On an older build the sound does
+// not exist and Android reports an error. Android also cannot change a channel's sound after the
+// channel is created, so the "stablebus" channel is created only when this is true.
+const CUSTOM_SOUND_READY = false;
+
 async function setupAndroidChannel() {
   if (Platform.OS !== 'android') return;
   await Notifications.setNotificationChannelAsync('default', {
     name: 'StableBus',
     importance: Notifications.AndroidImportance.DEFAULT,
+    lightColor: '#783D4A',
+  });
+  if (!CUSTOM_SOUND_READY) return;
+  await Notifications.setNotificationChannelAsync('stablebus', {
+    name: 'Booking updates',
+    importance: Notifications.AndroidImportance.HIGH,
+    sound: 'stablebus_pop.wav',
+    vibrationPattern: [0, 250, 150, 250],
     lightColor: '#783D4A',
   });
 }

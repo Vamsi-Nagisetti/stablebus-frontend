@@ -32,6 +32,7 @@ import { request } from '@/services/http';
 import type { City } from '@/types/api';
 import { menuSignals } from '@/features/home/menuSignals';
 import { registerPush } from '@/features/notifications/push';
+import { feedback } from '@/features/feedback/feedback';
 import { setSearchResponse } from '@/features/search/resultsCache';
 
 const C = {
@@ -715,6 +716,59 @@ function GoldCoin({ size = 54 }: { size?: number }) {
   return <Image source={require('@/assets/scenic/coin.png')} style={{ width: size, height: size }} resizeMode="contain" />;
 }
 
+/* Progress with a stop at every trip: Start, 1, 2 ... goal. */
+function GoldSteps({
+  required,
+  completed,
+  upcoming = 0,
+  allDone = false,
+}: {
+  required: number;
+  completed: number;
+  upcoming?: number;
+  allDone?: boolean;
+}) {
+  const steps = Array.from({ length: required + 1 }, (_, k) => k);
+  const pct = (k: number) => `${(k / required) * 100}%` as any;
+  const done = (k: number) => allDone || k === 0 || k <= completed;
+  const soon = (k: number) => !done(k) && k <= completed + upcoming;
+  const doneRatio = allDone ? 1 : Math.min(1, completed / required);
+  const soonRatio = Math.min(1, (completed + upcoming) / required);
+
+  return (
+    <View style={s.stepsWrap}>
+      <View style={s.stepsRail}>
+        <View style={[s.stepsFillSoft, { width: `${soonRatio * 100}%` }]} />
+        <View style={[s.stepsFill, { width: `${doneRatio * 100}%` }]} />
+      </View>
+      {steps.map(k => {
+        const goal = k === required;
+        return (
+          <View
+            key={k}
+            style={[
+              s.stepDot,
+              { left: pct(k) },
+              goal && s.stepDotGoal,
+              soon(k) && s.stepDotSoon,
+              done(k) && (goal ? s.stepDotGoalDone : s.stepDotDone),
+            ]}
+          />
+        );
+      })}
+      {steps.map(k => (
+        <Text
+          key={`l${k}`}
+          style={[s.stepLabel, { left: pct(k) }, done(k) && k > 0 && s.stepLabelOn]}
+          numberOfLines={1}
+        >
+          {k === 0 ? 'Start' : k === required ? '1g gold' : String(k)}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
 function GoldMileCard({ authed, onSignIn }: { authed: boolean; onSignIn: () => void }) {
   const [data, setData] = useState<GoldMile | null>(null);
   const [loading, setLoading] = useState(false);
@@ -795,16 +849,7 @@ function GoldMileCard({ authed, onSignIn }: { authed: boolean; onSignIn: () => v
           <GoldCoin size={84} />
         </View>
 
-        <View style={[s.goldTrack, { marginTop: 18, backgroundColor: 'rgba(120,61,74,0.14)' }]}>
-          <View style={[s.goldFill, { width: '100%' }]} />
-        </View>
-        <View style={s.goldMarks}>
-          {Array.from({ length: required + 1 }, (_, k) => (
-            <Text key={k} style={[s.goldMark, s.goldMarkOn]}>
-              {k === 0 ? 'Start' : k === required ? '1g gold' : String(k)}
-            </Text>
-          ))}
-        </View>
+        <GoldSteps required={required} completed={required} allDone />
 
         <Text style={s.goldWonNote}>
           {daysLeft != null && daysLeft > 0 ? `Your next round begins in ${daysLeft} days.  ` : ''}Terms, eligibility and winner
@@ -829,17 +874,7 @@ function GoldMileCard({ authed, onSignIn }: { authed: boolean; onSignIn: () => v
 
       {signedIn ? (
         <>
-          <View style={s.goldTrack}>
-            <View style={[s.goldFillSoft, { width: `${onTheWayRatio * 100}%` }]} />
-            <View style={[s.goldFill, { width: `${doneRatio * 100}%` }]} />
-          </View>
-          <View style={s.goldMarks}>
-            {Array.from({ length: required + 1 }, (_, k) => (
-              <Text key={k} style={[s.goldMark, k > 0 && k <= completed && s.goldMarkOn]}>
-                {k === 0 ? 'Start' : k === required ? '1g gold' : String(k)}
-              </Text>
-            ))}
-          </View>
+          <GoldSteps required={required} completed={completed} upcoming={upcoming} />
           <View style={s.goldStatusRow}>
             {data!.qualified && <Ionicons name="checkmark-circle" size={15} color={C.burgundy} />}
             <Text style={s.goldStatus}>
@@ -932,6 +967,81 @@ function OffersFooter({
 
 /* ---------------- Welcome / login ---------------- */
 
+/* Six boxes for the one-time code. A hidden input takes the typing (and SMS autofill). */
+function OtpBoxes({
+  value,
+  onChange,
+  onSubmit,
+  invalid,
+  shakeKey,
+}: {
+  value: string;
+  onChange: (text: string) => void;
+  onSubmit: () => void;
+  invalid: boolean;
+  shakeKey: number;
+}) {
+  const inputRef = useRef<TextInput>(null);
+  const shake = useRef(new Animated.Value(0)).current;
+  const [focused, setFocused] = useState(true);
+
+  // A wrong code: shake the boxes and give two quick buzzes.
+  useEffect(() => {
+    if (!shakeKey) return;
+    feedback.wrong();
+    shake.setValue(0);
+    Animated.sequence([
+      Animated.timing(shake, { toValue: 1, duration: 55, useNativeDriver: true }),
+      Animated.timing(shake, { toValue: -1, duration: 90, useNativeDriver: true }),
+      Animated.timing(shake, { toValue: 0.7, duration: 80, useNativeDriver: true }),
+      Animated.timing(shake, { toValue: -0.7, duration: 80, useNativeDriver: true }),
+      Animated.timing(shake, { toValue: 0, duration: 60, useNativeDriver: true }),
+    ]).start();
+  }, [shakeKey, shake]);
+
+  const activeIndex = Math.min(value.length, 5);
+
+  return (
+    <Animated.View
+      style={[s.otpBoxes, { transform: [{ translateX: shake.interpolate({ inputRange: [-1, 1], outputRange: [-9, 9] }) }] }]}
+    >
+      {Array.from({ length: 6 }, (_, i) => {
+        const digit = value[i] || '';
+        const active = focused && !invalid && i === activeIndex;
+        return (
+          <View
+            key={i}
+            style={[
+              s.otpBox,
+              digit ? s.otpBoxFilled : null,
+              active && s.otpBoxActive,
+              invalid && s.otpBoxInvalid,
+            ]}
+          >
+            <Text style={[s.otpDigit, invalid && s.otpDigitInvalid]}>{digit}</Text>
+          </View>
+        );
+      })}
+      <TextInput
+        ref={inputRef}
+        value={value}
+        onChangeText={t => onChange(t.replace(/\D/g, '').slice(0, 6))}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        keyboardType="number-pad"
+        maxLength={6}
+        autoFocus
+        autoComplete="sms-otp"
+        textContentType="oneTimeCode"
+        caretHidden
+        returnKeyType="done"
+        onSubmitEditing={onSubmit}
+        style={s.otpHiddenInput}
+      />
+    </Animated.View>
+  );
+}
+
 function WelcomeLogin({
   visible,
   onSkip,
@@ -950,6 +1060,8 @@ function WelcomeLogin({
 
   const [mobile, setMobile] = useState('');
   const [otp, setOtp] = useState('');
+  const [otpInvalid, setOtpInvalid] = useState(false);
+  const [otpShake, setOtpShake] = useState(0);
   const [step, setStep] = useState<'phone' | 'otp'>('phone');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -984,6 +1096,7 @@ function WelcomeLogin({
       await sendOTP(mobile);
       setStep('otp');
       setOtp('');
+      setOtpInvalid(false);
       setCountdown(45);
     } catch (e: any) {
       setError(friendlyError(e, "We couldn't send the OTP. Please try again."));
@@ -1007,6 +1120,10 @@ function WelcomeLogin({
       onLoggedIn();
     } catch (e: any) {
       setOtp('');
+      if (e?.status === 401) {
+        setOtpInvalid(true);
+        setOtpShake(n => n + 1);
+      }
       setError(
         e?.status === 401
           ? 'That code is invalid or has expired. Please try again.'
@@ -1089,24 +1206,17 @@ function WelcomeLogin({
               />
             </View>
           ) : (
-            <View style={s.inputRow}>
-              <TextInput
-                value={otp}
-                onChangeText={t => {
-                  setOtp(t.replace(/\D/g, '').slice(0, 6));
-                  if (error) setError('');
-                }}
-                placeholder="• • • • • •"
-                placeholderTextColor="#C9BDB6"
-                keyboardType="number-pad"
-                maxLength={6}
-                autoComplete="sms-otp"
-                textContentType="oneTimeCode"
-                style={[s.inputField, s.otpField]}
-                returnKeyType="done"
-                onSubmitEditing={verify}
-              />
-            </View>
+            <OtpBoxes
+              value={otp}
+              onChange={t => {
+                setOtp(t);
+                if (otpInvalid) setOtpInvalid(false);
+                if (error) setError('');
+              }}
+              onSubmit={verify}
+              invalid={otpInvalid}
+              shakeKey={otpShake}
+            />
           )}
 
           {!!error && <Text style={s.welcomeError}>{error}</Text>}
@@ -1125,7 +1235,7 @@ function WelcomeLogin({
 
           {step === 'otp' && (
             <View style={s.otpLinks}>
-              <Pressable onPress={() => { setStep('phone'); setOtp(''); setError(''); }} hitSlop={8}>
+              <Pressable onPress={() => { setStep('phone'); setOtp(''); setOtpInvalid(false); setError(''); }} hitSlop={8}>
                 <Text style={s.welcomeLink}>Change number</Text>
               </Pressable>
               <Pressable onPress={send} disabled={countdown > 0 || busy} hitSlop={8}>
@@ -2643,11 +2753,6 @@ const s = StyleSheet.create({
     borderWidth: 1,
     borderColor: 'rgba(120,61,74,0.18)',
     overflow: 'hidden',
-    shadowColor: '#783D4A',
-    shadowOpacity: 0.12,
-    shadowRadius: 18,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 2,
   },
   goldSpark: { position: 'absolute', color: '#B07A86', opacity: 0.8 },
   goldBadge: {
@@ -2670,6 +2775,44 @@ const s = StyleSheet.create({
   goldHeadline: { color: C.ink, fontSize: 17, lineHeight: 24, fontWeight: '500' },
   goldHeadlineGold: { color: C.burgundy, fontFamily: SERIF, fontStyle: 'italic', fontWeight: '600' },
   goldBody: { color: C.muted, fontSize: 12.5, lineHeight: 19, marginTop: 14 },
+  stepsWrap: { height: 50, marginTop: 20, marginHorizontal: 22 },
+  stepsRail: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    top: 8,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: 'rgba(120,61,74,0.14)',
+    overflow: 'hidden',
+  },
+  stepsFill: { position: 'absolute', left: 0, top: 0, bottom: 0, backgroundColor: C.burgundy },
+  stepsFillSoft: { position: 'absolute', left: 0, top: 0, bottom: 0, backgroundColor: 'rgba(120,61,74,0.28)' },
+  stepDot: {
+    position: 'absolute',
+    top: 4,
+    marginLeft: -6,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: '#F8F4ED',
+    borderWidth: 1.5,
+    borderColor: 'rgba(120,61,74,0.35)',
+  },
+  stepDotSoon: { borderColor: C.burgundy },
+  stepDotDone: { backgroundColor: C.burgundy, borderColor: C.burgundy },
+  stepDotGoal: { width: 16, height: 16, borderRadius: 8, marginLeft: -8, top: 2, borderColor: GOLD },
+  stepDotGoalDone: { backgroundColor: GOLD, borderColor: GOLD },
+  stepLabel: {
+    position: 'absolute',
+    top: 26,
+    width: 56,
+    marginLeft: -28,
+    textAlign: 'center',
+    color: C.muted,
+    fontSize: 11.5,
+  },
+  stepLabelOn: { color: C.burgundy, fontWeight: '600' },
   goldTrack: { height: 6, borderRadius: 3, backgroundColor: 'rgba(120,61,74,0.12)', overflow: 'hidden', marginTop: 18 },
   goldFill: { position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 3, backgroundColor: C.burgundy },
   goldFillSoft: { position: 'absolute', left: 0, top: 0, bottom: 0, borderRadius: 3, backgroundColor: 'rgba(120,61,74,0.28)' },
@@ -2811,6 +2954,23 @@ const s = StyleSheet.create({
   inputPrefix: { color: C.ink, fontSize: 15, fontWeight: '600' },
   inputField: { flex: 1, color: C.ink, fontSize: 16, paddingVertical: 0, height: 50 },
   otpField: { textAlign: 'center', letterSpacing: 8, fontSize: 20, fontWeight: '600' },
+  otpBoxes: { flexDirection: 'row', justifyContent: 'space-between', gap: 8 },
+  otpBox: {
+    flex: 1,
+    height: 54,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255,255,255,0.95)',
+    borderWidth: 1.5,
+    borderColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  otpBoxFilled: { borderColor: 'rgba(120,61,74,0.28)' },
+  otpBoxActive: { borderColor: C.burgundy },
+  otpBoxInvalid: { borderColor: '#D64545', backgroundColor: '#FFF1EF' },
+  otpDigit: { color: C.ink, fontSize: 22, fontWeight: '600' },
+  otpDigitInvalid: { color: '#B8453F' },
+  otpHiddenInput: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, opacity: 0.02, color: 'transparent' },
   welcomeError: { color: '#FFDAD4', fontSize: 13, marginTop: 10 },
   welcomeButton: {
     height: 52,

@@ -19,6 +19,8 @@ import { CFPaymentGatewayService } from 'react-native-cashfree-pg-sdk';
 import {
   CFDropCheckoutPayment,
   CFEnvironment,
+  CFPaymentComponentBuilder,
+  CFPaymentModes,
   CFSession,
   CFThemeBuilder,
 } from 'cashfree-pg-api-contract';
@@ -32,6 +34,13 @@ const SEND_BUS_DETAILS = true;
 // travel inside it under "_bus". Bookings and the confirmation email read them from there.
 // If the API ever rejects the booking because of this, set it to false.
 const SEND_BUS_IN_POINT = true;
+
+// Payment methods shown inside Cashfree's checkout, in this order. Change without a rebuild by
+// setting EXPO_PUBLIC_CASHFREE_MODES, e.g. "UPI,CARD,NB" (allowed: UPI, CARD, NB, WALLET, EMI, PAY_LATER).
+const CHECKOUT_MODES = (process.env.EXPO_PUBLIC_CASHFREE_MODES || 'UPI,CARD,NB,WALLET')
+  .split(',')
+  .map(m => m.trim().toUpperCase())
+  .filter(Boolean);
 
 const C = {
   bg: '#F8F4ED',
@@ -69,13 +78,28 @@ type ApiResponse = {
   status?: string;
   booking_status?: string;
   gateway?: string;
+  in_flight?: boolean;
   coins_used?: number;
   message?: string;
 };
 
+/** "22/09/2001" or "22-09-2001" -> "2001-09-22". Already-ISO dates pass through; anything unreadable is left out. */
+function toIsoDob(value?: string | null): string | undefined {
+  const v = String(value || '').trim();
+  if (!v) return undefined;
+  if (/^\d{4}-\d{2}-\d{2}/.test(v)) return v.slice(0, 10);
+  const m = v.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/);
+  if (!m) return undefined;
+  return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+}
+
 // 1 coin = ₹0.25 (4 coins = ₹1). The server re-checks every amount.
 const COIN_RUPEES = 0.25;
 const MIN_CASH = 1;
+
+// How long to keep asking the server whether a pending payment has settled (about 40 seconds).
+const VERIFY_RETRIES = 10;
+const VERIFY_RETRY_MS = 4000;
 
 /** How many coins to apply so that cash is either 0 or at least ₹1 (never a tiny gateway amount). */
 function coinsToApply(fare: number, balance: number, maxPercent = 100): number {
@@ -483,8 +507,8 @@ function getBookingPayload() {
       gender: p.gender,
       seat_key: seatKey,
       title: p.title,
-      ...(p.date_of_birth
-        ? { dob: p.date_of_birth }
+      ...(toIsoDob(p.date_of_birth)
+        ? { dob: toIsoDob(p.date_of_birth) }
         : {}),
     };
   });
@@ -660,6 +684,37 @@ function getBookingPayload() {
     );
   }
 
+  // What the outcome screen needs, kept while a payment is running (set once the payment exists).
+  const resultCtx = useRef({ bookingId: '', token: '', paymentId: '', orderId: '' });
+
+  // Payment outcomes (pending, failed, cancelled) open on the ticket screen, in the same look as a
+  // ticket, with a status on top. Pending replaces this screen so it cannot be paid a second time.
+  function openResult(kind: 'pending' | 'failed' | 'cancelled', message?: string, replace = false) {
+    const target = {
+      pathname: '/tickets',
+      params: {
+        bookingId: resultCtx.current.bookingId,
+        guestToken: resultCtx.current.token,
+        paymentId: resultCtx.current.paymentId,
+        gatewayOrderId: resultCtx.current.orderId,
+        bookingStatus:
+          kind === 'pending' ? 'PAYMENT_PENDING' : kind === 'failed' ? 'PAYMENT_FAILED' : 'PAYMENT_CANCELLED',
+        message: message || '',
+        from,
+        to,
+        date: journeyDate,
+        totalFare: String(fare),
+        currency: 'INR',
+        bus: JSON.stringify(bus),
+        passengers: JSON.stringify(passengers),
+        selectedBoardingPoint: JSON.stringify(boarding),
+        selectedDroppingPoint: JSON.stringify(dropping),
+      },
+    };
+    if (replace) router.replace(target as any);
+    else router.push(target as any);
+  }
+
   async function handlePay() {
     if (loading) return;
 
@@ -691,6 +746,7 @@ function getBookingPayload() {
 
       const id = created.booking_id!;
       const token = created.guest_access_token || guestToken;
+      resultCtx.current = { ...resultCtx.current, bookingId: id, token };
 
       stage = 'order';
       // Step 2: Create the payment order through StableBus backend.
@@ -715,6 +771,12 @@ function getBookingPayload() {
       if (!Number.isFinite(keyAmount) || keyAmount <= 0) {
         throw new Error('Backend returned an invalid payment amount.');
       }
+
+      resultCtx.current = {
+        ...resultCtx.current,
+        paymentId: payment.payment_id || '',
+        orderId: payment.gateway_order_id || '',
+      };
 
       // Step 3: Open Cashfree checkout.
       stage = 'checkout';
@@ -742,7 +804,12 @@ function getBookingPayload() {
       }
 
       // Cashfree reports the result through callbacks. Turn them into one promise.
-      const orderIdFromSdk = await new Promise<string>((resolve, reject) => {
+      // A back press, a pending page or an error inside the payment screen is NOT the answer: the
+      // server is asked what really happened below.
+      let sdkError: any = null;
+      let orderIdFromSdk = '';
+      try {
+      orderIdFromSdk = await new Promise<string>((resolve, reject) => {
         CFPaymentGatewayService.setCallback({
           onVerify: (orderID: string) => resolve(orderID),
           onError: (cfError: any, orderID: string) => {
@@ -759,12 +826,19 @@ function getBookingPayload() {
           const theme = new CFThemeBuilder()
             .setNavigationBarBackgroundColor(C.burgundy)
             .setNavigationBarTextColor('#FFFFFF')
-            .setButtonBackgroundColor(C.burgundy)
+            .setButtonBackgroundColor(C.burgundyDark)
             .setButtonTextColor('#FFFFFF')
             .setPrimaryTextColor(C.ink)
             .setSecondaryTextColor(C.muted)
             .build();
-          CFPaymentGatewayService.doPayment(new CFDropCheckoutPayment(session, null, theme));
+          const components = new CFPaymentComponentBuilder();
+          CHECKOUT_MODES.forEach(mode => {
+            const m = (CFPaymentModes as any)[mode];
+            if (m) components.add(m);
+          });
+          CFPaymentGatewayService.doPayment(
+            new CFDropCheckoutPayment(session, components.build(), theme)
+          );
         } catch (startError) {
           reject(startError);
         }
@@ -775,26 +849,45 @@ function getBookingPayload() {
           // nothing to remove
         }
       });
+      } catch (checkoutError: any) {
+        sdkError = checkoutError;
+      }
 
       // Step 4: Backend asks Cashfree what really happened. The app's word is never trusted.
       // Cashfree has no signature: the order id is the payment reference.
       stage = 'verify';
-      const verified = await verifyPayment(
-        id,
-        token,
-        payment.payment_id!,
-        orderIdFromSdk || payment.gateway_order_id!,
-        ''
-      );
+      const orderToVerify = orderIdFromSdk || payment.gateway_order_id!;
+      const verifyOnce = () => verifyPayment(id, token, payment.payment_id!, orderToVerify, '');
+      // The bank is still deciding only if an attempt is really in progress. A customer who just
+      // backed out has nothing in progress, so there is nothing to wait for.
+      const stillDeciding = (v: ApiResponse) => v.status === 'PENDING' && v.in_flight !== false;
 
-      if (verified.status !== 'SUCCESS') {
-        setFinalMessage(
-          'Payment is not confirmed yet. Please do not pay again. We are checking its status.'
-        );
-        setLocked(true);
+      let verified = await verifyOnce();
+      for (let attempt = 0; attempt < VERIFY_RETRIES && stillDeciding(verified); attempt++) {
+        setStep('Confirming your payment');
+        await new Promise(resolve => setTimeout(resolve, VERIFY_RETRY_MS));
+        verified = await verifyOnce();
+      }
+
+      if (verified.status === 'FAILED') {
+        // Final failure: nothing was captured, so paying again is safe.
+        openResult('failed');
         return;
       }
 
+      if (verified.status !== 'SUCCESS') {
+        if (stillDeciding(verified) || !sdkError) {
+          // Still not settled. Stay locked so the customer does not pay twice. The server keeps
+          // checking and issues the ticket by itself when the payment settles.
+          setLocked(true);
+          openResult('pending', undefined, true);
+          return;
+        }
+        // Nothing is in progress and the payment screen reported a problem: nothing was charged.
+        const reason = String(sdkError?.message || '');
+        openResult(/cancel|dropped|back|user/i.test(reason) ? 'cancelled' : 'failed');
+        return;
+      }
       }
 
       // Step 5: Ask the bus provider to issue the ticket, then open
@@ -829,13 +922,17 @@ function getBookingPayload() {
 
       if (cancelled) {
         // Cancelling the payment screen is not a failure: nothing was charged and paying again is fine.
-        setFinalMessage('Payment was cancelled. Your booking has not been confirmed.');
+        openResult('cancelled');
       } else if (stage === 'verify' || stage === 'ticket') {
         // Money may already have been taken: never invite a second payment.
-        setFinalMessage(
-          'We are still confirming your payment and ticket. Please do not pay again. You will receive your ticket shortly.'
-        );
         setLocked(true);
+        openResult(
+          'pending',
+          stage === 'ticket'
+            ? 'Your payment was received. We are confirming your ticket with the bus operator. Please do not pay again. Your ticket will appear in Bookings shortly.'
+            : undefined,
+          true
+        );
       } else if (error?.status === 409) {
         setFinalMessage(
           'These seats are still on hold from an earlier attempt, or were just taken. Please wait a minute and try again, or go back and choose your seats again.'
